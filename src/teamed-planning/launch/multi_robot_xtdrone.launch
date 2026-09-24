@@ -1,0 +1,65 @@
+<!-- Full multi-robot system for XTDrone simulation.
+     Usage: roslaunch teamed_planning multi_robot_xtdrone.launch
+
+     Config:
+       sim/world.yaml   — spawn poses (single source of truth)
+       sim/xtdrone.yaml — vehicle type, fleet size
+
+     Spawn args below MUST match config/sim/world.yaml.
+     Gazebo side must match multi_vehicle_with_ground.launch (xtdrone-ad container).
+
+     Segmentation model: bash scripts/drone/models/download_models.sh
+     Disable model: seg_model_path:="" -->
+<launch>
+  <arg name="num_drones" default="3"/>
+  <arg name="vehicle"    default="iris"/>
+  <arg name="seg_model_path"
+       default="$(find teamed_planning)/scripts/drone/models/segformer_b0_ade/model.onnx"/>
+
+  <!-- Publish world layout on param server (reference / debugging) -->
+  <rosparam file="$(find teamed_planning)/config/sim/world.yaml"
+            command="load" ns="sim_world"/>
+  <rosparam file="$(find teamed_planning)/config/sim/xtdrone.yaml"
+            command="load" ns="sim"/>
+
+  <!-- Drone 0 @ (-2, 0) — see sim/world.yaml → drones.drone_0 -->
+  <include file="$(find teamed_planning)/launch/drone_xtdrone.launch">
+    <arg name="drone_id"       value="drone_0"/>
+    <arg name="drone_num"      value="0"/>
+    <arg name="num_drones"     value="$(arg num_drones)"/>
+    <arg name="vehicle"        value="$(arg vehicle)"/>
+    <arg name="spawn_x"        value="-2.0"/>
+    <arg name="spawn_y"        value="0.0"/>
+    <arg name="seg_model_path" value="$(arg seg_model_path)"/>
+  </include>
+
+  <!-- Drone 1 @ (+2, 0) — see sim/world.yaml → drones.drone_1 -->
+  <include file="$(find teamed_planning)/launch/drone_xtdrone.launch">
+    <arg name="drone_id"       value="drone_1"/>
+    <arg name="drone_num"      value="1"/>
+    <arg name="num_drones"     value="$(arg num_drones)"/>
+    <arg name="vehicle"        value="$(arg vehicle)"/>
+    <arg name="spawn_x"        value="2.0"/>
+    <arg name="spawn_y"        value="0.0"/>
+    <arg name="seg_model_path" value="$(arg seg_model_path)"/>
+  </include>
+
+  <!-- Drone 2 @ (0, +2) — see sim/world.yaml → drones.drone_2 -->
+  <include file="$(find teamed_planning)/launch/drone_xtdrone.launch">
+    <arg name="drone_id"       value="drone_2"/>
+    <arg name="drone_num"      value="2"/>
+    <arg name="num_drones"     value="$(arg num_drones)"/>
+    <arg name="vehicle"        value="$(arg vehicle)"/>
+    <arg name="spawn_x"        value="0.0"/>
+    <arg name="spawn_y"        value="2.0"/>
+    <arg name="seg_model_path" value="$(arg seg_model_path)"/>
+  </include>
+
+  <include file="$(find teamed_planning)/launch/ground_robot_xtdrone.launch">
+    <arg name="num_drones" value="$(arg num_drones)"/>
+  </include>
+
+  <include file="$(find teamed_planning)/launch/gcs.launch">
+    <arg name="num_drones" value="$(arg num_drones)"/>
+  </include>
+</launch>

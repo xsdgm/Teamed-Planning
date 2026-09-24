@@ -1,0 +1,24 @@
+[submodule "src/ground/ground-chassis/scout_ros"]
+    path = src/ground/ground-chassis/scout_ros
+    url = https://github.com/agilexrobotics/scout_ros.git
+    branch = melodic-devel
+
+[submodule "src/ground/ground-chassis/ugv_sdk"]
+    path = src/ground/ground-chassis/ugv_sdk
+    url = https://github.com/westonrobot/ugv_sdk.git
+
+[submodule "src/map_server/octomap_msgs"]
+    path = src/map_server/octomap_msgs
+    url = https://github.com/OctoMap/octomap_msgs.git
+
+[submodule "src/map_server/octomap_ros"]
+    path = src/map_server/octomap_ros
+    url = https://github.com/OctoMap/octomap_ros.git
+
+[submodule "src/ground/ground-planner/fcl"]
+    path = src/ground/ground-planner/fcl
+    url = https://github.com/flexible-collision-library/fcl.git
+
+[submodule "src/dependencies/rofl-beta"]
+	path = src/dependencies/rofl-beta
+	url = https://github.com/versatran01/rofl-beta.git

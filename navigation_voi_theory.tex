@@ -1,0 +1,397 @@
+% =========================================================================
+% Navigation-Value-of-Information Dispatch — theory content for the paper
+% This file contains SECTION CONTENT ONLY, no \documentclass. Include it with \input{navigation_voi_theory} or copy the blocks into the paper.
+%
+% Required in the main paper's preamble:
+%   The template already loads amsmath, algorithm, and algorithmic — the pseudocode below uses algorithmic syntax (\STATE, \FOR, \ENDFOR).
+%   Still needed on top of the template:
+%   \usepackage{amssymb,amsthm}
+%   \newtheorem{definition}{Definition}
+%   \newtheorem{assumption}{Assumption}
+%   \newtheorem{lemma}{Lemma}
+%   \newtheorem{proposition}{Proposition}
+%   \newtheorem{theorem}{Theorem}
+%   \newtheorem{corollary}{Corollary}
+%   \newtheorem{remark}{Remark}
+%   \newtheorem{problem}{Problem}
+%
+% Where each block goes in the current paper outline:
+%   BLOCK 0, contribution statement → Introduction
+%   BLOCK 1, Problem Formulation section → replaces the existing Problem Formulation section
+%   BLOCK 2, Method section content → polished Overview, Multi-robot Semantic Topology Map, and the new Chain-Sequential Greedy Dispatch subsection placed right after the topology map
+%   BLOCK 3, Theoretical Analysis subsection → inside Method, placed DIRECTLY AFTER the Chain-Sequential Greedy Dispatch subsection, the remaining Method subsections follow it
+%   BLOCK 4, Aerial Trajectory Planning subsection → replaces the old Aerial Energy-Aware Planner subsection, whose CBBA/CVRP task allocation is superseded by BLOCK 2
+%   BLOCK 5, Motion Control → condensed implementation details, moved OUT of Method into the experimental section
+%   BLOCK 6, Experimental Setup section → hardware, simulation, software architecture and parameters, baselines and metrics, with Motion Control (BLOCK 5) as one of its subsections
+%   BibTeX entries for the cited references are at the bottom of this file.
+% =========================================================================
+
+% Notation macros — \providecommand avoids clashes with the main file
+\providecommand{\Graph}{\mathcal{G}}
+\providecommand{\Nodes}{\mathcal{V}}
+\providecommand{\Edges}{\mathcal{E}}
+\providecommand{\conf}{\mathrm{conf}}
+\providecommand{\dist}{\mathrm{dist}}
+\providecommand{\obs}{\oplus}
+\providecommand{\Cand}{\mathcal{C}}
+\providecommand{\OPT}{S^{\star}}
+\providecommand{\Dmax}{D_{\max}}
+\providecommand{\Dmin}{D_{\min}}
+\providecommand{\proxy}{\widetilde{J}}
+\providecommand{\R}{\mathbb{R}}
+
+% =========================================================================
+% BLOCK 0 — Contribution statement, paste into the Introduction
+% =========================================================================
+% We introduce \emph{navigation-value-of-information dispatch}, a decentralized aerial observation placement scheme that provably approximates the optimal reduction in ground-robot path cost under relay connectivity constraints. Specifically, we formulate aerial support of ground navigation as maximization of a task-space value function and show that, unlike coverage- and information-driven objectives, it is monotone but not submodular, as established in Proposition~\ref{prop:nonsubmod}. We show that a frontier-proxy surrogate restores weak submodularity, quantified by the submodularity ratio of Assumption~\ref{ass:gamma} and validated empirically. We propose a chain-sequential greedy dispatcher that satisfies relay connectivity by construction, communicates only one hop, and attains an $\frac{\alpha\gamma}{1+\alpha\gamma}$-approximation of the optimal dispatch, as proven in Theorem~\ref{thm:main}. Finally, we validate the system in high-fidelity simulation and on physical UAV--UGV teams.
+
+% =========================================================================
+% BLOCK 1 — Problem Formulation, merged with the paper's existing section
+% Notation decisions agreed 2026-07-08:
+%   * Topological navigation graph keeps \mathcal{G}; communication graph renamed to \mathcal{G}_{com}.
+%   * Robot states: x_t replaces s_t; start/goal positions: s, g replace S_s, S_g.
+%   * Objective weights: \lambda_i ground, \mu_j aerial — replace \alpha_i, \gamma_i, which are freed for anchor robustness and submodularity ratio.
+%   * Constraint functions: h_k replaces C_k; thresholds: \theta_k ground, replacing \sigma_k, and \varphi_k aerial, unchanged.
+%   * Theory stated for one ground robot; Remark on multiple ground robots covers M robots.
+%   * Observation tuples stay calligraphic \mathcal{S}_t, distinct from dispatch set S.
+% =========================================================================
+\section{Problem Formulation}
+\label{sec:formulation}
+
+\subsection{System Setup and Robot States}
+
+The problem addressed in this work is the autonomous navigation of one or more ground robots to reach a specific coordinate, in coordination with aerial robots, while considering their motion and battery constraints, as well as the limitations of their onboard sensors. This is especially challenging in environments such as forests, deserts, and plateaus, which often feature complex terrain and obstacle distributions. We focus on a system comprising $M$ ground robots and $N$ aerial robots that leverage their synergies while maintaining a high degree of individual autonomy.
+
+At time $t$, the observation of ground robot $i \in \{1, 2, \dots, M\}$ consists of an RGB image $I_{t}^{g_i}$ and a depth image $D_{t}^{g_i}$. The state of the ground robot is defined as $x_t^{g_i} \in SE(3)$, which contains the position coordinates and the rotation angles of the three axes. The observation of aerial robot $j \in \{1, 2, \dots, N\}$ is a top-down RGB image $I_{t}^{a_j}$. The state of the aerial robot is defined as $x_t^{a_j} \in SE(3)$. Each ground robot can move freely around the environment while meeting safety restrictions, as defined in Section~\ref{method}. In addition, this paper assumes that observations may contain noise and erroneous data. Since each robot is equipped with one or more range sensors that provide geometric and color information about the environment, the noise distributions and data uncertainties of these sensors vary, which must be considered in planning.
+
+\subsection{Communication}
+
+In the field environment, due to the large range of scenes and uncertain obstacles, communication between robots is intermittent. In this work, robots communicate to minimize a global cost function. Since we do not assume stable communication, each robot must consider the impact of positions and obstacles on communication, and can only communicate within a limited range. Communication is denoted by an undirected graph $\mathcal{G}_{\mathrm{com}} = (\mathcal{V}_{\mathrm{com}}, \mathcal{E}_{\mathrm{com}})$, where $\mathcal{V}_{\mathrm{com}}$ represents the robots and $\mathcal{E}_{\mathrm{com}} \subseteq \mathcal{V}_{\mathrm{com}} \times \mathcal{V}_{\mathrm{com}}$ denotes the pairs between which communication can occur. In each communication instance, ground robot $i$ receives information $sg_{t}^{g_i}$ from other ground robots and $sa_{t}^{g_i}$ from aerial robots. The transmitted information includes observations or processed results. Therefore, at time $t$, the full observation of ground robot $i$ is $\mathcal{S}_t^{g_i} = \{I_{t}^{g_i}, D_{t}^{g_i}, x_t^{g_i}, sg_t^{g_i}, sa_t^{g_i}\}$, where $I_t^{g_i}$, $D_t^{g_i}$, and $x_t^{g_i}$ are the robot's own sensory data, and $sg_t^{g_i}$ and $sa_t^{g_i}$ are received from other ground and aerial robots, respectively. Similarly, the observation of aerial robot $j$ is $\mathcal{S}_t^{a_j} = \{I_{t}^{a_j}, x_t^{a_j}, sg_t^{a_j}, sa_t^{a_j}\}$.
+
+\subsection{Global Objective}
+\label{sec:global-objective}
+
+The navigation goal is defined globally. Ground robot $i$ must navigate from a start position $s_i \in \R^2$ to a goal position $g_i \in \R^2$ along a trajectory $\tau^{g_i}$, taking terrain and obstacles into account, while each aerial robot $j$ flies a trajectory $\tau^{a_j}$ that supports the ground robots within its energy budget and communication range. Navigation goals are specified in the plane. The full robot states evolve in $SE(3)$.
+
+Let $J(\tau^{g_i})$ denote the traversal cost of ground trajectory $\tau^{g_i}$ and $E(\tau^{a_j})$ the energy expenditure of aerial trajectory $\tau^{a_j}$. The global task is
+\begin{align} \min_{\{\tau^{g_i}\}, \{\tau^{a_j}\}} & \sum_{i=1}^{M} \lambda_i J(\tau^{g_i}) + \sum_{j=1}^{N} \mu_j E(\tau^{a_j}) \label{eq:global-task} \\ \text{s.t.} & h_k^{g_i}(\tau^{g_i}) \leq \theta_k, && k \in \{1, 2\}, \label{eq:ground-constraints} \\ & h_k^{a_j}(\tau^{a_j}) \leq \varphi_k, && k \in \{1, 2\}, \label{eq:aerial-constraints} \end{align}
+where $h_1^{g_i}, h_2^{g_i}$ encode terrain traversability and obstacle clearance for the ground robots, and $h_1^{a_j}, h_2^{a_j}$ encode the energy budget and communication-range limits of the aerial robots, with thresholds $\theta_k$ and $\varphi_k$. The weights $\lambda_i, \mu_j > 0$ trade ground navigation cost against aerial energy. Due to intermittent communication, each robot operates in a decentralized manner and must determine its trajectory online from its own observation $\mathcal{S}_t$.
+
+The coupling between the two teams in \eqref{eq:global-task} is informational, since the ground cost $J(\tau^{g_i})$ depends on the quality of the environment representation that the aerial team provides. We make this coupling explicit by introducing the topological navigation graph in Section~\ref{sec:topo-graph} and then restating the aerial part of \eqref{eq:global-task} as an observation-placement problem over that graph in Section~\ref{sec:nvoi-dispatch}. For clarity of the analysis we state the aerial subproblem for a single ground robot, taking $M = 1$ and dropping the superscript $g_i$. Remark~\ref{rem:multi-ugv} discusses the extension to $M > 1$.
+
+\subsection{Topological Navigation Graph}
+\label{sec:topo-graph}
+
+The environment is abstracted as an undirected topological graph $\Graph = (\Nodes, \Edges)$ built online from aerial semantic observations. Each node $v \in \Nodes$ has a position $p_v \in \R^2$. Each edge $e \in \Edges$ has a length $\dist(e) > 0$ and a confidence $\conf(e) \in [0, 1]$ that reflects how often the corresponding terrain has been observed. The traversal cost of an edge is
+\begin{equation} c(e) = \frac{\dist(e)}{\max\bigl(\conf(e), \epsilon\bigr)}, \label{eq:edge-cost} \end{equation}
+where $\epsilon \in (0, 1)$ is a confidence floor, so terrain that has never been observed is penalized by a factor of at most $1/\epsilon$ relative to its metric length.
+
+The ground robot plans on $\Graph$. Its planning cost from start $s$ to goal $g$ is the shortest-path cost
+\begin{equation} J(\Graph) = \min_{\pi \in \Pi(s, g)} \sum_{e \in \pi} c(e), \label{eq:path-cost} \end{equation}
+where $\Pi(s,g)$ denotes the set of $s$--$g$ paths in $\Graph$, and $J(\Graph) = +\infty$ if no such path exists. The trajectory cost $J(\tau^{g})$ in \eqref{eq:global-task} is realized by tracking the shortest path in \eqref{eq:path-cost}, so improving $J(\Graph)$ directly improves the achievable ground cost.
+
+\subsection{Aerial Observation Model}
+
+Aerial robot $j$ selects an observation waypoint $w_j \in \Cand_j \subset \R^2$ from a finite candidate set $\Cand_j$ generated from the current graph topology, namely low-confidence path edges, frontier nodes, inter-component gap midpoints, and frontier extension points. An observation at $w$ updates the graph through the \emph{observation operator} $\Graph \obs w$. Every edge $e$ within the sensor footprint $\mathcal{F}(w) \subset \R^2$, a disk of radius $R_{\mathrm{fov}}$, receives a confidence increment,
+\begin{equation} \conf'(e) = \min\bigl(\conf(e) + \delta(e, w), 1\bigr), \delta(e, w) \geq 0, \label{eq:obs-model} \end{equation}
+with $\delta(e, w) > 0$ if and only if $e \subset \mathcal{F}(w)$, and new nodes and edges within $\mathcal{F}(w)$ may be added to $\Graph$. For a set of waypoints $S = \{w_1, \dots, w_k\}$ we write $\Graph \obs S$ for the graph after all observations in $S$ are applied. The operator is commutative because confidence increments are additive and saturating.
+
+\subsection{Navigation-Value-of-Information Dispatch}
+\label{sec:nvoi-dispatch}
+
+\begin{definition}[Navigation value of information]
+\label{def:nvoi}
+The \emph{navigation value of information} of a waypoint set $S$ is the induced reduction in the ground robot's path cost,
+\begin{equation} f(S) = J(\Graph) - J(\Graph \obs S). \label{eq:nvoi} \end{equation}
+\end{definition}
+
+$f$ measures observation utility in \emph{task space}, that is, seconds or meters saved by the ground robot, rather than in information space such as entropy or coverage area. This distinction is the source of both the practical appeal and the theoretical difficulty analyzed in Section~\ref{sec:theory}.
+
+Aerial observations reach the ground robot over a multi-hop relay, which instantiates the communication-range constraint $h_2^{a_j}$ of \eqref{eq:aerial-constraints} on the graph $\mathcal{G}_{\mathrm{com}}$. Let $x_0 \in \R^2$ denote the ground robot position and let $\sigma : \{1, \dots, N\} \to \{1, \dots, N\}$ order the aerial robots by distance to the ground robot, forming the \emph{relay chain}. Ties are broken deterministically. A dispatch $S = \{w_{\sigma(1)}, \dots, w_{\sigma(N)}\}$ is \emph{chain-feasible} if adjacent chain members remain within communication range and above a safety separation,
+\begin{equation} \Dmin \leq \bigl\| w_{\sigma(k)} - w_{\sigma(k-1)} \bigr\| \leq \Dmax, k = 1, \dots, N, \label{eq:chain} \end{equation}
+with the convention $w_{\sigma(0)} = x_0$. Chain feasibility keeps $\mathcal{G}_{\mathrm{com}}$ connected along the chain and extends the fleet's reach to $N \Dmax$ from the ground robot.
+
+\begin{problem}[Navigation-value-of-information dispatch]
+\label{prob:dispatch}
+Find a chain-feasible dispatch maximizing the navigation value of information,
+\begin{equation} \OPT \in \arg\max_{S : \text{\eqref{eq:chain}}} f(S), w_{\sigma(k)} \in \Cand_{\sigma(k)}. \label{eq:problem} \end{equation}
+Each aerial robot must select its waypoint using only local computation and one-hop communication with its chain neighbors.
+\end{problem}
+
+Problem~\ref{prob:dispatch} is the aerial part of \eqref{eq:global-task}. Maximizing $f(S)$ minimizes the achievable ground cost $J$, while the energy budget $h_1^{a_j}$ enters through the candidate sets $\Cand_j$, since waypoints beyond the remaining flight range are not generated.
+
+\begin{remark}[Multiple ground robots]
+\label{rem:multi-ugv}
+For $M > 1$, the navigation value of information generalizes to the weighted sum $f(S) = \sum_{i=1}^{M} \lambda_i \bigl[ J_i(\Graph) - J_i(\Graph \obs S) \bigr]$, where $J_i$ is the path cost of ground robot $i$. A weighted sum of normalized monotone functions is normalized and monotone, so Lemma~\ref{lem:monotone} is preserved. Proposition~\ref{prop:nonsubmod} follows a fortiori by taking $M = 1$, and Theorem~\ref{thm:main} holds verbatim with the submodularity ratio $\gamma$ evaluated for the summed objective. The relay chain is anchored at the position of the highest-weight ground robot.
+\end{remark}
+
+% =========================================================================
+% BLOCK 2 — Method section content
+% Polished Overview and Multi-robot Semantic Topology Map, followed by the new Chain-Sequential Greedy Dispatch subsection.
+% Notation fixes applied relative to the earlier draft:
+%   * Vietoris–Rips filtration radius renamed \epsilon → r, since \epsilon is the confidence floor in eq:edge-cost.
+%   * Loss weights renamed \alpha_i → \beta_i, since \alpha is the anchor-robustness constant of Assumption ass:alpha.
+%   * Path renamed S_{path} → \pi and the duplicate path-cost equation removed, the cost is eq:path-cost.
+%   * The aerial local graph superscript corrected g_i → a_j.
+%   * \cite{xx} is still a placeholder, fill it in before submission.
+% =========================================================================
+% \section{Method} — already exists in the paper, the subsections below go inside it.
+
+\subsection{Overview}
+
+The overall heterogeneous multi-robot navigation system is illustrated in Fig.~\ref{p1}. The hierarchical structure of the system is the same for aerial and ground robots, but the specific implementation of each module varies with the robot's form. The aerial robots provide a wide-range top-down view of the environment and help the ground robot find a feasible path to the target position.
+
+For the ground robot, the perception module provides geometric and semantic information on the terrain based on RGB-D images. The task scheduling module first maintains an uncertainty-aware graph based on the results of the perception module and the top-down RGB images and locations transmitted by the aerial robots. This module then selects waypoints for the ground robot and broadcasts the locations of high-uncertainty areas identified on the graph, which we call locations of interest. The details of this module are introduced in Section~\ref{decision-making}. The planning module calculates a specific trajectory for the ground robot to reach the waypoints provided by the task scheduling module, while considering the terrain, the dynamics, and the state of the robot. The last module is the motion control module, which uses a learning-based model predictive control method to make the robot follow the planned trajectory.
+
+For an aerial robot, to reduce complexity and facilitate system deployment, the perception module is removed compared to the ground robots. Instead, it broadcasts its top-down images and locations. The task scheduling module selects the next observation waypoint with the chain-sequential greedy dispatcher introduced in Section~\ref{sec:chain-greedy}, which maximizes the navigation value of information defined in Section~\ref{sec:nvoi-dispatch} while respecting the relay-chain communication constraint, the remaining flight duration, and the ground robot's broadcasted locations of interest. The planning module generates a specific trajectory based on LiDAR data and the selected waypoint, which is then passed to the control module to fly the drone along the planned trajectory.
+
+Each robot in the system performs decentralized state estimation to localize itself and broadcasts its location over the communication network. In the experiments, state estimation is performed with ORB-SLAM3~\cite{campos2021orb} and integrated into the system. Based on the estimated pose, each robot exchanges locations and maps when communication is available.
+
+\subsection{Multi-robot Semantic Topology Map}
+\label{mrsm}
+
+We construct two types of maps for the system. The first is a multilayer grid map that allows ground robots to navigate safely in challenging environments. The second is a topology map that both ground and aerial robots use to find the next waypoints.
+
+At time instance $t$, the multilayer grid map of ground robot $g_i$ is $\mathcal{M}^{g_i}_t$, which stores the environment information required by the ground robot, including the terrain, the obstacles, and the reliability of each observation. The size of $\mathcal{M}^{g_i}_t$ is limited, and observations from ground robots alone are not sufficient to find a feasible path in complex environments \cite{xx}. In addition to the observation $sg_t^{g_i}$ from the ground robots, the transformed information $sa_t^{g_i}$ from the aerial robots is therefore also used to build the map and increase the possibility of finding a path. The top-down images from aerial robots have a larger perception range and provide broader environment information, which helps the planner escape locally optimal paths. The process of building the multilayer grid map is as follows. First, the ground robot builds a local cost map based on our previous method \cite{10611055}. Second, when the ground robot receives the transformed information $sa_t^{g_i}$ published by one or more aerial robots, including the position, the semantic image, and the uncertainty of the corresponding classification, it updates its multilayer grid map at the locations of the other robots, with the update range given by the coverage of the received semantic image. The received semantic map is created with \cite{umar2021forest} based on top-down images, as shown in Fig.~\ref{f3}.
+
+Thus, each ground robot maintains its own map of the surrounding environment, which may vary depending on the data it has received. To enrich the environment information available to all robots, the ground robots transmit their maps to each other. Due to the high data volume, only ground robots with sufficient battery capacity and computational resources subscribe to these updates. Aerial robots do not process this published mapping information. When a ground robot receives a map transmitted by another ground robot, it computes the union of the two maps to maximize the acquired environmental information. This procedure does not assess overlaps or discrepancies between the existing map and the received map. It simply supplements the robot's own map with the regions present in the received map but absent from its current map.
+
+Based on the multilayer grid map $\mathcal{M}^{g_i}_t$, each ground robot also constructs a graph to calculate the next waypoints for both itself and the aerial robots. Let $\mathcal{G}^{g_i}_t = (\mathcal{V}_p, \mathcal{E}_p)$ be the graph with vertices $\mathcal{V}_p$ and edges $\mathcal{E}_p$. This graph instantiates the topological navigation graph $\Graph$ of Section~\ref{sec:topo-graph}, where the analysis drops the robot index and the time subscript for readability. Each vertex $v \in \mathcal{V}_p$ refers to a location in the multilayer grid map $\mathcal{M}^{g_i}_t$. Each edge $e = (v_i, v_j) \in \mathcal{E}_p$ connects two vertices $v_i, v_j \in \mathcal{V}_p$ between which a collision-free path exists. Each edge stores the Euclidean distance between the two vertices, the accumulated uncertainty of the grid map cells along the edge, and the semantic cost shown in Table~\ref{catagorytype}, which reflects the traversability of the terrain. The uncertainty and semantic terms are combined into the edge confidence $\conf(e) \in [0, 1]$, so each edge carries the traversal cost $c(e)$ defined in \eqref{eq:edge-cost}. The semantic cost value is defined as the ratio of the ground robot's vibrations on a given terrain, measured as the acceleration along the vertical axis of the IMU, to those on flat ground. For semantic classes such as vegetation and shrubs, the ground traversability is difficult to determine directly due to occlusion by leaves in the top-down view. As a result, these areas are labeled as high-uncertainty regions and their cost is empirically set to a high value.
+
+Given the current location of the ground robot and the target location, represented by $v_{start}, v_{goal} \in \mathcal{V}_p$, a path $\pi$ is a sequence of vertices $(v_{start}, v_2, \dots, v_{goal})$ with every vertex in $\mathcal{V}_p$, and its cost is the sum of its edge costs as defined in \eqref{eq:path-cost}. With this graph, ground robots can calculate a collision-free and cost-effective global path.
+
+To build this graph efficiently, we propose a learning-based method named NUTMapper. Given the multilayer grid map $\mathcal{M}^{g_i}_t$, NUTMapper builds the graph incrementally. Classical roadmap construction with persistent homology is time-consuming in large-scale scenarios, so we use a learning-based method to speed up the process. Specifically, we use a network that takes the points sampled from the semantic layer and the uncertainty of the sampled points from the uncertainty layer as inputs, and outputs the expanded key points, as shown in Fig.~\ref{graphbuild}. To train the network, we combine the Probabilistic Road Map (PRM)~\cite{kavraki1996probabilistic, karaman2011sampling} and Persistent Homology (PH)~\cite{otter2017roadmap, fritzke1994growing} to generate a dataset. The key graph structure produced by PH helps the probabilistic roadmap reduce redundant connections and avoid ineffective collision checks, while retaining the essential topological features of the environment, which improves the quality of the dataset.
+
+The process of creating the dataset is as follows. First, sample $n$ collision-free configurations $\mathcal{V}_{sample} = \{v_i\}$ from the traversable space in $\mathcal{M}^{g_i}_t$. Second, connect each node $v_i$ to its $k$ nearest neighbors if the straight path is valid, forming a graph $\{(v_i, v_j)\}$. Third, apply persistent homology to all nodes using a Vietoris--Rips filtration~\cite{otter2017roadmap}. For each radius $r$, a simplicial complex $K_r$ is constructed, and as $r$ increases the birth and death of topological features are tracked to produce a persistence diagram, as shown in Fig.~\ref{phdiagram}. We focus on 0-dimensional and 1-dimensional topological structures, since such structures typically correspond to critical areas like connected components and loops around obstacles. By setting a persistence threshold and retaining features with a lifespan above this threshold, we obtain the set of nodes $\mathcal{V}_{ph}$ related to critical areas. Fourth, clustering is applied to reduce redundancy. For the remaining nodes $\mathcal{V}_{sample} \setminus \mathcal{V}_{ph}$, the spatial clustering method DBSCAN~\cite{ester1996density} groups the nearby redundant nodes, each cluster is replaced by a representative node, and the results form the set of nodes $\mathcal{V}_{clu}$. The final simplified set of nodes is the union $\mathcal{V}_{ph} \cup \mathcal{V}_{clu}$. Finally, we reconstruct edges based on the current traversable space in $\mathcal{M}^{g_i}_t$, resulting in the simplified roadmap $\mathcal{G}^{g_i}_t = (\mathcal{V}_p, \mathcal{E}_p)$ for robot $g_i$. The overall dataset preparation process is illustrated in Fig.~\ref{phdataset}.
+
+To train the network, we define the loss $L_{graph} = \sum_{i=0}^{2} \beta_i l_i$, where $\beta_i$ is the weight of each term, $l_0$ is the geometry loss defined as the Chamfer distance between the real key points and the network output, $l_1$ is the topology loss defined as the Wasserstein distance between the barcodes computed from the input point cloud and from the network's output keypoints under the Vietoris--Rips filtration, and $l_2$ is a regularization term defined as the number of key points.
+
+Based on the above network, each aerial robot $j$ generates a set of candidate keypoints within its observation range. A local graph $\mathcal{G}^{a_j}_t = (\mathcal{V}_p, \mathcal{E}_p)$ is constructed by connecting pairs of keypoints. Two keypoints are connected by an edge if the straight-line path between them is collision-free, lies within a specified connection radius, and has an uncertainty below a threshold. The resulting graph is then broadcast to nearby robots within communication range to enable decentralized cooperation. An example of the final roadmap is shown in Fig.~\ref{graphbuild}. These candidate keypoints form the candidate set $\Cand_j$ of aerial robot $j$ in Problem~\ref{prob:dispatch}, together with the low-confidence path edges, frontier nodes, and gap midpoints described in Section~\ref{sec:nvoi-dispatch}, and the broadcast graph instantiates the topological navigation graph $\Graph$.
+
+\subsection{Chain-Sequential Greedy Dispatch}
+\label{sec:chain-greedy}
+
+With the graph and the candidate sets of Section~\ref{mrsm} in place, the remaining decision is which aerial robot observes which candidate. Problem~\ref{prob:dispatch} couples the UAVs' feasible sets through the chain constraint \eqref{eq:chain}, because UAV $\sigma(k)$'s feasible waypoints depend on the choice of its predecessor $\sigma(k-1)$. Our dispatcher exploits this coupling instead of fighting it. The relay chain \emph{is} the greedy order.
+
+\begin{algorithm}[t]
+\caption{Chain-Sequential Greedy Dispatch for One Planning Cycle}
+\label{alg:chain-greedy}
+\begin{algorithmic}[1]
+\STATE \textbf{input:} graph $\Graph$, ground robot position $x_0$, chain order $\sigma$, candidate sets $\{\Cand_i\}$, ranges $\Dmin, \Dmax$
+\STATE $S_0 \gets \emptyset$, $w_{\sigma(0)} \gets x_0$
+\FOR[executed by UAV $\sigma(k)$]{$k = 1, \dots, N$}
+  \STATE receive $S_{k-1}$ and $w_{\sigma(k-1)}$ from predecessor
+  \STATE $\Cand_{\sigma(k)}^{\mathrm{feas}} \gets \bigl\{ w \in \Cand_{\sigma(k)} : \Dmin \leq \| w - w_{\sigma(k-1)} \| \leq \Dmax \bigr\}$
+  \STATE $w_{\sigma(k)} \gets \displaystyle \arg\max_{w \in \Cand_{\sigma(k)}^{\mathrm{feas}}} \tilde f\bigl(S_{k-1} \cup \{w\}\bigr) - \tilde f(S_{k-1})$
+  \STATE $S_k \gets S_{k-1} \cup \{ w_{\sigma(k)} \}$
+  \STATE send $S_k$ and $w_{\sigma(k)}$ to successor
+\ENDFOR
+\STATE \textbf{output:} dispatch $S_N$, chain-feasible by construction
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:chain-greedy} has three properties analyzed in Section~\ref{sec:theory}. First, the dispatch is \emph{feasible by construction}, since line 5 restricts each UAV to the annulus around its predecessor and $S_N$ therefore satisfies \eqref{eq:chain} without projection or dual iterations. Second, communication is \emph{one hop}, as UAV $\sigma(k)$ exchanges messages only with $\sigma(k-1)$ and $\sigma(k+1)$, matching the physical relay topology. Third, the \emph{complexity} is modest, since each UAV evaluates at most $|\Cand_{\sigma(k)}|$ marginal gains, each requiring one shortest-path computation on the predicted graph, i.e. $O(|\Cand| \cdot |\Edges| \log |\Nodes|)$ per cycle per UAV. Between planning cycles the chain order $\sigma$ is re-sorted with a cooldown to prevent rank flapping, and a UAV that loses its relay link falls back to rank-0 behavior, returning toward the ground robot, after which the chain re-forms.
+
+% =========================================================================
+% BLOCK 3 — Theoretical Analysis, subsection inside Method, placed directly after the Chain-Sequential Greedy Dispatch subsection
+% =========================================================================
+\subsection{Theoretical Analysis}
+\label{sec:theory}
+
+We analyze the dispatcher of Section~\ref{sec:chain-greedy}. We show the navigation-value-of-information objective is monotone in Lemma~\ref{lem:monotone} but not submodular in Proposition~\ref{prop:nonsubmod}, introduce the frontier proxy that restores weak submodularity, and prove an approximation guarantee for Algorithm~\ref{alg:chain-greedy} in Theorem~\ref{thm:main}.
+
+\subsubsection{Monotonicity}
+
+\begin{lemma}[Monotonicity]
+\label{lem:monotone}
+The navigation-value-of-information function $f$ in \eqref{eq:nvoi} is normalized, $f(\emptyset) = 0$, and monotone non-decreasing, that is $f(A) \leq f(B)$ for all $A \subseteq B$.
+\end{lemma}
+
+\begin{proof}
+Normalization is immediate. For monotonicity it suffices to show $J(\Graph \obs B) \leq J(\Graph \obs A)$ whenever $A \subseteq B$. By \eqref{eq:obs-model}, applying the additional observations $B \setminus A$ to $\Graph \obs A$ neither removes any node or edge nor decreases any edge confidence. Hence by \eqref{eq:edge-cost} no edge cost increases. Every $s$--$g$ path in $\Graph \obs A$ therefore exists in $\Graph \obs B$ with cost no larger, so the minimum in \eqref{eq:path-cost} cannot increase.
+\end{proof}
+
+\subsubsection{Failure of Submodularity}
+
+Recall that $f$ is \emph{submodular} if for all $A \subseteq B$ and all $w \notin B$,
+\begin{equation} f(A \cup \{w\}) - f(A) \geq f(B \cup \{w\}) - f(B). \label{eq:submod} \end{equation}
+
+\begin{proposition}[Non-submodularity of the navigation value of information]
+\label{prop:nonsubmod}
+There exist instances of Problem~\ref{prob:dispatch} for which $f$ violates \eqref{eq:submod}. In particular, $f$ is not submodular even when restricted to graphs with finite initial cost $J(\Graph) < \infty$.
+\end{proposition}
+
+\begin{proof}
+We give an explicit construction. Let $\Graph$ contain two connected components, component $\mathcal{A}$ containing $s$ and component $\mathcal{B}$ containing $g$, separated by an unmapped corridor of width greater than $2 R_{\mathrm{fov}}$, and let a long detour path from $s$ to $g$ of cost $c_{\mathrm{det}}$ exist so that $J(\Graph) = c_{\mathrm{det}} < \infty$. Let $w_1, w_2$ be waypoints whose footprints jointly cover the corridor, $\mathcal{F}(w_1) \cup \mathcal{F}(w_2) \supseteq$ corridor, while neither footprint alone spans it. Choose the corridor length so that the bridged path has cost $c_{\mathrm{br}} \ll c_{\mathrm{det}}$.
+
+Individually, neither observation completes the bridge. The newly added nodes and edges of $\Graph \obs \{w_1\}$, and likewise of $\Graph \obs \{w_2\}$, do not connect $\mathcal{A}$ to $\mathcal{B}$, and confidence increments off the optimal detour leave the shortest path unchanged, so $f(\{w_1\}) = f(\{w_2\}) = 0$. Jointly, the corridor is mapped and $J(\Graph \obs \{w_1, w_2\}) = c_{\mathrm{br}}$, so $f(\{w_1, w_2\}) = c_{\mathrm{det}} - c_{\mathrm{br}} > 0$. Taking $A = \emptyset$, $B = \{w_1\}$, $w = w_2$ in \eqref{eq:submod} gives
+\[ \underbrace{f(\{w_2\}) - f(\emptyset)}_{=0} < \underbrace{f(\{w_1, w_2\}) - f(\{w_1\})}_{=c_{\mathrm{det}} - c_{\mathrm{br}} > 0}, \]
+violating submodularity.
+\end{proof}
+
+\begin{remark}
+Proposition~\ref{prop:nonsubmod} formalizes why navigation-value-of-information dispatch differs structurally from coverage-, mutual-information-, and detection-driven multi-robot objectives, which are submodular and for which greedy guarantees are classical~\cite{nemhauser1978,krause2014survey}. Complementarity arises precisely at \emph{bridging} configurations --- the situations that matter most in guidance of a ground robot through unknown terrain.
+\end{remark}
+
+\subsubsection{Frontier Proxy and Weak Submodularity}
+
+When $\Graph$ does not connect $s$ to $g$, or connects them only through expensive detours, we replace $J$ by the \emph{frontier proxy}
+\begin{equation} \proxy(\Graph) = \min_{v \in \Nodes_s} \Bigl[ J_{s \to v}(\Graph) + \tfrac{1}{\epsilon} \bigl\| p_v - g \bigr\| \Bigr], \label{eq:proxy} \end{equation}
+where $\Nodes_s \subseteq \Nodes$ is the component of $s$ and $J_{s \to v}$ is the shortest-path cost from $s$ to $v$. The minimizer $v^\ast$ is the \emph{best frontier node}. The second term charges the unmapped remainder at the maximum cost rate $1/\epsilon$ of \eqref{eq:edge-cost}, making $\proxy$ an optimistic yet cost-rate-consistent completion. Note $\proxy = J$ whenever the optimal path is fully mapped, and $\proxy \leq J$ in general. The proxy value function is $\tilde{f}(S) = \proxy(\Graph) - \proxy(\Graph \obs S)$. Lemma~\ref{lem:monotone} extends to $\tilde f$ verbatim, since enlarging $\Nodes_s$ and reducing edge costs can only decrease \eqref{eq:proxy}.
+
+The proxy converts the all-or-nothing value jump of a completed bridge into incremental value for each observation that extends the frontier toward $g$, which motivates quantifying \emph{how far} $\tilde f$ is from submodular.
+
+\begin{definition}[Submodularity ratio~\cite{das2011}]
+\label{def:gamma}
+The submodularity ratio of a normalized monotone set function $u$ over ground set $\Cand$ is
+\begin{equation} \gamma = \min_{\substack{A \subseteq B \subset \Cand \\ w \in \Cand \setminus B}} \frac{u(A \cup \{w\}) - u(A)}{u(B \cup \{w\}) - u(B)}, \label{eq:gamma} \end{equation}
+with the convention $0/0 = 1$. The function $u$ is submodular if and only if $\gamma \geq 1$. It is \emph{$\gamma$-weakly submodular} if $\gamma > 0$.
+\end{definition}
+
+\begin{assumption}[Weak submodularity of the proxy value function]
+\label{ass:gamma}
+Over the candidate ground set $\Cand = \Cand_1 \cup \dots \cup \Cand_N$ generated at each planning cycle, the proxy value function $\tilde f$ is $\gamma$-weakly submodular with $\gamma > 0$.
+\end{assumption}
+
+\begin{remark}[Status of Assumption~\ref{ass:gamma}]
+\label{rem:gamma-status}
+Two regimes support this assumption. In the \emph{connected regime}, where the optimal $s$--$g$ path is inside the mapped component, observations act only through saturating confidence increments \eqref{eq:obs-model}. Marginal cost reductions on a fixed path are then diminishing in the set of prior observations, suggesting $\gamma$ close to $1$. In the \emph{frontier regime}, the candidate generation of Section~\ref{mrsm} spaces frontier extension waypoints by a fixed fraction of $R_{\mathrm{fov}}$, 0.7 in our implementation, so that consecutive footprints overlap. Each candidate then strictly advances the best frontier $v^\ast$ and earns positive marginal proxy value, bounding the complementarity that Proposition~\ref{prop:nonsubmod} exploits. A closed-form lower bound on $\gamma$ in terms of $R_{\mathrm{fov}}$, the candidate spacing, and $\epsilon$ is the subject of ongoing analysis. In the experimental section we estimate $\gamma$ empirically by Monte-Carlo sampling of \eqref{eq:gamma} over randomized forest environments, in both regimes.
+\end{remark}
+
+\subsubsection{Approximation Guarantee}
+
+To compare Algorithm~\ref{alg:chain-greedy} against the optimum, which may anchor its chain differently, we require that candidate sets be rich enough that chaining off the greedy prefix does not forfeit all value.
+
+\begin{assumption}[$\alpha$-anchor robustness]
+\label{ass:alpha}
+There exists $\alpha \in (0, 1]$ such that at every step $k$ of Algorithm~\ref{alg:chain-greedy}, for every waypoint $w^\star \in \Cand_{\sigma(k)}$ that is feasible for \emph{some} chain-feasible dispatch, the feasible slice $\Cand_{\sigma(k)}^{\mathrm{feas}}$ contains a waypoint $w$ with
+\[ \tilde f(S_{k-1} \cup \{w\}) - \tilde f(S_{k-1}) \geq \alpha \bigl[ \tilde f(S_{k-1} \cup \{w^\star\}) - \tilde f(S_{k-1}) \bigr]. \]
+\end{assumption}
+
+\begin{remark}
+Assumption~\ref{ass:alpha} holds with $\alpha = 1$ whenever $\Cand_{\sigma(k)}^{\mathrm{feas}}$ contains the unconstrained best candidate, and degrades gracefully as $\Dmax$ shrinks relative to the spatial spread of high-value candidates. It is the formal price of comparing a chain-coupled greedy against an unrestricted chain-feasible optimum. Without it, no algorithm restricted to the greedy prefix's anchors can be competitive, as shown by a single adversarial instance in which an optimal chain is anchored in the opposite direction from the first greedy choice.
+\end{remark}
+
+\begin{theorem}[Approximation guarantee]
+\label{thm:main}
+Under Assumptions~\ref{ass:gamma} and \ref{ass:alpha}, Algorithm~\ref{alg:chain-greedy} returns a chain-feasible dispatch $S_N$ with
+\begin{equation} \tilde f(S_N) \geq \frac{\alpha \gamma}{1 + \alpha \gamma} \tilde f(\OPT), \label{eq:bound} \end{equation}
+where $\OPT$ is an optimal solution of Problem~\ref{prob:dispatch} with objective $\tilde f$.
+\end{theorem}
+
+\begin{proof}
+Write $\OPT = \{w^\star_1, \dots, w^\star_N\}$ indexed along its own chain order, and let $g_k = \tilde f(S_k) - \tilde f(S_{k-1})$ denote the greedy gain at step $k$, so $\tilde f(S_N) = \sum_{k=1}^{N} g_k$. By monotonicity, using Lemma~\ref{lem:monotone} applied to $\tilde f$,
+\begin{equation} \tilde f(\OPT) \leq \tilde f(\OPT \cup S_N). \label{eq:pf1} \end{equation}
+Expand $\tilde f(\OPT \cup S_N) - \tilde f(S_N)$ by adding the elements $w^\star_1, \dots, w^\star_N$ one at a time on top of $S_N$. Writing $T_j = S_N \cup \{w^\star_1, \dots, w^\star_j\}$,
+\begin{equation} \tilde f(\OPT \cup S_N) - \tilde f(S_N) = \sum_{j=1}^{N} \bigl[ \tilde f(T_j) - \tilde f(T_{j-1}) \bigr]. \label{eq:pf2} \end{equation}
+For each $j$, since $S_{j-1} \subseteq T_{j-1}$, Definition~\ref{def:gamma} gives
+\begin{equation} \tilde f(T_j) - \tilde f(T_{j-1}) \leq \tfrac{1}{\gamma} \bigl[ \tilde f(S_{j-1} \cup \{w^\star_j\}) - \tilde f(S_{j-1}) \bigr]. \label{eq:pf3} \end{equation}
+Each $w^\star_j$ is feasible for the optimal chain, so Assumption~\ref{ass:alpha} provides $w \in \Cand_{\sigma(j)}^{\mathrm{feas}}$ with marginal gain at least $\alpha$ times that of $w^\star_j$. The greedy choice at step $j$ attains at least this gain, hence
+\begin{equation} \tilde f(S_{j-1} \cup \{w^\star_j\}) - \tilde f(S_{j-1}) \leq \tfrac{1}{\alpha} g_j. \label{eq:pf4} \end{equation}
+Combining \eqref{eq:pf1}--\eqref{eq:pf4},
+\[ \tilde f(\OPT) \leq \tilde f(S_N) + \tfrac{1}{\alpha \gamma} \sum_{j=1}^{N} g_j = \Bigl( 1 + \tfrac{1}{\alpha\gamma} \Bigr) \tilde f(S_N), \]
+which rearranges to \eqref{eq:bound}.
+\end{proof}
+
+\begin{corollary}
+If the proxy value function $\tilde f$ is submodular over $\Cand$, that is $\gamma \geq 1$ as in the connected regime of Remark~\ref{rem:gamma-status}, and the feasible slices contain the unconstrained best candidates so that $\alpha = 1$, then Algorithm~\ref{alg:chain-greedy} is $\tfrac{1}{2}$-optimal, recovering the classical sequential-greedy guarantee~\cite{fisher1978} in a decentralized, connectivity-constrained setting.
+\end{corollary}
+
+\begin{remark}[Comparison with consensus-ADMM dispatch]
+\label{rem:admm}
+Consensus-ADMM solves distributed assignment \emph{optimally} for linear objectives~\cite{shorinwa2023tro} and convex relaxations, but offers no guarantee for the nonconvex, discrete navigation-value-of-information objective, where the augmented Lagrangian iterations may cycle among candidates and feasibility of \eqref{eq:chain} is enforced only via penalty terms. Theorem~\ref{thm:main} instead guarantees both feasibility by construction and bounded suboptimality for the deployed algorithm. We retain a C-ADMM dispatcher and a CBBA-based task-allocation pipeline~\cite{choi2009consensus} as experimental baselines.
+\end{remark}
+
+% =========================================================================
+% BLOCK 4 — Aerial Trajectory Planning, replaces the old Aerial Energy-Aware Planner subsection
+% The CBBA and CVRP task-allocation content is superseded by the Chain-Sequential Greedy Dispatch and should be removed from Method. If implemented, keep CBBA+CVRP as an experimental baseline alongside C-ADMM.
+% Notation fixes relative to the old draft:
+%   * Trajectory symbol unified with the formulation, \tau^{a_j} instead of \bm{\Psi}_{a_i}.
+%   * Yaw renamed \varphi → \psi, since \varphi_k is the aerial constraint threshold in eq:aerial-constraints.
+%   * Number of control points renamed N_{a_i} → n_j, since N is the number of aerial robots.
+%   * The old draft cited both zhou2021fuel and zhou2019robust as the adopted planner, keep whichever matches the implementation.
+% =========================================================================
+\subsection{Aerial Trajectory Planning}
+\label{sec:aerial-traj}
+
+Once the dispatcher of Section~\ref{sec:chain-greedy} assigns a waypoint to each aerial robot, a trajectory is required to reach it. Each aerial robot is equipped with a LiDAR sensor to avoid collisions with tall obstacles such as trees, buildings, and towers. The trajectory of aerial robot $j$ is the aerial trajectory $\tau^{a_j}$ of \eqref{eq:global-task}, represented by a uniform B-spline $\tau^{a_j}(t) = (\mathbf{p}_{a_j}(t), \psi_{a_j}(t))$ parameterized by a set of $n_j + 1$ control points $\mathbf{Q}_{a_j} = \{\mathbf{q}_{a_j,0}, \mathbf{q}_{a_j,1}, \dots, \mathbf{q}_{a_j,n_j}\}$, where each control point $\mathbf{q}_{a_j,m} = (\mathbf{p}_{a_j,m}, \psi_{a_j,m})$ consists of position and yaw components. We adopt the B-spline-based planner of \cite{zhou2021fuel}. The objective is to minimize the smoothness cost and the total trajectory duration, subject to constraints on safety, dynamic feasibility, and the assigned waypoint. To prevent inter-robot collisions, each aerial robot treats the other robots as dynamic obstacles, whose positions are obtained through communication and modeled as circular regions with diameters determined by the physical size of the aerial robots. The energy budget $h_1^{a_j}$ requires no separate treatment here, since candidate waypoints beyond the remaining flight range are never generated, as stated in Section~\ref{sec:nvoi-dispatch}.
+
+% =========================================================================
+% BLOCK 5 — Motion Control, condensed, place in the experimental section as implementation details
+% The old Motion control subsection in Method should be deleted entirely. It contained two near-duplicate descriptions of the ground tracking controller plus a third shorter one, and stale draft notes on distributed optimization, the communication probabilistic map, the description vector, and RL-based cost prediction, all superseded by the Global Objective in the Problem Formulation.
+% The targetpath equation and the sampled waypoint set S^g_t are dropped, since S is the dispatch set and N the number of aerial robots. The lookahead is described in words.
+% Check one consistency point — the Overview calls the ground controller a learning-based model predictive control method, make sure that matches \cite{yang2022sms}.
+% =========================================================================
+\subsection{Motion Control}
+\label{sec:motion-control}
+
+The ground robot tracks the planned B-spline trajectory with the Model Predictive Control method of \cite{yang2022sms}. At each control step, the inertial navigation system estimates the robot pose from IMU data, and the tracking module selects as its target the point on the trajectory at a fixed lookahead distance ahead of the robot. When no trajectory point exists at that distance, the module falls back to the trajectory point closest to the current position. The control action consists of linear and angular velocities, which the Scout-mini chassis converts into low-level commands for execution. Tracking is terminated once the distance between the robot and the reference trajectory exceeds two meters.
+
+For the aerial robots, the PX4 autopilot receives the pose estimate from Fast-LIO and fuses it with onboard IMU measurements through its internal Extended Kalman Filter. Since the flight trajectories in our scenarios are generally simple and smooth, we directly employ PX4's built-in position control mode, which converts high-level position targets into low-level attitude and thrust commands, ensuring stable trajectory tracking without additional external controllers.
+
+% =========================================================================
+% BLOCK 6 — Experimental Setup section
+% Suggested order of subsections: Hardware Platforms, System Implementation (architecture + simulation + field deployment in one subsection), Motion Control (BLOCK 5 above), Baselines and Metrics.
+% Parameter values below are read from config/algorithm/*.yaml, config/sim/*.yaml, and scripts/drone/drone_navigator.py on the noetic branch. VERIFY they match the final tuned values before submission.
+% The hardware paragraphs mention ROS 2, but the active development branch is ROS 1 Noetic — confirm which one the physical fleet runs and state it consistently.
+% =========================================================================
+% \section{Experimental Setup} — already exists in the paper, the subsections below go inside it.
+
+\subsection{Hardware Platforms}
+
+\subsubsection{Aerial Robot} We use a custom-built drone as the platform for the aerial robots, as shown in Fig.~\ref{f5} left. The onboard sensors include a Livox MID-360 LiDAR running at 10 Hz, an Intel RealSense D435i depth camera running at 30 Hz, and an onboard IMU running at 100 Hz. The drone is equipped with an NVIDIA Jetson Xavier NX onboard computer and a PX4 flight controller. The two drone models weigh 0.915 kg and 1.55 kg, with maximum flight times of approximately 10 and 15 minutes, respectively.
+
+\subsubsection{Ground Robot} We use a modified Scout-mini robot from AgileX as the ground platform, as shown in Fig.~\ref{f5} left. The robot is equipped with a Stereolabs ZED 2i camera and a RION TL740D IMU as sensors, and an NVIDIA AGX Orin as the onboard computer. The ZED 2i camera has a horizontal field of view of 110 degrees and a depth range of 0.3 to 15 meters. The resolution is HD 720 and the image acquisition frame rate is set to 30 Hz.
+
+\subsection{System Implementation}
+\label{sec:sys-impl}
+
+The system is implemented on the Robot Operating System, with one planning node per robot and a ground control station node for operator commands and visualization, as illustrated in Fig.~\ref{frosnode}. Each drone node performs flight control through MAVROS, builds its topological graph by skeleton extraction from the segmented top-down view, runs the dispatcher of Section~\ref{sec:chain-greedy}, and broadcasts its graph. The ground node fuses the received graphs, runs the hierarchical planner, and publishes velocity commands. All inter-robot exchanges are subject to the communication range, and a peer that remains silent beyond a timeout of 10 s is treated as disconnected. The main parameters are listed in Table~\ref{tab:params}.
+
+Simulation experiments are conducted in Gazebo with PX4 software-in-the-loop through the XTDrone framework. The simulated fleet consists of three iris quadrotors and one differential-drive ground robot equipped with a 32-line LiDAR, matching the sensor configuration of the physical platforms. The drones take off to an altitude of 15 m with a 3 m stagger between consecutive drones to avoid inter-drone collisions, under a hard ceiling of 25 m. Aerial semantic segmentation of the top-down images is performed by a SegFormer-B0 model exported to ONNX, and the resulting semantic classes drive the confidence updates of the topological graph as described in Section~\ref{mrsm}. All planning nodes run unmodified in simulation and on the physical robots, only the sensor drivers and the vehicle interfaces differ between the two settings.
+
+% Fill the bracketed placeholders after the field campaign.
+In the field experiments, the three drones and the ground robot communicate over a shared wireless network, with the ground robot hosting the ROS master. A deployment script launches all platforms remotely, and the drones take off sequentially at 5 s intervals with the 3 m altitude offsets described above. A robot whose heartbeat is missing for 5 s is treated as disconnected, which triggers the relay fallback behavior of Section~\ref{sec:chain-greedy}. Field trials are conducted in [a forested park with dense canopy and shrub undergrowth] covering an area of approximately [$X$ m $\times$ $Y$ m], with goal positions [$Z$] m from the start position, and we perform [$n$] trials per method.
+
+\begin{table}[!t]
+\caption{System parameters used in the experiments.}
+\label{tab:params}
+\centering
+\begin{tabular}{lcc}
+\toprule
+Parameter & Symbol & Value \\
+\midrule
+Number of aerial robots & $N$ & 3 \\
+Number of ground robots & $M$ & 1 \\
+Flight altitude & --- & 15 m \\
+Altitude stagger between drones & --- & 3 m \\
+Maximum aerial speed & --- & 5 m/s \\
+Maximum ground speed & --- & 1 m/s \\
+Communication range & $\Dmax$ & 30 m \\
+Sensor footprint radius & $R_{\mathrm{fov}}$ & 30 m \\
+Confidence floor & $\epsilon$ & 0.05 \\
+Frontier candidate spacing & --- & $0.7 R_{\mathrm{fov}}$ \\
+Planning rate & --- & 10 Hz \\
+Chain re-sort cooldown & --- & 3 s \\
+Ground perception range & --- & 8 m \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Baselines and Metrics}
+
+We compare the chain-sequential greedy dispatcher against the two baselines discussed in Remark~\ref{rem:admm}. The first is a C-ADMM dispatcher that solves the same waypoint assignment by consensus optimization with the chain constraint enforced through penalty terms. The second is a CBBA-based task-allocation pipeline~\cite{choi2009consensus} in which aerial robots bid on exploration points and order them by solving a capacitated vehicle routing problem. We additionally report a ground-only configuration without aerial support and an independent-greedy variant in which each drone maximizes its own marginal gain without the relay chain, which isolates the contribution of chain feasibility. Performance is measured by the navigation success rate, the ground robot's traversal time and path length, the evolution of the graph path cost $J(\Graph)$ over a run, the total aerial flight distance as an energy proxy, and the computation time and message volume per planning cycle. To support Assumption~\ref{ass:gamma}, we estimate the submodularity ratio $\gamma$ by Monte-Carlo sampling of \eqref{eq:gamma} over randomized forest environments in both the connected and the frontier regimes, as described in Remark~\ref{rem:gamma-status}.
+
+% =========================================================================
+% BibTeX entries for the references cited above — add to the paper's .bib
+% =========================================================================
+% @inproceedings{choi2009consensus, author = {Choi, Han-Lim and Brunet, Luc and How, Jonathan P.}, title = {Consensus-based decentralized auctions for robust task allocation}, journal = {IEEE Transactions on Robotics}, volume = {25}, number = {4}, pages = {912--926}, year = {2009} }
+% @article{nemhauser1978, author = {Nemhauser, George L. and Wolsey, Laurence A. and Fisher, Marshall L.}, title = {An analysis of approximations for maximizing submodular set functions---{I}}, journal = {Mathematical Programming}, volume = {14}, pages = {265--294}, year = {1978} }
+% @article{fisher1978, author = {Fisher, Marshall L. and Nemhauser, George L. and Wolsey, Laurence A.}, title = {An analysis of approximations for maximizing submodular set functions---{II}}, journal = {Mathematical Programming Studies}, volume = {8}, pages = {73--87}, year = {1978} }
+% @inproceedings{das2011, author = {Das, Abhimanyu and Kempe, David}, title = {Submodular meets spectral: Greedy algorithms for subset selection, sparse approximation and dictionary selection}, booktitle = {Proc. Int. Conf. Machine Learning}, year = {2011} }
+% @incollection{krause2014survey, author = {Krause, Andreas and Golovin, Daniel}, title = {Submodular function maximization}, booktitle = {Tractability: Practical Approaches to Hard Problems}, publisher = {Cambridge University Press}, year = {2014} }
+% @article{shorinwa2023tro, author = {Shorinwa, Olaoluwa and Haksar, Ravi N. and Washington, Patrick and Schwager, Mac}, title = {Distributed multirobot task assignment via consensus {ADMM}}, journal = {IEEE Transactions on Robotics}, volume = {39}, number = {3}, pages = {1781--1800}, year = {2023} }
+% @article{xu2025rag, author = {Xu, Zirui and Garimella, Sandilya Sai and Tzoumas, Vasileios}, title = {Communication- and computation-efficient distributed submodular optimization in robot mesh networks}, journal = {IEEE Transactions on Robotics}, year = {2025} }
+% @inproceedings{li2024colag, author = {Li, Zhehan and Mao, Rui and Chen, Nanhe and Xu, Chao and Gao, Fei and Cao, Yanjun}, title = {{ColAG}: A collaborative air-ground framework for perception-limited {UGVs}' navigation}, booktitle = {Proc. IEEE Int. Conf. Robotics and Automation}, year = {2024} }
+% @article{miller2024spomp, author = {Miller, Ian D. and Cladera, Fernando and Smith, Trey and Taylor, Camillo J. and Kumar, Vijay}, title = {Air-ground collaboration with {SPOMP}: Semantic panoramic online mapping and planning}, journal = {IEEE Transactions on Field Robotics}, year = {2024} }
+% @article{gerkey2004, author = {Gerkey, Brian P. and Matari{\'c}, Maja J.}, title = {A formal analysis and taxonomy of task allocation in multi-robot systems}, journal = {International Journal of Robotics Research}, volume = {23}, number = {9}, pages = {939--954}, year = {2004} }

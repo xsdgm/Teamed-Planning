@@ -1,0 +1,25 @@
+<!-- Ground robot launch for real hardware.
+     Usage: roslaunch teamed_planning ground_robot_real.launch
+
+     Config:
+       algorithm/ground.yaml — shared planning params
+       real/sensors.yaml     — topic names, sensor mounts -->
+<launch>
+  <arg name="robot_id"   default="ground_0"/>
+  <arg name="num_drones" default="3"/>
+
+  <rosparam file="$(find teamed_planning)/config/algorithm/ground.yaml"
+            command="load" ns="$(arg robot_id)"/>
+  <rosparam file="$(find teamed_planning)/config/real/sensors.yaml"
+            command="load" ns="$(arg robot_id)"/>
+
+  <node pkg="teamed_planning" type="ros_ground_node.py" name="ground_node"
+        ns="$(arg robot_id)" output="screen">
+    <param name="robot_id"   value="$(arg robot_id)"/>
+    <param name="num_drones" value="$(arg num_drones)"/>
+
+    <remap from="odom"    to="/$(arg robot_id)/odom"/>
+    <remap from="cmd_vel" to="/$(arg robot_id)/cmd_vel"/>
+    <remap from="points"  to="/$(arg robot_id)/velodyne_points"/>
+  </node>
+</launch>

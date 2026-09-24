@@ -1,0 +1,42 @@
+<!-- Ground robot launch for XTDrone Gazebo simulation.
+     Usage: roslaunch teamed_planning ground_robot_xtdrone.launch
+
+     Config:
+       algorithm/ground.yaml — shared planning params
+       sim/world.yaml        — ground spawn at (0, 0) via multi_robot_xtdrone.launch
+       sim/xtdrone.yaml      — lidar_mount_z
+
+     ground_robot_sim.urdf must already be spawned in Gazebo by
+     multi_vehicle_with_ground.launch (xtdrone-ad container). -->
+<launch>
+  <arg name="robot_id"   default="ground_0"/>
+  <arg name="num_drones" default="3"/>
+
+  <rosparam file="$(find teamed_planning)/config/algorithm/ground.yaml"
+            command="load" ns="$(arg robot_id)"/>
+  <rosparam file="$(find teamed_planning)/config/sim/xtdrone.yaml"
+            command="load" ns="$(arg robot_id)"/>
+
+  <!-- LiDAR mount: lidar_mount_z in sim/xtdrone.yaml (default 0.20 m) -->
+  <node pkg="tf2_ros" type="static_transform_publisher"
+        name="ground_base_to_lidar"
+        args="0 0 0.20 0 0 0 1 ground_0/base_link ground_0/lidar_link"/>
+
+  <!-- map → ground_0/odom identity (diff_drive odom is in world frame) -->
+  <node pkg="tf2_ros" type="static_transform_publisher"
+        name="ground_map_to_odom"
+        args="0 0 0 0 0 0 1 map ground_0/odom"/>
+
+  <node pkg="teamed_planning" type="ros_ground_node.py" name="ground_node"
+        ns="$(arg robot_id)" output="screen">
+    <param name="robot_id"   value="$(arg robot_id)"/>
+    <param name="num_drones" value="$(arg num_drones)"/>
+    <!-- spawn_offset = 0: diff_drive odom is already in world/map frame -->
+    <param name="spawn_x"    value="0.0"/>
+    <param name="spawn_y"    value="0.0"/>
+
+    <remap from="odom"    to="/$(arg robot_id)/odom"/>
+    <remap from="cmd_vel" to="/$(arg robot_id)/cmd_vel"/>
+    <remap from="points"  to="/$(arg robot_id)/velodyne_points"/>
+  </node>
+</launch>

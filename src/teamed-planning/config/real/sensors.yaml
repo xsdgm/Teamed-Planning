@@ -1,0 +1,15 @@
+# Real hardware sensor and topic configuration.
+# Sim ignores this file — edit only for field deployment.
+
+# Topic suffixes under each robot namespace (/{robot_id}/...)
+odom_topic: odom
+cmd_vel_topic: cmd_vel
+points_topic: velodyne_points
+
+# LiDAR mount relative to base_link (metres)
+lidar_mount_z: 0.20
+
+# SLAM / localization (planned)
+# slam_type: fast_lio2
+# map_frame: map
+# odom_frame: odom

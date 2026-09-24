@@ -1,0 +1,25 @@
+<!-- Ground Control Station launch (sim + real).
+     Usage: roslaunch teamed_planning gcs.launch
+
+     Config:
+       algorithm/drone.yaml    — takeoff_height (shared)
+       algorithm/operator.yaml — heartbeat / takeoff timing -->
+<launch>
+  <arg name="num_drones" default="3"/>
+  <arg name="num_ground" default="1"/>
+
+  <node pkg="teamed_planning" type="ros_gcs_node.py" name="gcs_node"
+        output="screen">
+    <rosparam file="$(find teamed_planning)/config/algorithm/drone.yaml"
+              command="load"/>
+    <rosparam file="$(find teamed_planning)/config/algorithm/operator.yaml"
+              command="load"/>
+    <param name="num_drones"        value="$(arg num_drones)"/>
+    <param name="num_ground_robots" value="$(arg num_ground)"/>
+  </node>
+
+  <arg name="rviz" default="false"/>
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz"
+        args="-d $(find teamed_planning)/config/gcs.rviz"
+        output="log" launch-prefix="bash -c 'export DISPLAY=:0; $0 $@'"/>
+</launch>

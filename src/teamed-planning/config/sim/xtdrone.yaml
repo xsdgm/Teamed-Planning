@@ -1,0 +1,13 @@
+# XTDrone / Gazebo simulation settings (sim-only).
+# Do not load this file on real hardware.
+
+vehicle: iris
+num_drones: 3
+num_ground_robots: 1
+
+# Ground robot LiDAR mount height above base_link (metres, from URDF lidar_joint).
+lidar_mount_z: 0.20
+
+# Segmentation model path is set in drone_xtdrone.launch (requires $(find ...) syntax).
+# Default: scripts/drone/models/segformer_b0_ade/model.onnx
+# Leave empty in launch to run with zero occupancy (no obstacle detection).

@@ -1,0 +1,44 @@
+# Build artifacts — do not commit
+build/
+install/
+log/
+devel/
+.catkin_workspace
+
+# catkin_tools build metadata (machine-specific, regenerated on every build)
+.catkin_tools/profiles/
+
+# Compiled binaries and Python bytecode
+*.so
+*.pyc
+__pycache__/
+
+# ONNX model weights — large binary files, download via download_models.sh
+src/teamed-planning/scripts/drone/models/segformer_b0_ade/
+src/teamed-planning/docker/.ros_docker/
+
+# ── Simulation-only assets (live inside xtdrone-ad container) ─────────────────
+# These files run inside the xtdrone-ad Docker container and are not part of
+# the planning system deployed on real hardware.  Edit them by exec-ing into
+# the container and commit the container image after changes.
+#
+#   Container paths:
+#     /root/PX4_Firmware/launch/multi_vehicle_with_ground.launch
+#     /root/PX4_Firmware/launch/ground_robot_sim.urdf
+#     /root/PX4_Firmware/launch/_sim_bringup.sh
+#     /root/PX4_Firmware/Tools/sitl_gazebo/worlds/forest.world
+#
+src/teamed-planning/worlds/
+src/teamed-planning/launch/multi_vehicle_with_ground.launch
+
+# Runtime / temporary files
+logs/
+tmp/
+*.bak
+src/teamed-planning/deploy/.ros_docker/
+src/CMakeLists.txt
+
+# Editor / OS
+.DS_Store
+**/.DS_Store
+.vscode

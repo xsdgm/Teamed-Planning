@@ -1,0 +1,22 @@
+# Shared drone algorithm parameters (sim + real).
+# Sim-only spawn poses → config/sim/world.yaml
+# Real fleet IPs       → config/real/fleet.yaml
+#
+# perception_range is derived from altitude and camera HFOV in ros_drone_node.py.
+#
+# ── HEIGHT CONFIGURATION ───────────────────────────────────────────────────
+# takeoff_height:         base altitude for drone_0.
+# takeoff_height_stagger:  each subsequent drone adds this offset on takeoff.
+#   drone_0 → takeoff_height + 0 * stagger
+#   drone_1 → takeoff_height + 1 * stagger
+#   drone_2 → takeoff_height + 2 * stagger
+# height_limit:           hard ceiling (all drones).
+takeoff_height: 15.0
+takeoff_height_stagger: 3.0
+height_limit: 25.0
+# ───────────────────────────────────────────────────────────────────────────
+communication_range: 30.0
+max_speed: 5.0
+comm_timeout: 10.0
+algorithm_rate: 10.0
+control_rate: 50.0

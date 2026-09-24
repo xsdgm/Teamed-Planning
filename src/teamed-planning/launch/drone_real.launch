@@ -1,0 +1,32 @@
+<!-- Single drone launch for real hardware.
+     Usage: roslaunch teamed_planning drone_real.launch drone_id:=drone_0
+
+     Config:
+       algorithm/drone.yaml — shared planning params
+       real/sensors.yaml    — topic names, sensor mounts -->
+<launch>
+  <arg name="drone_id"   default="drone_0"/>
+  <arg name="num_drones" default="3"/>
+  <arg name="num_ground" default="1"/>
+
+  <rosparam file="$(find teamed_planning)/config/algorithm/drone.yaml"
+            command="load" ns="$(arg drone_id)"/>
+  <rosparam file="$(find teamed_planning)/config/real/sensors.yaml"
+            command="load" ns="$(arg drone_id)"/>
+
+  <node pkg="teamed_planning" type="ros_drone_node.py" name="drone_node"
+        ns="$(arg drone_id)" output="screen">
+    <param name="drone_id"          value="$(arg drone_id)"/>
+    <param name="num_drones"        value="$(arg num_drones)"/>
+    <param name="num_ground_robots" value="$(arg num_ground)"/>
+
+    <!-- MAVROS services (standard) -->
+    <param name="arming_service"   value="/$(arg drone_id)/mavros/cmd/arming"/>
+    <param name="set_mode_service" value="/$(arg drone_id)/mavros/set_mode"/>
+
+    <!-- Topic remapping: internal name -> real topics -->
+    <remap from="odom"            to="/$(arg drone_id)/mavros/local_position/odom"/>
+    <remap from="mavros_setpoint" to="/$(arg drone_id)/mavros/setpoint_position/local"/>
+    <remap from="points"          to="/$(arg drone_id)/velodyne_points"/>
+  </node>
+</launch>

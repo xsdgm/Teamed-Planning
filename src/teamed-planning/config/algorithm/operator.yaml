@@ -1,0 +1,4 @@
+# GCS / operator interface parameters (sim + real).
+heartbeat_timeout: 5.0
+takeoff_interval: 5.0
+auto_start_mission: false

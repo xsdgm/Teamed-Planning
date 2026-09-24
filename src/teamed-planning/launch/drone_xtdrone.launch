@@ -1,0 +1,68 @@
+<!-- Single drone launch for XTDrone Gazebo simulation.
+     Usage: roslaunch teamed_planning drone_xtdrone.launch drone_id:=drone_0 drone_num:=0
+
+     Config:
+       algorithm/drone.yaml  — shared planning params
+       sim/xtdrone.yaml      — vehicle name, fleet size
+       spawn_x/y args        — from sim/world.yaml (via multi_robot_xtdrone.launch)
+
+     Two nodes per drone:
+       drone_node — flight control, graph building, evidence grid
+       seg_node   — SegFormer-B0 ONNX inference (~5 Hz)
+
+     Segmentation model: bash scripts/drone/models/download_models.sh
+     Disable model: seg_model_path:="" -->
+<launch>
+  <arg name="drone_id"       default="drone_0"/>
+  <arg name="drone_num"      default="0"/>
+  <arg name="num_drones"     default="3"/>
+  <arg name="num_ground"     default="1"/>
+  <arg name="vehicle"        default="iris"/>
+  <arg name="seg_model_path"
+       default="$(find teamed_planning)/scripts/drone/models/segformer_b0_ade/model.onnx"/>
+
+  <!-- Spawn in Gazebo world — must match config/sim/world.yaml -->
+  <arg name="spawn_x" default="-2.0"/>
+  <arg name="spawn_y" default="0.0"/>
+
+  <!-- ── drone_node: flight control + graph building ──────────────────── -->
+  <node pkg="teamed_planning" type="ros_drone_node.py" name="drone_node"
+        ns="$(arg drone_id)" output="screen">
+    <rosparam file="$(find teamed_planning)/config/algorithm/drone.yaml"
+              command="load"/>
+    <rosparam file="$(find teamed_planning)/config/sim/xtdrone.yaml"
+              command="load"/>
+    <param name="drone_id"          value="$(arg drone_id)"/>
+    <param name="drone_num"         value="$(arg drone_num)"/>
+    <param name="num_drones"        value="$(arg num_drones)"/>
+    <param name="num_ground_robots" value="$(arg num_ground)"/>
+    <param name="spawn_x"           value="$(arg spawn_x)"/>
+    <param name="spawn_y"           value="$(arg spawn_y)"/>
+
+    <!-- MAVROS services (XTDrone naming) -->
+    <param name="arming_service"    value="/$(arg vehicle)_$(arg drone_num)/mavros/cmd/arming"/>
+    <param name="set_mode_service"  value="/$(arg vehicle)_$(arg drone_num)/mavros/set_mode"/>
+    <param name="param_service"     value="/$(arg vehicle)_$(arg drone_num)/mavros/param/set"/>
+
+    <!-- Topic remapping: internal name -> XTDrone topic -->
+    <remap from="odom"             to="/$(arg vehicle)_$(arg drone_num)/mavros/local_position/odom"/>
+    <remap from="mavros_setpoint"  to="/$(arg vehicle)_$(arg drone_num)/mavros/setpoint_position/local"/>
+    <remap from="points"           to="/$(arg vehicle)_$(arg drone_num)/velodyne_points"/>
+  </node>
+
+  <!-- ── seg_node: SegFormer inference + evidence feed ────────────────── -->
+  <node pkg="teamed_planning" type="ros_seg_node.py" name="seg_node"
+        ns="$(arg drone_id)" output="screen">
+    <rosparam file="$(find teamed_planning)/config/algorithm/drone.yaml"
+              command="load"/>
+    <rosparam file="$(find teamed_planning)/config/sim/xtdrone.yaml"
+              command="load"/>
+    <param name="drone_id"       value="$(arg drone_id)"/>
+    <param name="vehicle_id"     value="$(arg vehicle)_$(arg drone_num)"/>
+    <param name="spawn_x"        value="$(arg spawn_x)"/>
+    <param name="spawn_y"        value="$(arg spawn_y)"/>
+    <param name="seg_model_path" value="$(arg seg_model_path)"/>
+
+    <remap from="odom" to="/$(arg vehicle)_$(arg drone_num)/mavros/local_position/odom"/>
+  </node>
+</launch>

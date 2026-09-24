@@ -1,0 +1,6 @@
+# Shared ground robot algorithm parameters (sim + real).
+perception_range: 8.0
+max_linear_vel: 1.0
+max_angular_vel: 1.0
+control_rate: 10.0
+comm_timeout: 10.0

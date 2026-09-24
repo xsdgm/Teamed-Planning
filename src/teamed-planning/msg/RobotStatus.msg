@@ -1,0 +1,11 @@
+Header header
+string robot_id
+string robot_type
+string flight_state
+string mission_phase
+float64 position_x
+float64 position_y
+float64 position_z
+int32 graph_nodes
+int32 graph_edges
+bool comm_ok

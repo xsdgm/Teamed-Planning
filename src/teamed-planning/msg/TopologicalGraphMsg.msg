@@ -1,0 +1,9 @@
+Header header
+string drone_id
+GraphNode[] nodes
+GraphEdge[] edges
+float64 bounds_min_x
+float64 bounds_min_y
+float64 bounds_max_x
+float64 bounds_max_y
+bool is_full_graph

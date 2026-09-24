@@ -1,0 +1,28 @@
+# Real hardware fleet topology — used by deploy scripts and real launch files.
+#
+# BASE HEIGHT: edit config/algorithm/drone.yaml → takeoff_height.
+# Each drone adds takeoff_height_offset to avoid mid-air collisions on takeoff.
+# drone_0: base + 0m  |  drone_1: base + 3m  |  drone_2: base + 6m
+
+roscore_ip: "192.168.1.100"          # Ground robot IP (runs roscore)
+
+drones:
+  - id: drone_0
+    ip: "192.168.1.101"
+    takeoff_height_offset: 0.0
+  - id: drone_1
+    ip: "192.168.1.102"
+    takeoff_height_offset: 3.0
+  - id: drone_2
+    ip: "192.168.1.103"
+    takeoff_height_offset: 6.0
+
+ground_robots:
+  - id: ground_0
+    ip: "192.168.1.100"
+
+common:
+  num_drones: 3
+  num_ground_robots: 1
+  heartbeat_timeout: 5.0
+  takeoff_interval: 5.0
