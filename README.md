@@ -1,5 +1,8 @@
 # Teamed Planning
 
+Windows + Docker Desktop ROS 1 simulation: see [setup and commands](docker/ros1/README.md).
+Run `./run-ros1.ps1 start` from PowerShell in this directory.
+
 A multi-robot cooperative navigation system where UAV drones build topological maps
 of the environment and broadcast them to a ground robot, which fuses the maps and
 navigates to a goal using hierarchical planning.

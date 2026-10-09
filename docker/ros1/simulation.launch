@@ -1,0 +1,18 @@
+<launch>
+  <arg name="gui" default="true"/>
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="/opt/teamed-docker/forest.world"/>
+    <arg name="gui" value="$(arg gui)"/>
+  </include>
+  <include file="/opt/teamed-docker/vehicle.launch">
+    <arg name="id" value="0"/><arg name="x" value="-2"/><arg name="y" value="0"/>
+  </include>
+  <include file="/opt/teamed-docker/vehicle.launch">
+    <arg name="id" value="1"/><arg name="x" value="2"/><arg name="y" value="0"/>
+  </include>
+  <include file="/opt/teamed-docker/vehicle.launch">
+    <arg name="id" value="2"/><arg name="x" value="0"/><arg name="y" value="2"/>
+  </include>
+  <param name="ground_robot_description" textfile="/opt/teamed-docker/ground_robot.urdf"/>
+  <node pkg="gazebo_ros" type="spawn_model" name="spawn_ground" args="-urdf -param ground_robot_description -model ground_0 -z 0.18" output="screen"/>
+</launch>

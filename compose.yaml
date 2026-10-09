@@ -1,0 +1,28 @@
+services:
+  ros1:
+    build:
+      context: .
+      dockerfile: docker/ros1/Dockerfile
+      args:
+        BUILD_JOBS: "2"
+    image: teamed-planning-ros1:local
+    init: true
+    shm_size: 1gb
+    ports:
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - ./src/teamed-planning:/ws/src/teamed-planning:ro
+      - ros1-build:/ws/build
+      - ros1-devel:/ws/devel
+    environment:
+      GUI: "true"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "/opt/teamed-docker/check.sh"]
+      interval: 20s
+      timeout: 15s
+      start_period: 180s
+      retries: 6
+volumes:
+  ros1-build:
+  ros1-devel:

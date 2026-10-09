@@ -1,0 +1,21 @@
+<launch>
+  <arg name="id"/><arg name="x"/><arg name="y"/>
+  <group ns="$(eval 'iris_' + str(arg('id')))">
+    <include file="$(find px4)/launch/single_vehicle_spawn.launch">
+      <arg name="ID" value="$(arg id)"/>
+      <arg name="x" value="$(arg x)"/><arg name="y" value="$(arg y)"/><arg name="z" value="0.2"/>
+      <arg name="vehicle" value="iris"/>
+      <arg name="mavlink_udp_port" value="$(eval 14560 + int(arg('id')))"/>
+      <arg name="mavlink_tcp_port" value="$(eval 4560 + int(arg('id')))"/>
+      <arg name="gst_udp_port" value="$(eval 5600 + int(arg('id')))"/>
+      <arg name="video_uri" value="$(eval 5600 + int(arg('id')))"/>
+      <arg name="mavlink_cam_udp_port" value="$(eval 14530 + int(arg('id')))"/>
+    </include>
+    <include file="$(find mavros)/launch/px4.launch">
+      <arg name="fcu_url" value="$(eval 'udp://:' + str(14540 + int(arg('id'))) + '@localhost:' + str(14580 + int(arg('id'))))"/>
+      <arg name="gcs_url" value=""/>
+      <arg name="tgt_system" value="$(eval 1 + int(arg('id')))"/>
+      <arg name="tgt_component" value="1"/>
+    </include>
+  </group>
+</launch>
