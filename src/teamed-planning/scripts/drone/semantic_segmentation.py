@@ -280,7 +280,13 @@ class SegFormerONNX:
         providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
                      if "CUDAExecutionProvider" in ort.get_available_providers()
                      else ["CPUExecutionProvider"])
-        self._session = ort.InferenceSession(model_path, providers=providers)
+        session_options = ort.SessionOptions()
+        inference_threads = int(os.environ.get("ORT_INTRA_OP_THREADS", "0"))
+        if inference_threads > 0:
+            session_options.intra_op_num_threads = inference_threads
+            session_options.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(
+            model_path, sess_options=session_options, providers=providers)
         self._input_name  = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
         self.output_resolution = output_resolution

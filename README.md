@@ -1,7 +1,9 @@
 # Teamed Planning
 
-Windows + Docker Desktop ROS 1 simulation: see [setup and commands](docker/ros1/README.md).
-Run `./run-ros1.ps1 start` from PowerShell in this directory.
+Windows + Docker Desktop Gazebo simulation with WSLg and NVIDIA rendering: see [setup and commands](docker/wslg/README.md).
+Run `powershell -NoProfile -ExecutionPolicy Bypass -File ./run-gazebo.ps1 start` from PowerShell in this directory after loading `xtdrone_ad:v4` from the image archive.
+Docker image backups and the current Windows launch scripts are in [`docker/`](docker/README.md).
+For simulation with planning nodes and semantic perception, use [`run-planning.ps1`](docker/planning/README.md).
 
 A multi-robot cooperative navigation system where UAV drones build topological maps
 of the environment and broadcast them to a ground robot, which fuses the maps and

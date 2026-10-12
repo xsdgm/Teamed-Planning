@@ -1,0 +1,14 @@
+Teamed Planning Docker images
+Generated: 2026-10-10
+Architecture: linux/amd64
+
+xtdrone_ad:v4
+  Original configuration digest: sha256:df06a7b66d6732e26b6353e6a27c88bd3793149df7c094b9340e1cd20be7e1cd
+  Role: PX4 SITL, Gazebo, MAVROS, custom world and ground robot assets
+
+teamedplanning-ad:v1
+  Original configuration digest: sha256:f1e9e9befa95e940b7a51416d4056b83621eeb9f27f958dc84c1f0c8b9d3ad03
+  Role: Ubuntu 20.04, ROS Noetic, planning runtime dependencies
+
+Archive:
+  teamedplanning-docker-images-2026-10-10.tar.gz

@@ -1,0 +1,3 @@
+docker/wslg/*.sh text eol=lf
+docker/planning/*.sh text eol=lf
+src/teamed-planning/scripts/drone/models/download_models.sh text eol=lf

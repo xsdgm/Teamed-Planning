@@ -1,0 +1,96 @@
+services:
+  gazebo:
+    image: xtdrone_ad:v4
+    container_name: xtdrone-ad
+    entrypoint: ["/bin/bash", "/opt/wslg/start.sh"]
+    gpus: all
+    devices:
+      - /dev/dxg:/dev/dxg
+    volumes:
+      - ./docker/wslg:/opt/wslg:ro
+      - type: bind
+        source: /mnt/host/wslg/.X11-unix
+        target: /tmp/.X11-unix
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /usr/lib/wsl
+        target: /usr/lib/wsl
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      DISPLAY: ":0"
+      NUM_DRONES: "3"
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib
+      GALLIUM_DRIVER: d3d12
+      MESA_D3D12_DEFAULT_ADAPTER_NAME: NVIDIA
+      QT_QPA_PLATFORM: xcb
+      QT_X11_NO_MITSHM: "1"
+    init: true
+    shm_size: 1gb
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "bash", "-c", "source /opt/ros/noetic/setup.bash && timeout 8 rosservice call /gazebo/get_world_properties | grep -q 'success: True' && pgrep -x gzclient >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      start_period: 90s
+      retries: 6
+  planning:
+    profiles: ["planning"]
+    image: teamedplanning-ad:v1
+    container_name: teamedplanning-ad
+    user: "0"
+    gpus: all
+    devices:
+      - /dev/dxg:/dev/dxg
+    init: true
+    network_mode: "service:gazebo"
+    depends_on:
+      gazebo:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/opt/teamed-planning/start.sh"]
+    working_dir: /home/dcist/Teamed-Planning
+    volumes:
+      - ./src/teamed-planning:/home/dcist/Teamed-Planning/src/teamed-planning:ro
+      - ./docker/planning:/opt/teamed-planning:ro
+      - ./docker/wslg:/opt/wslg:ro
+      - planning-build:/home/dcist/Teamed-Planning/build
+      - planning-devel:/home/dcist/Teamed-Planning/devel
+      - type: bind
+        source: /mnt/host/wslg/.X11-unix
+        target: /tmp/.X11-unix
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /usr/lib/wsl
+        target: /usr/lib/wsl
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      ROS_MASTER_URI: http://127.0.0.1:11311
+      ROS_IP: 127.0.0.1
+      PYTHONPATH: /home/dcist/.local/lib/python3.8/site-packages
+      ORT_INTRA_OP_THREADS: "2"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      DISPLAY: ":0"
+      XAUTHORITY: ""
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib
+      GALLIUM_DRIVER: d3d12
+      MESA_D3D12_DEFAULT_ADAPTER_NAME: NVIDIA
+      QT_QPA_PLATFORM: xcb
+      QT_X11_NO_MITSHM: "1"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "bash", "-c", "source /opt/ros/noetic/setup.bash && source devel/setup.bash && python3 /opt/teamed-planning/control.py health"]
+      interval: 20s
+      timeout: 15s
+      start_period: 90s
+      retries: 6
+volumes:
+  planning-build:
+  planning-devel:

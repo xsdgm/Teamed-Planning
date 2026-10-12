@@ -35,8 +35,8 @@ REPO="${MIRROR}/nvidia/segformer-b0-finetuned-ade-512-512/resolve/main"
 TMP_DIR="$(mktemp -d)"
 
 echo "[download_models] Downloading PyTorch weights from ${MIRROR}..."
-wget -q --show-progress -O "${TMP_DIR}/config.json"        "${REPO}/config.json"
-wget -q --show-progress -O "${TMP_DIR}/pytorch_model.bin"  "${REPO}/pytorch_model.bin"
+wget -q -O "${TMP_DIR}/config.json"        "${REPO}/config.json"
+wget -q -O "${TMP_DIR}/pytorch_model.bin"  "${REPO}/pytorch_model.bin"
 
 echo "[download_models] Exporting to ONNX (requires torch + transformers)..."
 python3 - <<PYEOF

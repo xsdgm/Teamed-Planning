@@ -15,7 +15,6 @@ __pycache__/
 
 # ONNX model weights — large binary files, download via download_models.sh
 src/teamed-planning/scripts/drone/models/segformer_b0_ade/
-src/teamed-planning/docker/.ros_docker/
 
 # ── Simulation-only assets (live inside xtdrone-ad container) ─────────────────
 # These files run inside the xtdrone-ad Docker container and are not part of
