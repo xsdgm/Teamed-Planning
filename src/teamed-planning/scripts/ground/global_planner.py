@@ -49,6 +49,7 @@ class GlobalPlanner:
         self.goal_position = None
         self.using_graph = False
         self.waiting_at_frontier = False
+        self.start_connection_idx = None
         
     def plan_path(self, start_pos: Tuple[float, float],
                  goal_pos: Tuple[float, float],
@@ -66,6 +67,7 @@ class GlobalPlanner:
         Returns:
             List of (x, y) waypoints, or None if no path found
         """
+        self.start_connection_idx = None
         # Decide strategy: graph-based or direct
         if graph is not None and len(graph) > 0 and self.should_use_graph(start_pos, goal_pos, graph):
             # Use graph-based planning
@@ -88,6 +90,7 @@ class GlobalPlanner:
         # Fallback: use direct waypoints
         waypoints = self.generate_direct_waypoints(start_pos, goal_pos)
         self.using_graph = False
+        self.start_connection_idx = None
         self.waiting_at_frontier = False
         self.current_path = waypoints
         self.current_waypoint_idx = 0
@@ -225,6 +228,8 @@ class GlobalPlanner:
                 prev = waypoints[-1]
                 if np.hypot(pos[0] - prev[0], pos[1] - prev[1]) > 0.5:
                     waypoints.append(pos)
+                    if node_id == node_path[0]:
+                        self.start_connection_idx = len(waypoints) - 1
 
             last = waypoints[-1]
             if np.hypot(goal_pos[0] - last[0], goal_pos[1] - last[1]) > 0.5:
@@ -442,6 +447,7 @@ class GlobalPlanner:
         self.goal_position = None
         self.using_graph = False
         self.waiting_at_frontier = False
+        self.start_connection_idx = None
     
     # ========== Multi-Component Planning Methods ==========
     
@@ -749,6 +755,8 @@ class GlobalPlanner:
             entry_pos = graph.get_node_position(entry_node_id)
             if min_entry_dist > 1.0:  # Only add if > 1m away
                 waypoints.append(entry_pos)
+                if i == 0:
+                    self.start_connection_idx = len(waypoints) - 1
             
             # Path through component (if entry != exit)
             if entry_node_id != exit_node_id:

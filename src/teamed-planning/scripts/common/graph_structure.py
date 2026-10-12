@@ -315,9 +315,14 @@ class TopologicalGraph:
             'edges_added': 0
         }
         
-        # Build spatial index if needed
-        if not self._spatial_index_valid:
-            self.build_spatial_index()
+        # Incremental index for this fusion only. Rebuilding a KD-tree for
+        # every averaged node makes large fleet graphs unnecessarily slow.
+        cell_size = merge_distance_threshold if merge_distance_threshold > 0 else 1.
+        def cell(position):
+            return tuple(int(np.floor(value / cell_size)) for value in position[:2])
+        buckets = {}
+        for node_id, data in self.graph.nodes(data=True):
+            buckets.setdefault(cell(data['position']), []).append(node_id)
         
         # Track mapping from other_graph node_ids to this graph node_ids
         node_mapping = {}
@@ -327,7 +332,15 @@ class TopologicalGraph:
             other_pos = other_node_data['position']
             
             # Check if this position is close to an existing node
-            nearby_nodes = self.find_nearby_nodes(other_pos, merge_distance_threshold)
+            cx, cy = cell(other_pos)
+            nearby_nodes = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for node_id in buckets.get((cx + dx, cy + dy), []):
+                        distance = float(np.linalg.norm(np.asarray(other_pos) - self.graph.nodes[node_id]['position']))
+                        if distance <= merge_distance_threshold:
+                            nearby_nodes.append((node_id, distance))
+            nearby_nodes.sort(key=lambda item: item[1])
             
             if len(nearby_nodes) > 0:
                 # Merge with the nearest existing node
@@ -357,6 +370,10 @@ class TopologicalGraph:
                 other_pos_arr = np.array(other_pos)
                 new_pos = (existing_pos * existing_confidence + 
                           other_pos_arr * other_confidence) / total_confidence
+                old_cell, new_cell = cell(existing_pos), cell(new_pos)
+                if old_cell != new_cell:
+                    buckets[old_cell].remove(nearest_node_id)
+                    buckets.setdefault(new_cell, []).append(nearest_node_id)
                 
                 # Update node attributes
                 self.update_node_attributes(
@@ -378,6 +395,7 @@ class TopologicalGraph:
                 # Copy all attributes
                 node_attrs = dict(other_node_data)
                 self.add_node(new_node_id, position=other_pos, attributes=node_attrs)
+                buckets.setdefault(cell(other_pos), []).append(new_node_id)
                 
                 stats['nodes_added'] += 1
         
@@ -425,7 +443,7 @@ class TopologicalGraph:
         Returns:
             True if should fuse, False otherwise
         """
-        last_fusion_time = self.fusion_history.get(other_drone_id, 0)
+        last_fusion_time = self.fusion_history.get(other_drone_id, float('-inf'))
         time_since_fusion = current_time - last_fusion_time
         return time_since_fusion >= fusion_interval_threshold
     
@@ -547,17 +565,20 @@ class TopologicalGraph:
         search_r = seg_len / 2.0 + half_width
         candidates = self.find_nearby_nodes(tuple(centre), search_r)
 
-        result = []
-        for node_id, _ in candidates:
-            pos   = np.array(self.graph.nodes[node_id]['position'])
-            rel   = pos - p1
-            along = float(np.dot(rel, seg_dir))
-            if along < 0.0 or along > seg_len:
-                continue
-            perp = float(np.linalg.norm(rel - along * seg_dir))
-            if perp <= half_width:
-                result.append(node_id)
-        return result
+        if not candidates:
+            return []
+        node_ids = [node_id for node_id, _ in candidates]
+        positions = np.asarray([self.graph.nodes[n]['position'] for n in node_ids])
+        rel = positions - p1
+        along = np.sum(rel * seg_dir, axis=1)
+        perp = np.linalg.norm(rel - along[:, None] * seg_dir, axis=1)
+        # Projection roundoff can put the destination node a few ulps beyond
+        # seg_len. Endpoints belong to the corridor; losing the only observed
+        # node here would incorrectly turn a known short segment into a gap.
+        tolerance = 1e-9 * max(1.0, seg_len, half_width)
+        inside = ((along >= -tolerance) & (along <= seg_len + tolerance)
+                  & (perp <= half_width + tolerance))
+        return [node_ids[i] for i in np.flatnonzero(inside)]
 
     def edge_confidence_from_positions(self,
                                         p1: Tuple[float, float],
@@ -569,15 +590,27 @@ class TopologicalGraph:
             otherwise  c = 1 - exp( -(|N(e)| / expected_nodes) * mean_r )
 
         where expected_nodes = edge_length / d_bar and mean_r is the mean
-        terrain reliability of nodes found in the corridor.
+        accumulated terrain evidence (observation_count * terrain reliability)
+        of nodes found in the corridor.
         """
+        return self._edge_confidence(p1, p2, self.mean_edge_length())
+
+    def _edge_confidence(self, p1, p2, d_bar: float) -> float:
+        """Evaluate corridor confidence with a precomputed graph scale."""
         p1_arr = np.array(p1)
         p2_arr = np.array(p2)
         length = float(np.linalg.norm(p2_arr - p1_arr))
-        d_bar  = self.mean_edge_length()
 
         if length > 2.0 * d_bar:
-            return 0.0  # gap edge — completely unknown
+            # A long edge explicitly built from observed traversability is
+            # not an artificial gap. Sparse sampling can make it longer
+            # than twice the median without making it unobserved.
+            first, second = self.find_nearest_node(p1), self.find_nearest_node(p2)
+            observed_edge = (first is not None and second is not None
+                             and first[1] < 1e-6 and second[1] < 1e-6
+                             and self.graph.has_edge(first[0], second[0]))
+            if not observed_edge:
+                return 0.0
 
         corridor = self._find_corridor_nodes(p1_arr, p2_arr, d_bar / 2.0)
         if not corridor:
@@ -588,9 +621,31 @@ class TopologicalGraph:
         mean_r   = float(np.mean([
             self._terrain_reliability(
                 self.graph.nodes[nid].get('terrain_type', 'UNKNOWN'))
+            * self.graph.nodes[nid].get('observation_count', 1)
             for nid in corridor
         ]))
         return float(1.0 - np.exp(-coverage * mean_r))
+
+    def _uncertainty_weight_function(self, epsilon: float):
+        """Recompute evidence weights for each search using checked geometry."""
+        d_bar = self.mean_edge_length()
+        geometry = self._corridor_geometry(d_bar)
+        nodes = geometry['nodes']
+        evidence = np.asarray([self._terrain_reliability(self.graph.nodes[node].get('terrain_type', 'UNKNOWN'))
+                               * self.graph.nodes[node].get('observation_count', 1) for node in nodes])
+        accumulated = geometry['incidence'] @ evidence
+        confidence = (1. - np.exp(-accumulated / geometry['expected'])) * geometry['valid']
+        values = geometry['lengths'] / np.maximum(confidence, epsilon)
+        weights = {frozenset((first, second)): value
+                   for (first, second, _), value in zip(geometry['edges'], values)}
+
+        def weight(u, v, data):
+            # This is an undirected graph, so both traversal directions share
+            # one confidence calculation. The cache expires with this search.
+            key = frozenset((u, v))
+            return weights[key]
+
+        return weight
 
     def path_confidence(self, waypoints: List[Tuple[float, float]]) -> float:
         """C(π) = min c(e) over all consecutive waypoint pairs (weakest-link).
@@ -630,20 +685,10 @@ class TopologicalGraph:
         if start_id == goal_id:
             return start_dist + goal_dist
 
-        def _uncertainty_weight(u, v, data):
-            d = data.get('weight', 0.0)
-            if d <= 0:
-                pos_u = np.array(self.graph.nodes[u]['position'])
-                pos_v = np.array(self.graph.nodes[v]['position'])
-                d = float(np.linalg.norm(pos_v - pos_u))
-            c_e = self.edge_confidence_from_positions(
-                self.graph.nodes[u]['position'],
-                self.graph.nodes[v]['position'])
-            return d / max(c_e, epsilon)
-
         try:
             cost = nx.astar_path_length(
-                self.graph, start_id, goal_id, weight=_uncertainty_weight)
+                self.graph, start_id, goal_id,
+                weight=self._uncertainty_weight_function(epsilon))
         except (nx.NetworkXNoPath, nx.NodeNotFound, nx.NetworkXError):
             return float('inf')
 
@@ -651,6 +696,89 @@ class TopologicalGraph:
         cost += start_dist * off_graph_penalty
         cost += goal_dist * off_graph_penalty
         return float(cost)
+
+    def _corridor_geometry(self, scale):
+        """Reuse geometry only when every position, edge and weight matches.
+
+        Observation counts and terrain are always read afresh by searches.
+        The signature also catches direct NetworkX edits made by callers.
+        """
+        from scipy.sparse import csr_matrix
+        nodes = list(self.graph.nodes())
+        index = {node: i for i, node in enumerate(nodes)}
+        positions = np.asarray([self.get_node_position(node) for node in nodes])
+        edges = list(self.graph.edges(data=True))
+        signature = (tuple((node, tuple(self.get_node_position(node))) for node in nodes),
+                     tuple((first, second, data.get('weight', 0.)) for first, second, data in edges), scale)
+        cached = getattr(self, '_corridor_geometry_cache', None)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        rows, columns, expected, lengths, endpoints, valid = [], [], [], [], [], []
+        for edge_index, (first, second, data) in enumerate(edges):
+            a, b = positions[index[first]], positions[index[second]]
+            length = float(np.linalg.norm(b - a))
+            corridor = self._find_corridor_nodes(a, b, scale / 2.)
+            rows.extend([edge_index] * len(corridor))
+            columns.extend(index[node] for node in corridor)
+            expected.append(max(1., length / scale))
+            weight = data.get('weight', 0.)
+            lengths.append(weight if weight > 0 else length)
+            endpoints.append((index[first], index[second]))
+            permitted = True
+            if length > 2. * scale:
+                near_a, near_b = self.find_nearest_node(a), self.find_nearest_node(b)
+                permitted = self.graph.has_edge(near_a[0], near_b[0])
+            valid.append(permitted)
+        incidence = csr_matrix((np.ones(len(rows)), (rows, columns)), shape=(len(edges), len(nodes)))
+        geometry = dict(nodes=nodes, positions=positions, edges=edges, incidence=incidence,
+                        expected=np.asarray(expected), lengths=np.asarray(lengths),
+                        endpoints=np.asarray(endpoints, dtype=int).reshape(-1, 2), valid=np.asarray(valid))
+        self._corridor_geometry_cache = (signature, geometry)
+        return geometry
+
+    def predicted_path_costs(self, centers, radius, start, goal, epsilon=0.05):
+        """Batch count-only observations with exact uncertainty search weights."""
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import dijkstra
+        if not len(centers):
+            return np.zeros(0)
+        nodes = list(self.graph.nodes())
+        if not nodes:
+            return np.zeros(len(centers))
+        index = {node: i for i, node in enumerate(nodes)}
+        start_node, start_distance = self.find_nearest_node(start)
+        goal_node, goal_distance = self.find_nearest_node(goal)
+        start_index, goal_index = index[start_node], index[goal_node]
+        if start_index == goal_index:
+            return np.full(len(centers), start_distance + goal_distance)
+        geometry = self._corridor_geometry(self.mean_edge_length())
+        positions = geometry['positions']
+        evidence = np.asarray([self._terrain_reliability(self.graph.nodes[node].get('terrain_type', 'UNKNOWN'))
+                               for node in nodes])
+        counts = np.asarray([self.graph.nodes[node].get('observation_count', 1) for node in nodes])
+        centers = np.asarray(centers, dtype=float)
+        observed = np.linalg.norm(positions[None, :, :] - centers[:, None, :], axis=2) <= radius
+        accumulated = geometry['incidence'] @ ((counts[None, :] + observed) * evidence).T
+        confidences = (1. - np.exp(-accumulated / geometry['expected'][:, None])) * geometry['valid'][:, None]
+        weights = geometry['lengths'][:, None] / np.maximum(confidences, epsilon)
+        ends = geometry['endpoints']
+        adjacency_rows = np.concatenate((ends[:, 0], ends[:, 1]))
+        adjacency_columns = np.concatenate((ends[:, 1], ends[:, 0]))
+        remaining = np.linalg.norm(positions - np.asarray(goal), axis=1)
+        costs = []
+        for candidate in range(len(centers)):
+            adjacency = csr_matrix((np.tile(weights[:, candidate], 2),
+                                    (adjacency_rows, adjacency_columns)), shape=(len(nodes), len(nodes)))
+            distances = dijkstra(adjacency, directed=False, indices=start_index)
+            if np.isfinite(distances[goal_index]):
+                cost = distances[goal_index] + (start_distance + goal_distance) / epsilon
+            else:
+                frontier_index = int(np.argmin(distances + remaining / epsilon))
+                prefix = (start_distance if frontier_index == start_index else
+                          distances[frontier_index] + start_distance / epsilon)
+                cost = prefix + remaining[frontier_index] / epsilon
+            costs.append(float(cost))
+        return np.asarray(costs)
 
     def predict_observation(self,
                             center: Tuple[float, float],
@@ -703,21 +831,11 @@ class TopologicalGraph:
         goal_arr = np.array(goal_pos)
         off_graph_penalty = 1.0 / epsilon
 
-        def _uncertainty_weight(u, v, data):
-            d = data.get('weight', 0.0)
-            if d <= 0:
-                pos_u = np.array(self.graph.nodes[u]['position'])
-                pos_v = np.array(self.graph.nodes[v]['position'])
-                d = float(np.linalg.norm(pos_v - pos_u))
-            c_e = self.edge_confidence_from_positions(
-                self.graph.nodes[u]['position'],
-                self.graph.nodes[v]['position'])
-            return d / max(c_e, epsilon)
-
         # Single-source Dijkstra from the start node over the full graph.
         try:
             costs = nx.single_source_dijkstra_path_length(
-                self.graph, start_id, weight=_uncertainty_weight)
+                self.graph, start_id,
+                weight=self._uncertainty_weight_function(epsilon))
         except nx.NetworkXError:
             return None
 

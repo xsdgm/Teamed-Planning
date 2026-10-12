@@ -158,6 +158,7 @@ class MultiRobotEnv:
         
         for robot in all_robots:
             self_obs = robot.get_self_observation()
+            self_obs['id'] = robot.robot_id
             
             # Detect neighbors within communication radius
             neighbors = []
@@ -228,6 +229,8 @@ class MultiRobotEnv:
             if occupancy_map is not None:
                 observations[robot.robot_id]['occupancy_map'] = occupancy_map
                 observations[robot.robot_id]['map_resolution'] = self.config.occupancy_map_resolution
+                observations[robot.robot_id]['map_axes'] = 'yx'
+                observations[robot.robot_id]['time_step'] = self.config.dt
         
         return observations
     
@@ -320,6 +323,9 @@ class MultiRobotEnv:
                 visible_max_x = min(obs_max_x, max_x)
                 visible_min_y = max(obs_min_y, min_y)
                 visible_max_y = min(obs_max_y, max_y)
+
+                if visible_min_x >= visible_max_x or visible_min_y >= visible_max_y:
+                    continue
 
                 # Convert visible portion to pixel coordinates
                 pixel_x1 = int((visible_min_x - min_x) / resolution)

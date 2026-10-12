@@ -38,7 +38,8 @@ class DroneController:
                  fusion_interval: float = 30.0,
                  max_speed: float = 15.0,
                  waypoint_threshold: float = 10.0,
-                 total_drones: int = 1):
+                 total_drones: int = 1,
+                 dispatch_interval: float = 1.0):
         """
         Initialize drone controller.
 
@@ -62,6 +63,10 @@ class DroneController:
         self.resolution = resolution
         self.max_speed = max_speed
         self.broadcast_interval = broadcast_interval
+        self.dispatch_interval = dispatch_interval
+        self._last_dispatch_time = float('-inf')
+        self._last_graph_broadcast_time = float('-inf')
+        self._broadcast_graph = None
 
         # Initialize modules
         self.semantic_processor = SemanticProcessor(resolution=resolution)
@@ -80,6 +85,7 @@ class DroneController:
             drone_id=drone_id,
             total_drones=total_drones,
             waypoint_threshold=waypoint_threshold,
+            comm_range=communication_range,
         )
         
         # NOTE: GraphBroadcaster and RobotDetector are kept for future ground robot integration
@@ -133,10 +139,18 @@ class DroneController:
         occupancy_map = sim_obs.get('occupancy_map')
         if occupancy_map is None:
             raise ValueError(f"[{self.drone_id}] No occupancy map in simulator observation!")
+        # The mapper consumes camera grids (row=X, column=Y). The 2D
+        # simulator supplies world grids (row=Y, column=X); adapt once here.
+        axes = sim_obs.get('map_axes', 'yx')
+        if axes == 'yx':
+            occupancy_map = occupancy_map.T
+        elif axes != 'xy':
+            raise ValueError(f"Unsupported occupancy map axes: {axes}")
         
         # Extract nearby drones from neighbors
         drones = {}
         ground_robots = {}
+        neighbor_waypoints = dict(sim_obs.get('neighbor_waypoints', {}))
         
         neighbors = sim_obs.get('neighbors', [])
         for neighbor in neighbors:
@@ -152,6 +166,11 @@ class DroneController:
                             'position': tuple(other_position),
                             'broadcast': broadcast_msg
                         }
+                        waypoint = broadcast_msg.get('proposed_waypoint')
+                        if waypoint is not None:
+                            neighbor_waypoints[other_drone_id] = tuple(waypoint)
+                        for robot_id, mission in broadcast_msg.get('ground_missions', {}).items():
+                            ground_robots.setdefault(robot_id, mission)
             # Handle ground robots
             elif neighbor['type'] in ['diff_drive', 'holonomic']:
                 # Get broadcast data from ground robot
@@ -173,7 +192,7 @@ class DroneController:
             'occupancy_map': occupancy_map,
             'drones': drones,
             'ground_robots': ground_robots,
-            'neighbor_waypoints': sim_obs.get('neighbor_waypoints', {}),
+            'neighbor_waypoints': neighbor_waypoints,
         }
     
     def _generate_semantic_map(self, occupancy_map: np.ndarray) -> np.ndarray:
@@ -221,6 +240,39 @@ class DroneController:
         vz = (dz / distance) * self.max_speed
         
         return (vx, vy, vz)
+
+    def _safe_simulation_velocity(self, velocity, observation):
+        """Apply reciprocal separation bounds to the next simulator step.
+
+        Uses physical relative positions, not delayed graph broadcasts. If
+        spawned too close, agents separate at their available speed.
+        """
+        dt = observation.get('time_step')
+        if dt is None or dt <= 0:
+            return velocity
+        v = np.asarray(velocity, dtype=float).copy()
+        constraints = []
+        for neighbor in observation.get('neighbors', []):
+            if neighbor['type'] != 'drone':
+                continue
+            delta = -np.asarray(neighbor['relative_position'][:2], dtype=float)
+            distance = float(np.linalg.norm(delta))
+            if distance < 1e-8:
+                sign = 1. if observation['self'].get('id', -1) > neighbor['id'] else -1.
+                normal = np.array([sign, 0.])
+            else:
+                normal = delta / distance
+            lower = (self.navigator.min_separation - distance) / (2. * dt)
+            constraints.append((normal, lower))
+        for _ in range(4):
+            for normal, lower in constraints:
+                shortage = lower - float(np.dot(v[:2], normal))
+                if shortage > 0:
+                    v[:2] += shortage * normal
+            speed = float(np.linalg.norm(v))
+            if speed > self.max_speed:
+                v *= self.max_speed / speed
+        return tuple(v)
     
     def get_action(self, simulator_obs: Dict, mode: str = 'sim') -> Dict:
         """
@@ -238,7 +290,7 @@ class DroneController:
             When mode='real':
                 {'target_waypoint': (x,y,z) or None, 'broadcast': dict}
         """
-        current_time = time.time()
+        current_time = simulator_obs.get('full_state', {}).get('time', time.time())
         
         # Step 1: Parse simulator observation (adapter)
         with self.timer.measure("observation_parsing"):
@@ -261,7 +313,9 @@ class DroneController:
             other_drones_data = {}
             for drone_id, drone_info in parsed_obs['drones'].items():
                 broadcast = drone_info.get('broadcast')
-                if broadcast and 'graph' in broadcast:
+                if (broadcast and 'graph' in broadcast and self.current_graph is not None
+                        and self.current_graph.should_fuse_with_drone(
+                            drone_id, current_time, self.fusion_interval)):
                     other_drones_data[drone_id] = TopologicalGraph.from_message(broadcast['graph'])
             
             # Build or update graph
@@ -292,24 +346,34 @@ class DroneController:
             'nearby_drones': parsed_obs['drones'],
             'ground_robots': parsed_obs.get('ground_robots', {}),
             'neighbor_waypoints': parsed_obs.get('neighbor_waypoints', {}),
-            'fusion_stats': self.last_fusion_stats
+            'fusion_stats': self.last_fusion_stats,
+            'time': current_time
         }
         
         # Step 6: Compute navigation target
         with self.timer.measure("navigation"):
-            target = self.navigator.compute_next_target(self.position, nav_obs)
+            if current_time - self._last_dispatch_time >= self.dispatch_interval:
+                target = self.navigator.compute_next_target(self.position, nav_obs)
+                self._last_dispatch_time = current_time
+            else:
+                target = self.navigator._current_target
         
         # Step 7: Prepare broadcast data
         broadcast_data = None
         if self.current_graph is not None:
             with self.timer.measure("broadcasting"):
+                if current_time - self._last_graph_broadcast_time >= self.broadcast_interval:
+                    self._broadcast_graph = self.current_graph.to_message()
+                    self._last_graph_broadcast_time = current_time
                 broadcast_data = {
-                    'graph': self.current_graph.to_message(),
+                    'graph': self._broadcast_graph,
                     'position': list(self.position),
                     'drone_id': self.drone_id,
                     'timestamp': current_time,
                     'node_count': len(self.current_graph),
-                    'edge_count': self.current_graph.graph.number_of_edges()
+                    'edge_count': self.current_graph.graph.number_of_edges(),
+                    'proposed_waypoint': target,
+                    'ground_missions': parsed_obs.get('ground_robots', {})
                 }
         
         # Step 8: Return action according to mode
@@ -320,6 +384,7 @@ class DroneController:
             }
         else:
             velocity = self._compute_velocity_to_target(target) if target else (0.0, 0.0, 0.0)
+            velocity = self._safe_simulation_velocity(velocity, simulator_obs)
             return {
                 'motion': np.array([velocity[0], velocity[1], velocity[2]]),
                 'broadcast': broadcast_data

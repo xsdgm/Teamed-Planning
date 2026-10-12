@@ -1,7 +1,7 @@
 """
-Multi-Drone Perception, Mapping, and Fusion Test
+Cooperative Forest Navigation Demo
 
-Tests 3 drones with:
+Simulates 3 drones with:
 - Rectangular perception (30m × 30m square) with semantic segmentation
 - Topological graph building with skeleton-based strategy
 - Map fusion when drones meet (100m communication range)
@@ -12,6 +12,7 @@ import numpy as np
 import sys
 import os
 import time
+import argparse
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -109,10 +110,8 @@ def visualize_drone_perceptions(env, drone_controllers, obs, drone_robot_ids, pe
             obstacle_pixels = np.sum(semantic_map == 2)
             
             # Calculate map bounds in world coordinates (matching SemanticProcessor)
-            half_width = (width * resolution) / 2.0
-            half_height = (height * resolution) / 2.0
-            min_x = map_drone_pos[0] - half_width
-            min_y = map_drone_pos[1] - half_height
+            bounds = controller.semantic_processor.process_segmentation(
+                semantic_map, map_drone_pos)['coverage_bounds']
             
             # Create a surface for the semantic map overlay
             overlay = pygame.Surface((screen.get_width(), screen.get_height()), pygame.SRCALPHA)
@@ -122,8 +121,7 @@ def visualize_drone_perceptions(env, drone_controllers, obs, drone_robot_ids, pe
                 for px in range(0, width, 2):
                     if semantic_map[py, px] == 2:  # TerrainType.OBSTACLE = 2
                         # Convert pixel to world
-                        world_x = min_x + (px + 0.5) * resolution
-                        world_y = min_y + (py + 0.5) * resolution
+                        world_x, world_y = controller.semantic_processor.pixel_to_world((px, py), bounds)
                         
                         # Convert world to screen
                         screen_pos = renderer.world_to_screen((world_x, world_y))
@@ -333,7 +331,24 @@ def visualize_ground_robot_paths(env, ground_robot_controllers):
             screen_pos1 = renderer.world_to_screen(pos1)
             screen_pos2 = renderer.world_to_screen(pos2)
             
-            pygame.draw.line(screen, PATH_COLOR, screen_pos1, screen_pos2, PATH_WIDTH)
+            graph = controller.unified_graph
+            verified = (graph is not None and
+                        graph.edge_confidence_from_positions(pos1, pos2)
+                        > controller.edge_confidence_threshold)
+            if controller.goal_position is not None and np.linalg.norm(
+                    np.asarray(pos2) - controller.goal_position) < 1e-6:
+                nearest = graph.find_nearest_node(pos2) if graph is not None else None
+                verified = verified and nearest is not None and nearest[1] <= controller.waypoint_threshold
+            if verified:
+                pygame.draw.line(screen, PATH_COLOR, screen_pos1, screen_pos2, PATH_WIDTH)
+            else:
+                # Unobserved goal connectors are intentions, not safe routes.
+                a, b = np.asarray(screen_pos1), np.asarray(screen_pos2)
+                length = float(np.linalg.norm(b - a))
+                for offset in np.arange(0., length, 16.):
+                    first = a + (b - a) * offset / max(length, 1.)
+                    second = a + (b - a) * min(offset + 8., length) / max(length, 1.)
+                    pygame.draw.line(screen, (230, 150, 30), first, second, PATH_WIDTH)
         
         # Draw waypoint markers (blue circles)
         for waypoint in remaining_waypoints:
@@ -415,14 +430,14 @@ def create_patrol_waypoints(start_pos, world_size, num_waypoints=8, patrol_range
     return waypoints
 
 
-def run_test():
-    """Run multi-drone perception and map fusion test."""
+def run_simulation(max_steps=2000):
+    """Run cooperative aerial mapping and ground navigation."""
     
     print("="*70)
-    print("Multi-Drone Perception and Map Fusion Test")
+    print("Cooperative Forest Navigation")
     print("="*70)
     
-    # Configuration for 1km world (smaller for testing)
+    # Configuration for the 1km forest world
     WORLD_SIZE = 1000.0
     PERCEPTION_RANGE = 60.0  # Square perception area: 60m × 60m (rectangular)
     COMMUNICATION_RANGE = 100.0  # Communication range for fusion (100m radius)
@@ -466,12 +481,8 @@ def run_test():
         (515, 525, 50.0),   # Drone 2: slightly offset
     ]
     
-    # NOTE: No manual waypoints needed!
-    # Drones will automatically:
-    # 1. Discover ground robot's mission (start → target)
-    # 2. Assign themselves to segments (3 drones = 3 segments)
-    # 3. Generate vortex exploration patterns
-    # 4. Each drone explores a different segment of the path
+    # Drones discover the ground robot mission and use the C-ADMM
+    # dispatcher to select observation targets while maintaining a relay chain.
     
     for i in range(num_drones):
         drone_id = f"drone_{i}"
@@ -484,12 +495,12 @@ def run_test():
         controller = DroneController(
             drone_id=drone_id,
             resolution=0.5,
-            perception_range=PERCEPTION_RANGE,  # 30m × 30m square
             communication_range=COMMUNICATION_RANGE,
             fusion_interval=FUSION_INTERVAL,
             max_speed=15.0,
-            waypoint_threshold=10.0
-            # map_size auto-calculated: 30m / 0.5m = 60 pixels
+            waypoint_threshold=10.0,
+            total_drones=num_drones
+            # Map footprint comes from the simulator occupancy map.
         )
         
         # Waypoints are automatically generated based on ground robot mission
@@ -524,13 +535,12 @@ def run_test():
 
     print("\nDrone mission-based exploration:")
     print("  Ground robot path: (520, 520) → (900, 900)")
-    print("  Path divided into 3 segments (one per drone)")
     print("  Each drone autonomously:")
     print("    1. Discovers ground robot mission")
-    print("    2. Assigns itself to a segment")
-    print("    3. Flies to segment start")
-    print("    4. Executes vortex exploration pattern")
-    print("  This tests: autonomous coordination + path-oriented exploration")
+    print("    2. Selects observation targets with the C-ADMM dispatcher")
+    print("    3. Maintains communication with relay-chain neighbors")
+    print("    4. Observes terrain and shares its topological graph")
+    print("  Autonomous coordination and path-oriented exploration")
     
     # Main simulation loop
     print("\n" + "="*70)
@@ -538,7 +548,6 @@ def run_test():
     print("="*70)
     
     running = True
-    max_steps = 2000
     step = 0
     last_print_time = time.time()
     print_interval = 2.0
@@ -580,6 +589,8 @@ def run_test():
         
         # Step 4: Render current state
         env.render(auto_flip=False)
+        if env.renderer is None or env.renderer.closed:
+            break
         
         if PYGAME_AVAILABLE:
             # Layer 1: Drone perception areas (semi-transparent)
@@ -652,7 +663,8 @@ def run_test():
                     
                     # Print navigation stats
                     nav_stats = controller.navigator.get_stats()
-                    print(f"  Navigation: waypoint {nav_stats['current_waypoint']}/{nav_stats['total_waypoints']}, "
+                    print(f"  Navigation: {nav_stats['phase']}, "
+                          f"target {nav_stats['current_target']}, "
                           f"reached {nav_stats['waypoints_reached']}")
                     
                     controller.print_timing_stats(summary=True)
@@ -705,8 +717,14 @@ def run_test():
 
 
 def main():
-    """Main entry point - runs unified perception and fusion test."""
-    run_test()
+    """Run the cooperative forest navigation simulation."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--steps', type=int, default=2000,
+                        help='Number of simulation frames (default: 2000)')
+    args = parser.parse_args()
+    if args.steps < 1:
+        parser.error('--steps must be positive')
+    run_simulation(max_steps=args.steps)
 
 
 if __name__ == "__main__":

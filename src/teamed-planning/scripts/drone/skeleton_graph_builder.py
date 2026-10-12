@@ -109,8 +109,8 @@ class SkeletonGraphBuilder:
         # — especially important for wide-aspect (landscape) cameras where
         # the x half-extent is much larger than the y half-extent.
         margin = self.max_edge_distance / 2.0
-        safe_build_half_x = max(0.0, (semantic_map.shape[1] * self.resolution) / 2.0 - margin)
-        safe_build_half_y = max(0.0, (semantic_map.shape[0] * self.resolution) / 2.0 - margin)
+        safe_build_half_x = max(0.0, (semantic_map.shape[0] * self.resolution) / 2.0 - margin)
+        safe_build_half_y = max(0.0, (semantic_map.shape[1] * self.resolution) / 2.0 - margin)
         
         node_time = time.time()
         node_positions_pixel = self._sample_nodes_on_skeleton(
@@ -209,8 +209,8 @@ class SkeletonGraphBuilder:
 
         # safe bounds derived from current map dimensions (altitude-adaptive)
         margin = self.max_edge_distance / 2.0
-        safe_build_half_x = max(0.0, (semantic_map.shape[1] * self.resolution) / 2.0 - margin)
-        safe_build_half_y = max(0.0, (semantic_map.shape[0] * self.resolution) / 2.0 - margin)
+        safe_build_half_x = max(0.0, (semantic_map.shape[0] * self.resolution) / 2.0 - margin)
+        safe_build_half_y = max(0.0, (semantic_map.shape[1] * self.resolution) / 2.0 - margin)
 
         node_time = time.time()
         new_node_positions_pixel = self._sample_nodes_on_skeleton(

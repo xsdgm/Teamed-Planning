@@ -9,9 +9,48 @@ A multi-robot cooperative navigation system where UAV drones build topological m
 of the environment and broadcast them to a ground robot, which fuses the maps and
 navigates to a goal using hierarchical planning.
 
-> **Branch guide**
-> | Branch | ROS version | Status |
-> |--------|------------|--------|
+## Pure Python 2D simulation (Windows / Conda)
+
+Run these commands from the repository root. This simulation uses Pygame and
+does not require Docker or ROS.
+
+```powershell
+conda env create -f environment-2d.yml
+conda run --no-capture-output -n teamedplanning-2d python src/teamed-planning/scripts/simulator/mission_demo.py --steps 100
+```
+
+If the environment already exists, run only the second command. Omit `--steps`
+for the default 2000 frames. The scene includes three drones, one ground robot,
+and 300 obstacles. Graph construction, fusion and C-ADMM dispatch run alongside
+the visualization; computation can limit the actual frame rate.
+
+Dispatch reuses the baseline path cost across candidates, batches corridor
+geometry with NumPy, and caches edge costs only for the duration of each search.
+Subsequent searches recompute costs from the latest graph. The SDL window supports
+resizing and maximizing; graph computation and drawing run on the CPU.
+Near the goal, count-only observation predictions share a sparse corridor
+matrix and use batched shortest-path searches. Geometry is reused only when
+all node positions, edges and weights match; each search reads current terrain
+and observation counts, including direct NetworkX edits.
+
+For a longer mission from `(520, 520)` toward `(900, 900)`, run:
+
+```powershell
+conda run --no-capture-output -n teamedplanning-2d python src/teamed-planning/scripts/simulator/mission_demo.py --steps 20000
+```
+
+The 2D observation adapter marks world grids as `map_axes: yx` and
+transposes them once for the camera-oriented drone mapper (`xy`). Ground
+observations retain their world-grid convention. Ground obstacle evidence
+persists across graph fusions in this static forest simulation. Blue route
+segments have graph evidence; orange dashed segments are unverified goal
+connections. Drones use stable ID ordering for the relay chain and apply
+separation limits to each simulator step; initially crowded spawns move
+apart. The first relay's horizontal radio budget accounts for its altitude.
+
+The current ROS package targets **ROS 1 Noetic** and uses catkin.
+
+--------|------------|--------|
 > | `noetic` | ROS 1 Noetic | **Active development** |
 > | `main`   | ROS 2 Humble | Archived |
 

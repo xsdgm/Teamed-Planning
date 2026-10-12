@@ -7,6 +7,8 @@ import numpy as np
 import time
 import sys
 import os
+import copy
+from scipy.spatial import cKDTree
 from typing import Dict, Tuple, Optional
 
 # Add parent directory to path for imports
@@ -65,6 +67,7 @@ class GroundRobotController:
         self.resolution = resolution
         self.perception_range = perception_range
         self.fusion_interval = fusion_interval
+        self.waypoint_threshold = waypoint_threshold
         
         # Handle max_speed vs max_linear_vel/max_angular_vel
         self.max_linear_vel = max_linear_vel if max_linear_vel is not None else max_speed
@@ -126,6 +129,9 @@ class GroundRobotController:
         # Store last semantic map for visualization (debug)
         self._last_semantic_map = None
         self._last_semantic_map_position = None
+        self._observed_obstacles = set()
+        self._obstacle_tree = None
+        self._obstacle_filter_cache = None
     
     def set_goal(self, goal_pos: Tuple[float, float]):
         """
@@ -134,8 +140,63 @@ class GroundRobotController:
         Args:
             goal_pos: (x, y) goal position
         """
+        self.global_planner.clear_path()
         self.goal_position = goal_pos
         print(f"[{self.robot_id}] Goal set to {goal_pos}")
+
+    def _filter_observed_obstacles(self, graph, semantic_map):
+        """Retain static obstacle evidence in world coordinates across fusions.
+
+        Ground observations never authorize unknown space. Occupied cells
+        reject aerial graph geometry even after leaving the current view.
+        """
+        rows, columns = np.nonzero(np.isin(semantic_map, [2, 4]))
+        height, width = semantic_map.shape
+        points = np.column_stack((
+            self.position[0] + (columns + .5 - width / 2.) * self.resolution,
+            self.position[1] + (rows + .5 - height / 2.) * self.resolution))
+        # A fixed quarter-metre lattice keeps evidence independent of moving
+        # raster origins and subsequent observation-resolution changes.
+        keys = {tuple(point) for point in np.rint(points / .25).astype(int)}
+        old_count = len(self._observed_obstacles)
+        self._observed_obstacles.update(keys)
+        changed = len(self._observed_obstacles) != old_count
+        if changed:
+            self._obstacle_tree = cKDTree(np.asarray(list(self._observed_obstacles)) * .25)
+            self._obstacle_filter_cache = None
+        if graph is None or self._obstacle_tree is None:
+            return graph
+        cache = self._obstacle_filter_cache
+        if cache is not None and cache[0] is graph and cache[1] == self.resolution:
+            return cache[2]
+        margin = .5 + np.sqrt(2.) * (self.resolution / 2. + .125)
+        nodes = list(graph.graph.nodes())
+        positions = np.asarray([graph.get_node_position(node) for node in nodes])
+        blocked_nodes = []
+        if len(nodes):
+            distances = self._obstacle_tree.query(positions)[0]
+            blocked_nodes = [node for node, distance in zip(nodes, distances) if distance <= margin]
+        edges = list(graph.graph.edges())
+        blocked_edges = []
+        if edges:
+            samples, owners = [], []
+            for index, (first, second) in enumerate(edges):
+                a, b = np.asarray(graph.get_node_position(first)), np.asarray(graph.get_node_position(second))
+                count = max(2, int(np.ceil(np.linalg.norm(b - a) / .25)) + 1)
+                samples.append(np.linspace(a, b, count))
+                owners.append(np.full(count, index, dtype=int))
+            distances = self._obstacle_tree.query(np.concatenate(samples))[0]
+            rejected = np.unique(np.concatenate(owners)[distances <= margin])
+            blocked_edges = [edges[index] for index in rejected]
+        filtered = graph
+        if blocked_nodes or blocked_edges:
+            filtered = copy.copy(graph)
+            filtered.graph = graph.graph.copy()
+            filtered.graph.remove_nodes_from(blocked_nodes)
+            filtered.graph.remove_edges_from(blocked_edges)
+            filtered._spatial_index_valid = False
+        self._obstacle_filter_cache = (graph, self.resolution, filtered)
+        return filtered
     
     def set_target(self, target_pos: Tuple[float, float]):
         """
@@ -196,7 +257,7 @@ class GroundRobotController:
             'drones': drones
         }
     
-    def _receive_and_fuse_graphs(self, drones_data: Dict) -> bool:
+    def _receive_and_fuse_graphs(self, drones_data: Dict, current_time=None) -> bool:
         """
         Receive graphs from nearby drones and perform fusion.
         
@@ -211,7 +272,7 @@ class GroundRobotController:
             self.current_drone_communications.clear()
             return False
         
-        current_time = time.time()
+        current_time = time.time() if current_time is None else current_time
         graphs_fused = False
         
         # Reset communication state for this step
@@ -220,6 +281,11 @@ class GroundRobotController:
         for drone_id, drone_info in drones_data.items():
             broadcast = drone_info.get('broadcast')
             if broadcast and 'graph' in broadcast:
+                last_fusion = self.last_fusion_per_drone.get(drone_id, float('-inf'))
+                if current_time - last_fusion < self.fusion_interval:
+                    self.current_drone_communications[drone_id] = {
+                        'received': True, 'fused': False, 'last_fusion_time': last_fusion}
+                    continue
                 try:
                     # Deserialize graph
                     graph = TopologicalGraph.from_message(broadcast['graph'])
@@ -227,7 +293,7 @@ class GroundRobotController:
                     # Validate graph
                     if len(graph) > 0:
                         # Mark as received
-                        last_fusion_time = self.last_fusion_per_drone.get(drone_id, 0)
+                        last_fusion_time = self.last_fusion_per_drone.get(drone_id, float('-inf'))
                         time_since_last_fusion = current_time - last_fusion_time
                         
                         # Check if we should fuse based on interval
@@ -297,13 +363,15 @@ class GroundRobotController:
                 - 'motion': (linear_vel, angular_vel) velocity command
                 - 'broadcast': None (ground robots don't broadcast yet)
         """
-        current_time = time.time()
+        current_time = simulator_obs.get('full_state', {}).get('time', time.time())
         
         # Step 1: Parse simulator observation
         with self.timer.measure("observation_parsing"):
             parsed_obs = self._parse_simulator_observation(simulator_obs)
             self.position = parsed_obs['position']
             self.heading = parsed_obs['heading']
+            self.resolution = simulator_obs.get('map_resolution', self.resolution)
+            self.local_perception.resolution = self.resolution
         
         # Step 2: Process local perception (occupancy → semantic)
         with self.timer.measure("local_perception"):
@@ -316,14 +384,74 @@ class GroundRobotController:
         
         # Step 3: Receive and fuse graphs from drones
         with self.timer.measure("graph_reception_fusion"):
-            graphs_received = self._receive_and_fuse_graphs(parsed_obs['drones'])
+            graphs_received = self._receive_and_fuse_graphs(parsed_obs['drones'], current_time)
             
             if graphs_received:
                 # Get updated unified graph
                 self.unified_graph = self.graph_fusion.get_unified_graph()
         
+        # Local ground observations override aerial nodes inside obstacles.
+        # Filter a planning copy; retain the received graph for later updates.
+        planning_graph = self._filter_observed_obstacles(self.unified_graph, semantic_map)
+        blocked_cells, _ = self.local_planner.observed_blocked_cells(
+            semantic_map, self.resolution, include_boundary=False)
+        height, width = semantic_map.shape
+        if semantic_map[height // 2, width // 2] in (1, 3, 5):
+            blocked_cells[height // 2, width // 2] = False
+
+        def locally_blocked(position):
+            x = int(np.floor((position[0] - self.position[0]) / self.resolution + width / 2.))
+            y = int(np.floor((position[1] - self.position[1]) / self.resolution + height / 2.))
+            return 0 <= x < width and 0 <= y < height and blocked_cells[y, x]
+
+        def locally_blocked_segment(first, second):
+            first = np.asarray(first, dtype=float) - self.position
+            second = np.asarray(second, dtype=float) - self.position
+            direction = second - first
+            limits = np.array([width, height]) * self.resolution / 2.
+            low, high = 0., 1.
+            for axis in range(2):
+                if abs(direction[axis]) < 1e-12:
+                    if not -limits[axis] <= first[axis] < limits[axis]:
+                        return False
+                else:
+                    a = (-limits[axis] - first[axis]) / direction[axis]
+                    b = (limits[axis] - 1e-9 - first[axis]) / direction[axis]
+                    low, high = max(low, min(a, b)), min(high, max(a, b))
+            if low > high:
+                return False
+            begin, end = first + direction * low, first + direction * high
+            count = max(2, int(np.linalg.norm(end - begin) / self.resolution * 4) + 1)
+            points = np.linspace(begin, end, count)
+            xs = np.clip(np.floor(points[:, 0] / self.resolution + width / 2.).astype(int), 0, width - 1)
+            ys = np.clip(np.floor(points[:, 1] / self.resolution + height / 2.).astype(int), 0, height - 1)
+            return bool(np.any(blocked_cells[ys, xs]))
+
+        if planning_graph is not None:
+            blocked_nodes = [node for node, data in planning_graph.graph.nodes(data=True)
+                             if locally_blocked(data['position'])]
+            blocked_edges = [(first, second) for first, second in planning_graph.graph.edges()
+                             if locally_blocked_segment(planning_graph.get_node_position(first),
+                                                        planning_graph.get_node_position(second))]
+            if blocked_nodes or blocked_edges:
+                planning_graph = copy.copy(planning_graph)
+                planning_graph.graph = planning_graph.graph.copy()
+                planning_graph.graph.remove_nodes_from(blocked_nodes)
+                planning_graph.graph.remove_edges_from(blocked_edges)
+                planning_graph._spatial_index_valid = False
+        old_waypoint = self.global_planner.get_current_waypoint()
+        # A blocked straight connector can have a valid local detour. Keep
+        # that destination while executing the detour instead of repeatedly
+        # resetting the route to a nearest node behind the robot.
+        route_blocked = (old_waypoint is not None and
+                         (locally_blocked(old_waypoint) or
+                          (locally_blocked_segment(self.position, old_waypoint) and
+                           self.local_planner.observed_connection_waypoint(
+                               self.position, old_waypoint, semantic_map, self.resolution) is None)))
+
         # Step 4: Global planning
         current_waypoint = None
+        local_route_used = False
         
         if self.goal_position is not None:
             with self.timer.measure("global_planning"):
@@ -334,19 +462,19 @@ class GroundRobotController:
                     # Initial planning
                     needs_replan = True
                     print(f"[{self.robot_id}] Initial planning...")
-                elif graphs_received and self.unified_graph is not None:
+                elif route_blocked or (graphs_received and self.unified_graph is not None):
                     # New graph fused - re-evaluate planning strategy
                     needs_replan = True
                     print(f"[{self.robot_id}] New graph fused, re-evaluating route...")
                 else:
                     # Check if goal reached
-                    if self.global_planner.is_goal_reached(self.position):
+                    if self.global_planner.is_goal_reached(self.position, self.waypoint_threshold):
                         print(f"[{self.robot_id}] Goal reached!")
                         self.global_planner.clear_path()
                         self.goal_position = None
                     else:
                         # Advance waypoint if reached
-                        self.global_planner.advance_waypoint(self.position)
+                        self.global_planner.advance_waypoint(self.position, self.waypoint_threshold)
                         
                         # Check if should replan due to deviation
                         if self.global_planner.should_replan(self.position):
@@ -358,30 +486,59 @@ class GroundRobotController:
                     self.global_planner.plan_path(
                         start_pos=self.position,
                         goal_pos=self.goal_position,
-                        graph=self.unified_graph
+                        graph=planning_graph
                     )
                     # path[0] is the start_pos anchor (robot is already there).
                     # Advance past it immediately so the first real destination is
                     # served on this control cycle, not the next one.
                     # Without this, every replan (triggered by new graph fusions)
                     # keeps the robot targeting its own position → zero velocity.
-                    self.global_planner.advance_waypoint(self.position)
+                    self.global_planner.advance_waypoint(self.position, self.waypoint_threshold)
                 
                 # Get current waypoint
                 current_waypoint = self.global_planner.get_current_waypoint()
 
+                self.global_planner.waiting_at_frontier = False
                 # Uncertainty gate: hold position if the upcoming edge is
                 # through unexplored terrain (confidence below threshold).
                 if (current_waypoint is not None
-                        and self.unified_graph is not None
+                        and planning_graph is not None
                         and self.position is not None):
-                    conf = self.unified_graph.edge_confidence_from_positions(
-                        self.position, current_waypoint)
+                    edge_start = self.position
+                    if self.global_planner.using_graph and self.global_planner.current_waypoint_idx > 0:
+                        edge_start = self.global_planner.current_path[
+                            self.global_planner.current_waypoint_idx - 1]
+                    conf = planning_graph.edge_confidence_from_positions(edge_start, current_waypoint)
+                    if (self.global_planner.using_graph and self.goal_position is not None
+                            and np.linalg.norm(np.asarray(current_waypoint) - self.goal_position) < 1e-6):
+                        goal_node = planning_graph.find_nearest_node(self.goal_position)
+                        delta = np.abs(np.asarray(self.goal_position) - self.position)
+                        locally_observed_goal = np.all(delta <= np.array([width, height])
+                                                       * self.resolution / 2. - 1.)
+                        if (goal_node is None or goal_node[1] > self.waypoint_threshold) and not locally_observed_goal:
+                            conf = 0.
                     if conf <= self.edge_confidence_threshold:
-                        self.global_planner.waiting_at_frontier = True
-                        current_waypoint = None
+                        # The artificial START -> first graph node connector
+                        # has no graph evidence yet. Local sensing can support
+                        # a short approach to that node, without authorizing
+                        # internal graph gaps or the final unknown goal edge.
+                        is_entry = (self.global_planner.using_graph
+                                    and self.global_planner.start_connection_idx is not None
+                                    and self.global_planner.current_waypoint_idx
+                                    == self.global_planner.start_connection_idx)
+                        current_waypoint = (
+                            self.local_planner.observed_connection_waypoint(
+                                self.position, current_waypoint, semantic_map, self.resolution)
+                            if is_entry else None)
+                        self.global_planner.waiting_at_frontier = current_waypoint is None
+                        local_route_used = current_waypoint is not None
                     else:
                         self.global_planner.waiting_at_frontier = False
+
+                if current_waypoint is not None and not local_route_used:
+                    current_waypoint = self.local_planner.observed_connection_waypoint(
+                        self.position, current_waypoint, semantic_map, self.resolution)
+                    local_route_used = current_waypoint is not None
         
         # Step 5: Local planning (compute velocity command)
         with self.timer.measure("local_planning"):
@@ -392,9 +549,15 @@ class GroundRobotController:
                     current_pos=self.position,
                     current_heading=self.heading,
                     target_waypoint=current_waypoint,
-                    local_semantic_map=semantic_map,
+                    local_semantic_map=None if local_route_used else semantic_map,
                     resolution=self.resolution
                 )
+                if local_route_used:
+                    desired_heading = np.arctan2(current_waypoint[1] - self.position[1],
+                                                 current_waypoint[0] - self.position[0])
+                    heading_error = self.local_planner._normalize_angle(desired_heading - self.heading)
+                    if abs(heading_error) > 0.25:
+                        velocity_cmd = (0., velocity_cmd[1])
         
         # Step 6: Return action with broadcast (for drone coordination)
         return {
@@ -403,7 +566,8 @@ class GroundRobotController:
                 'robot_id': self.robot_id,
                 'position': list(self.position) if self.position else [0.0, 0.0],
                 'target': list(self.goal_position) if self.goal_position else None,
-                'timestamp': current_time
+                'timestamp': current_time,
+                'planned_path': self.global_planner.get_remaining_path() or []
             }
         }
     
@@ -420,7 +584,8 @@ class GroundRobotController:
             'heading': self.heading,
             'goal_position': self.goal_position,
             'has_graph': self.unified_graph is not None,
-            'graphs_received': self.graphs_received
+            'graphs_received': self.graphs_received,
+            'waiting_at_frontier': self.global_planner.waiting_at_frontier
         }
         
         if self.unified_graph is not None:
@@ -454,6 +619,9 @@ class GroundRobotController:
         self.goal_position = None
         self.unified_graph = None
         self.graphs_received = 0
+        self._observed_obstacles.clear()
+        self._obstacle_tree = None
+        self._obstacle_filter_cache = None
         self.global_planner.clear_path()
         self.graph_fusion.clear()
         print(f"[{self.robot_id}] Controller reset")

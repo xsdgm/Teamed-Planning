@@ -614,6 +614,7 @@ class DroneROSNode:
                 'type': 'drone',
             },
             'occupancy_map': smoothed_occ,
+            'map_axes': 'xy',
             'neighbors': neighbors,
             'neighbor_waypoints': dict(self.other_drone_waypoints),
         }

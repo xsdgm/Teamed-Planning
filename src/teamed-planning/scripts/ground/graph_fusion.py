@@ -39,6 +39,7 @@ class GraphFusion:
         self.merge_threshold = merge_threshold
         self.unified_graph = TopologicalGraph(drone_id=f"{robot_id}_unified")
         self.source_graphs = {}  # {drone_id: TopologicalGraph}
+        self._merge_buckets = {}
         
         # Uncertainty handling (placeholder for future)
         self.uncertainty_enabled = False
@@ -63,6 +64,7 @@ class GraphFusion:
         """
         # Create new unified graph
         self.unified_graph = TopologicalGraph(drone_id=f"{self.robot_id}_unified")
+        self._merge_buckets = {}
         
         # Track which nodes have been added
         # Maps (drone_id, original_node_id) -> unified_node_id
@@ -86,6 +88,7 @@ class GraphFusion:
                     # Use attributes from this node
                     attributes = {k: v for k, v in node_data.items() if k != 'position'}
                     self.unified_graph.add_node(unified_node_id, position, attributes)
+                    self._merge_buckets.setdefault(self._merge_cell(position), []).append(unified_node_id)
                     
                     # Track mapping
                     node_mapping[(drone_id, node_id)] = unified_node_id
@@ -143,19 +146,23 @@ class GraphFusion:
         if len(self.unified_graph) == 0:
             return None
         
-        # Find nearest node
-        nearest = self.unified_graph.find_nearest_node(position)
-        
-        if nearest is None:
-            return None
-        
-        node_id, distance = nearest
-        
-        # Merge if within threshold
-        if distance <= self.merge_threshold:
-            return node_id
-        
-        return None
+        # Rebuilding a KD-tree after every inserted/averaged node is quadratic.
+        # A threshold-sized spatial grid finds exactly the same nearby merge
+        # candidates while supporting incremental position updates.
+        cx, cy = self._merge_cell(position)
+        best_node, best_distance = None, float('inf')
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for node_id in self._merge_buckets.get((cx + dx, cy + dy), []):
+                    distance = float(np.linalg.norm(np.asarray(position) -
+                                                   self.unified_graph.get_node_position(node_id)))
+                    if distance <= self.merge_threshold and distance < best_distance:
+                        best_node, best_distance = node_id, distance
+        return best_node
+
+    def _merge_cell(self, position):
+        size = self.merge_threshold if self.merge_threshold > 0 else 1.
+        return tuple(int(np.floor(value / size)) for value in position[:2])
     
     def _update_merged_node_position(self, node_id: str, new_position: Tuple[float, float],
                                      source_nodes: List[Tuple[str, str]]):
@@ -177,6 +184,10 @@ class GraphFusion:
         
         # Update node position
         self.unified_graph.graph.nodes[node_id]['position'] = (avg_x, avg_y)
+        old_cell, new_cell = self._merge_cell(current_pos), self._merge_cell((avg_x, avg_y))
+        if old_cell != new_cell:
+            self._merge_buckets[old_cell].remove(node_id)
+            self._merge_buckets.setdefault(new_cell, []).append(node_id)
         
         # Invalidate spatial index
         self.unified_graph._spatial_index_valid = False

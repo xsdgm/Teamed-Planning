@@ -28,8 +28,19 @@ class PygameRenderer:
             raise ImportError("pygame is required for rendering")
         
         self.world_size = world_size
+        pygame.init()
+        # Use matching window/surface pixels. SCALED keeps a fixed logical
+        # surface and can letterbox a resized window, complicating picking.
+        self.display_flags = pygame.RESIZABLE
+        desktop_width, desktop_height = pygame.display.get_desktop_sizes()[0]
+        fit = min(1., max(1, desktop_width - 80) / window_size[0],
+                  max(1, desktop_height - 120) / window_size[1])
+        window_size = tuple(max(1, int(value * fit)) for value in window_size)
+        self.screen = pygame.display.set_mode(window_size, self.display_flags)
+        window_size = self.screen.get_size()
         self.window_size = window_size
         self.target_fps = target_fps
+        self.closed = False
         
         # Initial scale
         self.base_scale_x = window_size[0] / world_size[0]
@@ -51,10 +62,6 @@ class PygameRenderer:
         self.drag_start_pos = None
         self.drag_start_offset = None
         
-        # Initialize pygame with hardware acceleration
-        pygame.init()
-        flags = pygame.HWSURFACE | pygame.DOUBLEBUF
-        self.screen = pygame.display.set_mode(window_size, flags)
         pygame.display.set_caption("Multi-Robot Sim [Scroll:Zoom Drag:Pan R:Reset F:FPS 1-3:Limit]")
         self.clock = pygame.time.Clock()
         
@@ -134,19 +141,40 @@ class PygameRenderer:
     
     def zoom(self, zoom_delta: float, mouse_pos: Optional[Tuple[int, int]] = None):
         """Zoom view"""
-        if mouse_pos:
+        if mouse_pos is not None:
             world_pos_before = self.screen_to_world(mouse_pos)
         
-        self.zoom_level *= (1.0 + zoom_delta)
+        self.zoom_level *= 1.1 ** (zoom_delta / 0.1)
         self.zoom_level = np.clip(self.zoom_level, 0.1, 20.0)
         self.scale = self.base_scale * self.zoom_level
         
-        if mouse_pos:
+        if mouse_pos is not None:
             world_pos_after = self.screen_to_world(mouse_pos)
             self.offset_x += world_pos_before[0] - world_pos_after[0]
             self.offset_y += world_pos_before[1] - world_pos_after[1]
         
         self.cache_valid = False
+
+    def resize(self, window_size):
+        """Resize the drawing surface while preserving the view center."""
+        window_size = tuple(max(1, int(value)) for value in window_size)
+        if window_size == self.window_size:
+            return
+        center = self.screen_to_world((self.window_size[0] / 2., self.window_size[1] / 2.))
+        surface = pygame.display.get_surface()
+        if surface is None or surface.get_size() != window_size:
+            surface = pygame.display.set_mode(window_size, self.display_flags)
+        self.screen = surface
+        self.window_size = self.screen.get_size()
+        self.base_scale_x = self.window_size[0] / self.world_size[0]
+        self.base_scale_y = self.window_size[1] / self.world_size[1]
+        self.base_scale = min(self.base_scale_x, self.base_scale_y)
+        self.scale = self.base_scale * self.zoom_level
+        self.offset_x = center[0] - self.window_size[0] / (2. * self.scale)
+        self.offset_y = center[1] - self.window_size[1] / (2. * self.scale)
+        self.background_cache = None
+        self.cache_valid = False
+        self.dragging = False
     
     def reset_view(self):
         """Reset view"""
@@ -163,13 +191,22 @@ class PygameRenderer:
         Args:
             auto_flip: If True, automatically call pygame.display.flip() (default: True)
         """
+        if self.closed:
+            return
         # Handle events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.close()
                 return
+            elif event.type in (pygame.VIDEORESIZE, pygame.WINDOWSIZECHANGED):
+                # Pygame 2 resizes the surface automatically. Read the current
+                # size rather than replaying stale events from rapid drags.
+                self.resize(pygame.display.get_window_size())
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_g:
+                if event.key == pygame.K_ESCAPE:
+                    self.close()
+                    return
+                elif event.key == pygame.K_g:
                     self.show_grid = not self.show_grid
                     self.cache_valid = False
                 elif event.key == pygame.K_l:
@@ -408,6 +445,7 @@ class PygameRenderer:
     def close(self):
         """Close renderer"""
         if PYGAME_AVAILABLE:
+            self.closed = True
             pygame.quit()
 
 

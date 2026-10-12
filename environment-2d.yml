@@ -1,0 +1,9 @@
+name: teamedplanning-2d
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r src/teamed-planning/scripts/requirements.txt
+      - -r src/teamed-planning/scripts/simulator/requirements.txt

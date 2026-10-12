@@ -54,9 +54,17 @@ The same proxy is computed for the predicted graph `G'(w_i)`.  If an
 observation at `w_i` extends the graph frontier closer to the goal, the
 proxy decreases, producing a positive `DeltaJ`.
 
+For a distant goal outside the existing topology, the implementation also
+estimates the continuous extension of the frontier covered by the proposed
+camera footprint. The footprint must overlap the observed frontier. This
+optimistic estimate scores aerial observation targets only; it never adds
+predicted edges to the real ground map or permits ground travel through
+unobserved terrain. Reobservations increase cumulative terrain evidence
+used in edge confidence, rather than changing an unused node counter.
+
 ## Coupling Constraints — Relay Chain Topology
 
-Drones form a **relay chain** ordered by distance to the ground robot.
+Drones form a **relay chain** ordered by stable drone ID.
 Communication constraints are enforced only between **adjacent** chain
 members, not between all pairs.  This allows the fleet to extend
 exploration range to `N * comm_range` instead of clustering within a
@@ -64,9 +72,9 @@ single `comm_range` bubble.
 
 ### Chain ordering
 
-All known drones are sorted by Euclidean distance to the ground robot
-(ties broken by drone ID string for determinism).  A **cooldown timer**
-(default 3 s) prevents rank flapping when drones are equidistant.
+All known drones are sorted by drone ID. Independent position snapshots
+and near-equal distances cannot make two agents claim the same rank when
+they know the same fleet. Fleet membership still comes from communication.
 
 ```
 Robot <-- Drone rank 0 <-- Drone rank 1 <-- ... <-- Drone rank N-1
@@ -159,7 +167,10 @@ Candidates are drawn from five sources (ranked by priority):
 With a fixed candidate set and convex coupling constraints, C-ADMM
 converges to a consensus-feasible solution.  In practice, *K = 5*
 iterations per planning cycle (at 10 Hz) provide sufficient convergence
-for real-time operation.
+for real-time operation. The Python simulator runs motion control each physics
+step and dispatches new aerial targets once per simulated second by default.
+Fusion and relay ordering use simulation time when simulator observations
+provide it, and wall time for live observations.
 
 ## Ground Robot Frontier Behaviour
 

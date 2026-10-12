@@ -32,6 +32,8 @@ src/teamed-planning/launch/multi_vehicle_with_ground.launch
 
 # Runtime / temporary files
 logs/
+artifacts/
+docker/*.tar.gz
 tmp/
 *.bak
 src/teamed-planning/deploy/.ros_docker/

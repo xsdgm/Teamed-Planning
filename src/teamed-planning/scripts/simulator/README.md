@@ -30,10 +30,8 @@ simple_multi_robot_sim/
 ├── utils.py                # Utility functions
 ├── renderer_pygame.py      # Pygame renderer (with zoom/pan)
 ├── forest_generator.py     # Forest scene generator
-├── quick_test.py           # Quick test
+├── mission_demo.py         # Cooperative forest navigation
 ├── km_scale_demo.py        # 10km scene demo
-├── performance_test.py     # Performance test
-├── broadcast_test.py       # Broadcast communication test
 └── requirements.txt
 ```
 
@@ -44,9 +42,9 @@ simple_multi_robot_sim/
 pip install numpy pygame
 ```
 
-### Quick Test (2km x 2km scene)
+### Cooperative Forest Navigation (1km x 1km)
 ```bash
-python quick_test.py
+python mission_demo.py --steps 20000
 ```
 
 ### Large Scene Demo (10km x 10km, 7 robots)
@@ -356,27 +354,10 @@ for step in range(1000):
         env.render()
 ```
 
-## 📝 Example Programs
+## Example Programs
 
-1. **quick_test.py** - Quick visualization test
-   - 2km x 2km
-   - 3 robots
-   - Test zoom and pan
-
-2. **km_scale_demo.py** - Large-scale navigation
-   - 10km x 10km forest
-   - 7 robot navigation task
-   - Simple obstacle avoidance
-
-3. **performance_test.py** - Performance testing
-   - 5km x 5km dense forest
-   - 10 robots
-   - Test rendering performance
-
-4. **broadcast_test.py** - Communication test
-   - Demonstrates broadcast functionality
-   - Robots broadcast and receive messages
-   - Shows neighbor communication
+- **mission_demo.py**: Three drones map a 1km forest and support ground navigation.
+- **km_scale_demo.py**: Larger forest visualization and navigation example.
 
 ## ⚡ Performance Tips
 

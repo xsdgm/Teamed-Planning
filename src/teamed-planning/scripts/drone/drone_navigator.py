@@ -108,6 +108,7 @@ class DroneNavigator:
                              current_pos: Tuple[float, float],
                              flight_height: float,
                              max_candidates: int = 20,
+                             frontier=None,
                              ) -> List[Tuple[float, float, float]]:
         """Produce candidate waypoints from the graph topology.
 
@@ -174,7 +175,8 @@ class DroneNavigator:
         # When the graph doesn't reach the goal, place candidates just
         # beyond the current frontier so observing there extends the graph.
         if graph is not None and graph.graph.number_of_nodes() > 0:
-            frontier = graph.find_best_frontier(current_pos[:2], goal)
+            if frontier is None:
+                frontier = graph.find_best_frontier(current_pos[:2], goal)
             if frontier is not None:
                 _fid, fpos = frontier
                 fpos_arr = np.array(fpos)
@@ -186,7 +188,7 @@ class DroneNavigator:
                     for k in range(1, 4):
                         pt = fpos_arr + extend_dir * step * k
                         if float(np.linalg.norm(pt - goal_arr)) < extend_dist:
-                            candidates.append(
+                            candidates.insert(0,
                                 (float(pt[0]), float(pt[1]), flight_height))
 
         # Deduplicate (keep candidates further than 2m apart)
@@ -206,7 +208,9 @@ class DroneNavigator:
                     w: Tuple[float, float, float],
                     graph,
                     start: Tuple[float, float],
-                    goal: Tuple[float, float]) -> float:
+                    goal: Tuple[float, float],
+                    cost_before: Optional[float] = None,
+                    frontier=None, predicted_cost=None) -> float:
         """f_i(w) = -DeltaJ(w) = -(cost_before - cost_after).
 
         Lower is better (we minimise f_i).
@@ -225,21 +229,71 @@ class DroneNavigator:
         epsilon = 0.05
         off_graph_penalty = 1.0 / epsilon
 
-        cost_before = graph.path_cost(start, goal, epsilon=epsilon)
-        if cost_before == float('inf'):
-            cost_before = self._frontier_proxy(graph, start, goal,
-                                               epsilon, off_graph_penalty)
+        if cost_before is None:
+            cost_before = self._baseline_cost(graph, start, goal, epsilon)
 
-        predicted = graph.predict_observation(
-            (w[0], w[1]), self.fov_radius)
+        if frontier is None:
+            frontier = graph.find_best_frontier(start, goal, epsilon=epsilon)
+        # For a distant, unseen goal the topology outside the frontier does
+        # not exist yet. Evaluate its optimistic footprint extension directly
+        # instead of cloning/searching the identical graph per candidate.
+        if frontier is not None:
+            fpos = np.asarray(frontier[1], dtype=float)
+            ray = np.asarray(goal, dtype=float) - fpos
+            remaining = float(np.linalg.norm(ray))
+            if remaining > self.fov_radius:
+                ray /= remaining
+                relative = np.asarray(w[:2]) - fpos
+                along = float(np.dot(relative, ray))
+                perpendicular = float(np.linalg.norm(relative - along * ray))
+                gain = 0.
+                if perpendicular < self.fov_radius:
+                    span = float(np.sqrt(self.fov_radius ** 2 - perpendicular ** 2))
+                    if along - span <= 0 <= along + span:
+                        gain = (off_graph_penalty - 1.) * min(remaining, max(0., along + span))
+                return -gain
 
-        cost_after = predicted.path_cost(start, goal, epsilon=epsilon)
-        if cost_after == float('inf'):
-            cost_after = self._frontier_proxy(predicted, start, goal,
-                                              epsilon, off_graph_penalty)
+        if predicted_cost is None:
+            predicted = graph.predict_observation(
+                (w[0], w[1]), self.fov_radius)
+            cost_after = predicted.path_cost(start, goal, epsilon=epsilon)
+            if cost_after == float('inf'):
+                cost_after = self._frontier_proxy(predicted, start, goal,
+                                                  epsilon, off_graph_penalty)
+        else:
+            cost_after = predicted_cost
+
+        # Predict the extension of an *observed* frontier. Count-only copies
+        # cannot add topology in unseen space, so they otherwise assign zero
+        # gain to every new observation. This optimistic extension is used
+        # only for choosing aerial observations, never as a ground map edge.
+        if frontier is not None:
+            fpos = np.asarray(frontier[1], dtype=float)
+            direction = np.asarray(goal, dtype=float) - fpos
+            remaining = float(np.linalg.norm(direction))
+            if remaining > 0:
+                direction /= remaining
+                relative = np.asarray(w[:2]) - fpos
+                along = float(np.dot(relative, direction))
+                perpendicular = float(np.linalg.norm(relative - along * direction))
+                if perpendicular < self.fov_radius:
+                    half_span = float(np.sqrt(self.fov_radius ** 2 - perpendicular ** 2))
+                    if along - half_span <= 0 <= along + half_span:
+                        extension = max(0., min(remaining, along + half_span))
+                        cost_after = min(cost_after,
+                                         cost_before - (off_graph_penalty - 1.) * extension)
 
         delta_j = cost_before - cost_after
         return -delta_j
+
+    def _baseline_cost(self, graph, start, goal, epsilon=0.05):
+        """The unobserved graph's cost is identical for every candidate."""
+        if graph is None or graph.graph.number_of_nodes() == 0:
+            return 0.0
+        cost = graph.path_cost(start, goal, epsilon=epsilon)
+        if cost == float('inf'):
+            cost = self._frontier_proxy(graph, start, goal, epsilon, 1.0 / epsilon)
+        return cost
 
     @staticmethod
     def _frontier_proxy(graph,
@@ -272,6 +326,7 @@ class DroneNavigator:
                      neighbor_waypoints: Dict[str, Tuple[float, float, float]],
                      drone_positions: Dict[str, tuple],
                      current_pos: Tuple[float, float, float],
+                     frontier=None,
                      ) -> Optional[Tuple[float, float, float]]:
         """Run K C-ADMM iterations over the candidate set.
 
@@ -307,14 +362,16 @@ class DroneNavigator:
         # ── Rank 0 hard constraint: filter candidates ─────────────────
         if self._chain_rank == 0 and self.ground_robot_position is not None:
             robot_arr = np.array(self.ground_robot_position)
+            # The radio limit is spatial; the ground endpoint is at z=0.
+            horizontal_range = np.sqrt(max(0., self.comm_range ** 2 - current_pos[2] ** 2))
             filtered = [c for c in candidates
                         if np.linalg.norm(
-                            np.array(c[:2]) - robot_arr) <= self.comm_range]
+                            np.array(c[:2]) - robot_arr) <= horizontal_range]
             if not filtered:
-                # All candidates too far — keep the one closest to robot
-                filtered = [min(candidates,
-                                key=lambda c: float(np.linalg.norm(
-                                    np.array(c[:2]) - robot_arr)))]
+                closest = min(candidates, key=lambda c: np.linalg.norm(np.array(c[:2]) - robot_arr))
+                delta = np.asarray(closest[:2]) - robot_arr
+                point = robot_arr + delta * min(1., horizontal_range / max(np.linalg.norm(delta), 1e-9))
+                filtered = [(float(point[0]), float(point[1]), closest[2])]
             candidates = filtered
 
         # ── Dual variable housekeeping (chain neighbors only) ─────────
@@ -330,16 +387,48 @@ class DroneNavigator:
             if did != self.drone_id:
                 repulsion_refs[did] = np.array(pos[:2])
         for did, wp in neighbor_waypoints.items():
-            repulsion_refs[did] = np.array(wp[:2])
+            if did != self.drone_id:
+                repulsion_refs[did] = np.array(wp[:2])
+
+        # Reserve lower-ID proposals first, so symmetric agents cannot keep
+        # selecting the same point. Add nearby alternatives before filtering.
+        reserved = [np.asarray(wp[:2]) for did, wp in neighbor_waypoints.items()
+                    if did < self.drone_id]
+        if reserved:
+            alternatives = list(candidates)
+            for w in candidates[:4]:
+                for angle in np.linspace(0., 2. * np.pi, 8, endpoint=False):
+                    offset = (self.min_separation + 1.) * np.array([np.cos(angle), np.sin(angle)])
+                    point = np.asarray(w[:2]) + offset
+                    alternatives.append((float(point[0]), float(point[1]), w[2]))
+            candidates = [w for w in alternatives
+                          if all(np.linalg.norm(np.asarray(w[:2]) - ref) >= self.min_separation
+                                 for ref in reserved)
+                          and (self._chain_rank != 0 or
+                               np.linalg.norm(np.asarray(w[:2]) - robot_arr) <= horizontal_range)]
+            if not candidates:
+                return None
 
         best_w = candidates[0]
 
+        # Graph, start, goal and candidates stay fixed during this solve.
+        # Only the dual penalties change between ADMM iterations.
+        if frontier is None and graph is not None:
+            frontier = graph.find_best_frontier(start, goal)
+        distant_frontier = (frontier is not None and
+                            np.linalg.norm(np.asarray(goal) - frontier[1]) > self.fov_radius)
+        cost_before = 0. if distant_frontier else self._baseline_cost(graph, start, goal)
+        predictions = ([None] * len(candidates) if distant_frontier or graph is None else
+                       graph.predicted_path_costs([w[:2] for w in candidates], self.fov_radius, start, goal))
+        local_costs = [self._local_cost(w, graph, start, goal, cost_before, frontier, prediction)
+                       for w, prediction in zip(candidates, predictions)]
+
         for _k in range(self._admm_K):
             best_score = float('inf')
-            for w in candidates:
+            for w, local_cost in zip(candidates, local_costs):
                 w_arr = np.array(w[:2])
 
-                score = self._local_cost(w, graph, start, goal)
+                score = local_cost
 
                 # ADMM penalty: chain neighbors only
                 for did, wp_arr in chain_wps.items():
@@ -375,21 +464,17 @@ class DroneNavigator:
         """Auxiliary variable z_ij projected onto the feasible set
         [min_separation, comm_range] for inter-drone distance.
 
-        Returns the consensus midpoint shifted so that the half-vector
-        satisfies both distance bounds.
+        Project the proposed waypoint onto the feasible distance annulus
+        around the neighbor. Feasible proposals are unchanged.
         """
-        mid = (w_i + w_j) / 2.0
-        half = (w_i - w_j) / 2.0
-        half_norm = float(np.linalg.norm(half))
-        if half_norm < 1e-6:
-            return mid
-        # Clamp half-distance to [min_sep/2, comm_range/2]
-        min_half = self.min_separation / 2.0
-        max_half = self.comm_range / 2.0
-        clamped = max(min_half, min(half_norm, max_half))
-        if abs(clamped - half_norm) > 1e-6:
-            half = half * (clamped / half_norm)
-        return mid
+        displacement = w_i - w_j
+        distance = float(np.linalg.norm(displacement))
+        if self.min_separation <= distance <= self.comm_range:
+            return w_i.copy()
+        if distance < 1e-6:
+            return w_j + np.array([self.min_separation, 0.])
+        clamped = np.clip(distance, self.min_separation, self.comm_range)
+        return w_j + displacement * (clamped / distance)
 
     # ── Relay chain ordering ─────────────────────────────────────────────
 
@@ -400,16 +485,15 @@ class DroneNavigator:
     ) -> Dict[str, tuple]:
         """Determine this drone's adjacent neighbors in the relay chain.
 
-        All known drones (including self) are sorted by distance to the
-        ground robot.  The chain is:
+        All known drones (including self) are sorted by stable drone ID.
+        The chain is:
             Robot <-- rank 0 <-- rank 1 <-- ... <-- rank N-1
 
         Returns a dict of at most 2 neighbors (predecessor + successor).
         For rank 0, the ground robot is included as a fixed "neighbor"
         under the key ``'__ground_robot__'``.
 
-        A cooldown timer prevents rank flapping when drones are close
-        together.
+        Position delays do not change ranks when the known fleet agrees.
         """
         import time as _time
 
@@ -426,25 +510,15 @@ class DroneNavigator:
             if did != self.drone_id:
                 all_drones[did] = np.array(pos[:2])
 
-        # Sort by distance to ground robot, tiebreak by drone_id
-        def _sort_key(item):
-            did, pos = item
-            return (float(np.linalg.norm(pos - robot_xy)), did)
+        # IDs define a stable chain. Sorting independent, delayed position
+        # snapshots made two nearly equidistant agents both claim rank 1.
+        sorted_ids = sorted(all_drones)
 
-        sorted_drones = sorted(all_drones.items(), key=_sort_key)
-        sorted_ids = [did for did, _ in sorted_drones]
-
-        # Cooldown: keep previous rank if not expired and the same drones
-        # are still present
-        now = _time.time()
-        same_fleet = set(sorted_ids) == set(self._chain_order)
-        if (same_fleet
-                and self._chain_order
-                and now - self._last_rank_time < self._rank_cooldown):
-            sorted_ids = self._chain_order
-        else:
-            self._chain_order = sorted_ids
-            self._last_rank_time = now
+        now = getattr(self, '_observation_time', None)
+        if now is None:
+            now = _time.time()
+        self._chain_order = sorted_ids
+        self._last_rank_time = now
 
         # Find my rank
         my_rank = 0
@@ -491,16 +565,12 @@ class DroneNavigator:
             return None
         direction = direction / dist
 
-        # Determine this drone's rank by distance to robot
+        # Use the same stable rank as the dispatcher.
         all_pos = {self.drone_id: current_pos}
         all_pos.update(drone_positions)
         robot_xy = robot_pos
 
-        def _dist_to_robot(item):
-            return float(np.linalg.norm(
-                np.array(item[1][:2]) - robot_xy))
-
-        sorted_drones = sorted(all_pos.items(), key=_dist_to_robot)
+        sorted_drones = sorted(all_pos.items())
         n_drones = len(sorted_drones)
         rank = 0
         for r, (did, _) in enumerate(sorted_drones):
@@ -508,8 +578,8 @@ class DroneNavigator:
                 rank = r
                 break
 
-        segment = dist / max(n_drones, 1)
-        deploy_dist = segment * (rank + 0.5)
+        segment = min(self.fov_radius, self.comm_range * 0.6)
+        deploy_dist = segment * (rank + 1)
         deploy_dist = min(deploy_dist, dist * 0.95)
         pt = robot_pos + direction * deploy_dist
         return (float(pt[0]), float(pt[1]), flight_height)
@@ -530,6 +600,7 @@ class DroneNavigator:
         """
 
         # ── DISCOVERING ───────────────────────────────────────────────────
+        self._observation_time = observation_data.get('time')
         if self.phase == NavigationPhase.DISCOVERING:
             self.discover_mission(observation_data,
                                   flight_height=current_position[2])
@@ -567,16 +638,17 @@ class DroneNavigator:
                 drone_positions[did] = tuple(dpos)
 
         # Generate candidates from graph topology
+        frontier = graph.find_best_frontier(start, goal) if graph is not None else None
         candidates = self._generate_candidates(
             graph, self._planned_path, goal,
-            current_position, current_position[2])
+            current_position, current_position[2], frontier=frontier)
 
         # Choose waypoint via C-ADMM (or fallback)
         target: Optional[Tuple[float, float, float]] = None
         if candidates and graph is not None and graph.graph.number_of_nodes() > 0:
             target = self._admm_select(
                 candidates, graph, start, goal, neighbor_wps,
-                drone_positions, current_position)
+                drone_positions, current_position, frontier=frontier)
 
         if target is None:
             target = self._straight_line_fallback(
