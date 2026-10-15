@@ -25,6 +25,7 @@ class EnvConfig:
     occupancy_map_size: int = None  # Size of occupancy map in pixels for drones (if None, auto-calculated)
     ground_occupancy_map_size: int = None  # Size of occupancy map in pixels for ground robots (if None, auto-calculated)
     occupancy_map_resolution: float = 0.5  # Resolution in meters per pixel
+    ground_occupancy_map_resolution: float = None  # Optional independent ground sensor resolution
     
 
 class MultiRobotEnv:
@@ -228,7 +229,9 @@ class MultiRobotEnv:
             
             if occupancy_map is not None:
                 observations[robot.robot_id]['occupancy_map'] = occupancy_map
-                observations[robot.robot_id]['map_resolution'] = self.config.occupancy_map_resolution
+                observations[robot.robot_id]['map_resolution'] = (
+                    self.config.ground_occupancy_map_resolution or self.config.occupancy_map_resolution
+                    if isinstance(robot,GroundRobot) else self.config.occupancy_map_resolution)
                 observations[robot.robot_id]['map_axes'] = 'yx'
                 observations[robot.robot_id]['time_step'] = self.config.dt
         
@@ -258,7 +261,8 @@ class MultiRobotEnv:
             perception_range = self.config.perception_radius
             map_size = self.config.occupancy_map_size
         
-        resolution = self.config.occupancy_map_resolution
+        resolution = (self.config.ground_occupancy_map_resolution or self.config.occupancy_map_resolution
+                      if robot_type == 'ground' else self.config.occupancy_map_resolution)
         
         # Initialize as free space
         occupancy_map = np.zeros((map_size, map_size), dtype=np.uint8)

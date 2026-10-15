@@ -1,0 +1,509 @@
+"""Train/evaluate MAPPO in the existing 2D physics, mapper and controller.
+
+Run from anywhere: python path/to/mappo_experiment.py --episodes 40 --steps 48
+No simulator full_state, velocity or obstacle list enters the learner/reward.
+"""
+import argparse
+import contextlib
+import io
+import json
+import sys
+import time
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import torch
+from drone.drone_main import DroneController
+from drone.drone_navigator import DroneNavigator
+from drone.mappo import ActorCritic, CandidateNavigator
+from simulator.env import EnvConfig, MultiRobotEnv
+from ground.ground_main import GroundRobotController
+
+
+def navigation_cost(graph, start, goal):
+    """Original CADMM uncertainty-weighted path cost and frontier proxy.
+
+    Empty/unknown graph uses the same 1/epsilon off-graph penalty, rather
+    than zero: the first delivered graph must not be punished for existing.
+    """
+    if graph is None or len(graph) == 0:
+        return float(np.linalg.norm(np.asarray(goal)-start)/.05)
+    cost=graph.path_cost(start,goal,epsilon=.05)
+    return float(cost if np.isfinite(cost) else
+                 DroneNavigator._frontier_proxy(graph,start,goal,.05,20.))
+
+
+def cadmm_exploration_reward(cost_before, cost_after, old_seen, seen, weight,
+                             path_scale=100., area_scale=400.):
+    """Two task terms, computed solely from information delivered to ground."""
+    gain=float(cost_before-cost_after)
+    area=float(np.count_nonzero(seen & ~old_seen)*4.)
+    return gain/path_scale+weight*area/area_scale, dict(
+        cadmm_gain=gain,cadmm_reward=gain/path_scale,
+        exploration_area=area,exploration_reward=weight*area/area_scale)
+
+
+class DeliveredEvidence:
+    """Reward-only evidence ledger. Each source/frame is accepted at most once.
+
+    The binary simulator sensor has assumed reliability .8 (not calibrated on
+    real images). Bounded signed log odds preserve losses from contradictions.
+    Unknown cells have confidence zero, including unobserved free locations.
+    """
+    def __init__(self, world=120., resolution=2.):
+        self.resolution = resolution
+        self.n = int(world / resolution)
+        self.log_odds = np.zeros((self.n, self.n), np.float32)
+        self.seen = np.zeros_like(self.log_odds, bool)
+        self.received = set()
+        xy = (np.arange(self.n) + .5) * resolution
+        self.xy = np.stack(np.meshgrid(xy, xy), -1)
+
+    def confidence(self):
+        return np.tanh(np.abs(self.log_odds) / 2) * self.seen
+
+    def receive(self, source, frame, position, occupancy, resolution, valid=True):
+        key = (source, frame)
+        if not valid or occupancy is None or key in self.received:
+            return False
+        self.received.add(key)
+        h, w = occupancy.shape
+        # Simulator grids: row Y, column X. Use the actual received pixels only.
+        xs = position[0] + (np.arange(w)+.5-w/2)*resolution
+        ys = position[1] + (np.arange(h)+.5-h/2)*resolution
+        ix, iy = np.meshgrid(np.floor(xs/self.resolution).astype(int),
+                             np.floor(ys/self.resolution).astype(int))
+        valid_cells = (ix >= 0) & (iy >= 0) & (ix < self.n) & (iy < self.n)
+        ids = iy[valid_cells] * self.n + ix[valid_cells]
+        # One vote per world cell per source frame, even at finer sensor scale.
+        unique, inverse = np.unique(ids, return_inverse=True)
+        votes = np.bincount(inverse, weights=occupancy[valid_cells].astype(float))
+        count = np.bincount(inverse)
+        weights = np.where(votes/count >= .5, 1., -1.) * np.log(4.)
+        self.log_odds.flat[unique] += weights
+        np.clip(self.log_odds, -3., 3., out=self.log_odds)
+        self.seen.flat[unique] = True
+        return True
+
+    def task_mask(self, start, goal, car_radius=18., goal_radius=18., band=12.):
+        d = np.asarray(goal)-start
+        t = np.clip(np.sum((self.xy-start)*d, axis=-1)/max(np.dot(d,d), 1e-8), 0, 1)
+        corridor = np.linalg.norm(self.xy-start-t[...,None]*d, axis=-1)
+        return ((np.linalg.norm(self.xy-start, axis=-1) <= car_radius) |
+                (np.linalg.norm(self.xy-goal, axis=-1) <= goal_radius) | (corridor <= band))
+
+
+class Reward:
+    def __init__(self, preference=True, exploration=True, curriculum=None):
+        self.beta, self.eta = float(preference), .15*exploration
+        self.preference, self.exploration = preference, exploration
+        self.window = deque(maxlen=20)
+        self.curriculum = curriculum
+        self.focus = 0.
+        self.beta_adjust, self.eta_adjust = 1., 1.
+        if curriculum is not None:
+            self.focus = float(curriculum['focus'])
+            self.beta = float(curriculum['beta'])*preference
+            self.eta = float(curriculum['eta'])*exploration
+        self.quality_scale = 1.
+
+    def compute(self, before, after, old_seen, seen, region, distance, area=4.):
+        delta = (after-before)*area
+        gt, ge = float(delta[region].sum()), float(delta[~region].sum())
+        outside_new = float(np.count_nonzero(seen & ~old_seen & ~region)*area)
+        self.window.append((float(np.maximum(delta[region],0).sum()),
+                            float(np.maximum(delta[~region],0).sum())))
+        pos_t, pos_e = np.sum(self.window, axis=0)
+        rho = pos_t/max(pos_t+pos_e, 1e-8)
+        reward = (gt+ge)/400 + self.beta*gt/400 + self.eta*min(outside_new/400, 1.) - .03*distance/18 - .01
+        applied_beta, applied_eta = self.beta, self.eta
+        if self.curriculum is not None:
+            # A bounded feedback correction cannot undo the curriculum.
+            if pos_t+pos_e > 1 and len(self.window) == self.window.maxlen:
+                low, high = .35+.25*self.focus, .50+.25*self.focus
+                self.beta_adjust = float(np.clip(self.beta_adjust+.01*(low-rho), .85, 1.15))
+                self.eta_adjust = float(np.clip(self.eta_adjust+.01*(rho-high), .85, 1.15))
+            if self.preference and np.any(region) and float(after[region].mean()) >= .8:
+                self.quality_scale = max(.2,self.quality_scale*.99)
+            self.beta = float(self.curriculum['beta'])*self.beta_adjust*self.quality_scale*self.preference
+            self.eta = float(self.curriculum['eta'])*self.eta_adjust*self.exploration
+        elif pos_t+pos_e > 1 and len(self.window) == self.window.maxlen:
+            if self.preference:
+                self.beta = float(np.clip(self.beta+.01*(.60-rho), .1, 2.))
+            if self.exploration:
+                self.eta = float(np.clip(self.eta+.01*(rho-.75), .05, .5))
+        if self.curriculum is None and self.preference and np.any(region) and float(after[region].mean()) >= .8:
+            self.beta = max(.1, self.beta*.99)
+        return reward, dict(task_gain=gt, outside_gain=ge, outside_new=outside_new,
+                            positive_task_gain=self.window[-1][0], positive_outside_gain=self.window[-1][1],
+                            reward_beta=applied_beta, reward_eta=applied_eta,
+                            reward_focus=self.focus)
+
+
+class Experiment:
+    def __init__(self, seed, model, algorithm='mappo', stochastic=False,
+                 drop=0., preference=True, exploration=True, curriculum=None,
+                 exploration_candidates=0, communication_mode='direct', safety_filter='legacy',
+                 spacing_penalty_weight=0., intervention_weight=0., moving_ground=False,
+                 reward_mode='legacy', ground_speed=1., path_reward_scale=100.,exploration_weight=None):
+        self.rng = np.random.default_rng(seed)
+        self.drop = drop
+        self.communication_mode=communication_mode
+        self.safety_filter=safety_filter
+        self.spacing_penalty_weight=spacing_penalty_weight
+        self.intervention_weight=intervention_weight
+        self.moving_ground=moving_ground
+        self.reward_mode=reward_mode
+        self.path_reward_scale=path_reward_scale
+        self.exploration_weight=(float(exploration_weight) if exploration_weight is not None else
+            float(curriculum['eta']) if curriculum else .6 if reward_mode=='cadmm_exploration' else .15)*exploration
+        self.audit_buffers=[{} for _ in range(3)]
+        self.env = MultiRobotEnv(EnvConfig(world_size=(120,120), dt=1.,
+            perception_radius=24., communication_radius=95., occupancy_map_resolution=2.,
+            occupancy_map_size=12, ground_occupancy_map_size=16 if moving_ground else 4,
+            ground_occupancy_map_resolution=.5 if moving_ground else None))
+        self.ground = self.env.add_ground_robot(15.,60.,max_speed=ground_speed)
+        self.goal = np.array([self.rng.uniform(85,110), self.rng.uniform(25,95)])
+        # Truth is used only by the physics/sensor generator and the final plot.
+        for _ in range(22):
+            self.env.add_circle_obstacle(*self.rng.uniform(30,110,2), self.rng.uniform(2,5))
+        self.ids, self.controllers = [], []
+        for i, (x,y) in enumerate(((24,42),(24,60),(24,78))):
+            self.ids.append(self.env.add_drone(x,y,15.,max_speed=6.))
+            c = DroneController(f'drone_{i}', resolution=2., total_drones=3,
+                communication_range=95., max_speed=6., broadcast_interval=1., fusion_interval=5.,
+                communication_mode=communication_mode,safety_filter=safety_filter)
+            if algorithm != 'cadmm_original':
+                c.navigator = CandidateNavigator(f'drone_{i}', total_drones=3, comm_range=95.,
+                    min_separation=15., fov_radius=12., max_speed=6., model=model,
+                    exploration_candidates=exploration_candidates, world_bounds=(0.,0.,120.,120.),
+                    communication_mode=communication_mode,
+                    algorithm=algorithm, deterministic=not stochastic)
+            else:
+                c.navigator.fov_radius = 12.  # Same actual 24m sensor footprint.
+            self.controllers.append(c)
+            c.ground_max_speed=ground_speed if moving_ground else 0.
+        self.obs = self.env.reset()
+        self.ground_controller=GroundRobotController('ground_0',resolution=2.,
+            perception_range=8.,max_linear_vel=ground_speed,max_angular_vel=1.,
+            fusion_interval=5.,safety_distance=1.5)
+        self.ground_controller.set_goal(tuple(self.goal))
+        self.ground_action=self._ground_action() if moving_ground else None
+        self.initial_goal_distance=float(np.linalg.norm(self.goal-[15.,60.]))
+        self.goal_reached=False
+        self.ledger = DeliveredEvidence()
+        self.reward = Reward(preference, exploration, curriculum)
+        self.algorithm = algorithm
+        self.trace = []
+
+    def mission(self):
+        # Fixed surveyed task source, broadcast by the ground robot; navigation
+        # held stationary in this initial exploration-only experiment.
+        return dict(robot_id='ground_0',position=[15.,60.,0.],target=self.goal.tolist(),
+                    planned_path=[],timestamp=self.env.time)
+
+    def _ground_action(self,neighbors=None):
+        received=dict(self.obs[self.ground])
+        received['neighbors']=(neighbors if neighbors is not None else
+            [n for n in received['neighbors'] if self.rng.random()>=self.drop])
+        # Only time is retained from simulator diagnostics; no map truth,
+        # fleet positions, velocities or obstacle lists reach the controller.
+        received['full_state']={'time':self.env.time}
+        received.pop('obstacles',None)
+        action=self.ground_controller.get_action(received)
+        if np.linalg.norm(np.asarray(received['self']['position'])[:2]-self.goal)<=2.:
+            action['motion']=(0.,0.)
+            self.goal_reached=True
+        return action
+
+    def step(self, frame):
+        before, old_seen = self.ledger.confidence().copy(), self.ledger.seen.copy()
+        old_ground=np.asarray(self.obs[self.ground]['self']['position']).copy()
+        region = self.ledger.task_mask(old_ground[:2], self.goal)
+        actions = {self.ground: self.ground_action if self.moving_ground else
+                   {'motion':np.zeros(2), 'broadcast':self.mission()}}
+        samples, decision_ms = [], []
+        old = []
+        interventions=[];observed_violations=[];infeasible=0
+        for index,(rid,c) in enumerate(zip(self.ids,self.controllers)):
+            received = dict(self.obs[rid])
+            # Packet loss applies equally to all algorithms; no actor truth fields.
+            received['neighbors'] = [n for n in received['neighbors']
+                                     if self.rng.random() >= self.drop]
+            old.append(np.asarray(received['self']['position']).copy())
+            tic = time.perf_counter()
+            action = c.get_action(received)
+            decision_ms.append((time.perf_counter()-tic)*1000)
+            target = c.navigator._current_target
+            if target is not None and self.safety_filter!='cbf':
+                distance = np.linalg.norm(np.asarray(target)-old[-1])
+                speed = np.linalg.norm(action['motion'])
+                if speed > distance:
+                    action['motion'] *= distance/max(speed, 1e-8)
+            # Never mutate a command after the CBF. Fail explicitly on an
+            # infeasible filter rather than silently proceeding as if safe.
+            stats=c.safety_stats
+            if stats.get('infeasible',False):
+                infeasible+=1
+            interventions.append(float(stats.get('intervention',0.))**2/36.)
+            received_distance=stats.get('min_received_separation')
+            observed_violations.append(float(received_distance is not None and received_distance<15.-1e-5))
+            actions[rid] = action
+            if isinstance(action.get('broadcast'), dict):
+                # Training-only audit payload travels with the real graph packet.
+                # Never consumed by any navigator or included in ROS observations.
+                action['broadcast']['evidence_audit'] = dict(source=rid, frame=frame,
+                    position=old[-1].copy(), occupancy=received.get('occupancy_map'),
+                    resolution=received['map_resolution'], valid=received.get('sensor_valid',True))
+                if self.communication_mode=='chain':
+                    # Audit transport follows actual received packets, one hop
+                    # per simulation step. Reward ledger de-duplicates origins.
+                    buffer=self.audit_buffers[index]
+                    for neighbor in received['neighbors']:
+                        for packet in (neighbor.get('broadcast') or {}).get('evidence_audits',[]):
+                            if frame-packet['frame']<=30:
+                                buffer[(packet['source'],packet['frame'])]=packet
+                    packet=action['broadcast']['evidence_audit']
+                    buffer[(rid,frame)]=packet
+                    self.audit_buffers[index]={k:v for k,v in buffer.items() if frame-v['frame']<=30}
+                    action['broadcast']['evidence_audits']=list(self.audit_buffers[index].values())
+            if hasattr(c.navigator, 'last_sample'):
+                samples.append(c.navigator.last_sample)
+        if infeasible:
+            raise RuntimeError(f'CBF infeasible for {infeasible} agents; simulation step was not executed')
+        self.obs, info = self.env.step(actions)
+        ground_received=[n for n in self.obs[self.ground]['neighbors']
+                         if self.rng.random()>=self.drop]
+        ground_position=np.asarray(self.obs[self.ground]['self']['position']).copy()
+        # Evaluate both maps at the SAME new position: vehicle progress alone
+        # must not masquerade as an observation-induced CADMM improvement.
+        cost_before=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],self.goal)
+        if self.moving_ground:
+            self.ground_action=self._ground_action(ground_received)
+        cost_after=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],self.goal)
+        # Delivery must be present in the actual ground receiver's neighbor list.
+        delivered = ground_received
+        delivered_ids = {n['id'] for n in delivered}
+        for neighbor in delivered:
+            message=neighbor.get('broadcast') or {}
+            packets=message.get('evidence_audits',[]) if self.communication_mode=='chain' else [message.get('evidence_audit')]
+            for packet in packets:
+                if not packet:
+                    continue
+                self.ledger.receive(packet['source'], packet['frame'], packet['position'],
+                    packet['occupancy'], packet['resolution'], valid=packet['valid'])
+        current = np.array([self.obs[r]['self']['position'] for r in self.ids])
+        distance = np.linalg.norm(current-np.asarray(old), axis=1)
+        reward, metrics = self.reward.compute(before, self.ledger.confidence(), old_seen,
+            self.ledger.seen, region, float(distance.sum()))
+        if self.reward_mode=='cadmm_exploration':
+            reward,terms=cadmm_exploration_reward(cost_before,cost_after,old_seen,
+                self.ledger.seen,self.exploration_weight,self.path_reward_scale)
+            metrics.update(terms)
+            metrics.update(reward_beta=1.,reward_eta=self.exploration_weight)
+        else:
+            metrics.update(cadmm_gain=0.,cadmm_reward=0.,exploration_area=0.,exploration_reward=0.)
+        # Penalties use local received safety telemetry, not evaluator truth.
+        spacing_cost=self.spacing_penalty_weight*max(observed_violations,default=0.)
+        intervention_cost=self.intervention_weight*float(np.mean(interventions))
+        reward-=spacing_cost+intervention_cost
+        # Swept distances are independent evaluation, never learner inputs.
+        sep = []
+        for i in range(3):
+            for j in range(i):
+                r = old[i]-old[j]
+                v = (current[i]-old[i])-(current[j]-old[j])
+                t = np.clip(-np.dot(r,v)/max(np.dot(v,v),1e-8),0,1)
+                sep.append(np.linalg.norm(r+t*v))
+        # Independent evaluator checks configured chain edges and swept maxima.
+        chain_distances=[max(np.linalg.norm(np.asarray(old[0])-old_ground),np.linalg.norm(current[0]-ground_position))]+[
+            max(np.linalg.norm(np.asarray(old[i])-old[i-1]),np.linalg.norm(current[i]-current[i-1]))
+            for i in range(1,3)]
+        metrics.update(reward=float(reward), distance=float(distance.sum()),
+            spacing_cost=spacing_cost,intervention_cost=intervention_cost,
+            cbf_intervention=float(np.mean(interventions)),
+            chain_link_violation=float(max(chain_distances)>95.+1e-5),
+            min_separation=float(min(sep)),
+            simultaneous_moving=float(np.all(distance > .1)),
+            moving_fraction=float(np.mean(distance > .1)),
+            spacing_violation=float(min(sep) < 15.-1e-5),
+            collisions=float(min(sep) < 2.),
+            communication_outage=(float(max(chain_distances)>95.+1e-5) if self.communication_mode=='chain'
+                                  else float(len(delivered_ids & set(self.ids))<3)),
+            received_ground_packets=len(delivered_ids & set(self.ids)),
+            fallback=sum(getattr(c.navigator,'fallbacks',0) for c in self.controllers),
+            decision_ms=float(np.mean(decision_ms)),
+            out_of_bounds=len(info['out_of_bounds']))
+        metrics.update(ground_distance=float(np.linalg.norm(ground_position-old_ground)),
+            ground_goal_distance=float(np.linalg.norm(ground_position[:2]-self.goal)),
+            ground_collisions=float(len(info['collisions'])),goal_reached=float(self.goal_reached),
+            ground_path_cost=cost_after)
+        self.trace.append(dict(positions=current.tolist(),ground_position=ground_position.tolist(), **metrics))
+        return samples, reward, metrics
+
+    def summary(self):
+        total = {k: float(sum(t[k] for t in self.trace)) for k in
+                 ('task_gain','outside_gain','outside_new','positive_task_gain',
+                  'positive_outside_gain','distance','reward','spacing_violation','collisions','out_of_bounds',
+                  'cadmm_gain','cadmm_reward','exploration_area','exploration_reward','ground_distance','ground_collisions')}
+        total['goal_reached']=float(self.goal_reached)
+        total['ground_goal_distance']=self.trace[-1]['ground_goal_distance']
+        total['ground_progress']=self.initial_goal_distance-total['ground_goal_distance']
+        total['episode_steps']=len(self.trace)
+        for k in ('simultaneous_moving','moving_fraction','communication_outage','decision_ms',
+                  'reward_beta','reward_eta','reward_focus'):
+            total[k] = float(np.mean([t[k] for t in self.trace]))
+        total['task_share'] = total['positive_task_gain']/max(total['positive_task_gain']+total['positive_outside_gain'],1e-8)
+        total['fallback'] = self.trace[-1]['fallback']
+        total['coverage_area'] = float(self.ledger.seen.sum()*4)
+        total['confidence_area'] = float(self.ledger.confidence().sum()*4)
+        for key in ('spacing_cost','intervention_cost','chain_link_violation'):
+            total[key]=float(sum(t[key] for t in self.trace))
+        total['min_separation']=float(min(t['min_separation'] for t in self.trace))
+        total['cbf_intervention']=float(np.mean([t['cbf_intervention'] for t in self.trace]))
+        # Independent evaluator only: truth never enters rewards or network.
+        truth = np.zeros_like(self.ledger.seen)
+        for obstacle in self.env.obstacles:
+            truth |= np.linalg.norm(self.ledger.xy-obstacle.position, axis=-1) <= obstacle.radius
+        seen = self.ledger.seen
+        probability = 1/(1+np.exp(-self.ledger.log_odds[seen]))
+        total['brier_error'] = float(np.mean((probability-truth[seen])**2)) if seen.any() else 0.
+        certainty = np.maximum(probability,1-probability)
+        correct = ((probability >= .5) == truth[seen]).astype(float)
+        ece = 0.
+        for lower in np.arange(.5,1.,.05):
+            selected = (certainty >= lower) & (certainty < lower+.05)
+            if selected.any():
+                ece += float(selected.mean()*abs(certainty[selected].mean()-correct[selected].mean()))
+        total['calibration_error'] = ece
+        return total
+
+
+def update(model, optimizer, rollout, epochs=4, entropy_coef=.01):
+    x = torch.tensor(np.array([s[0] for s in rollout]), dtype=torch.float32)
+    mask = torch.tensor(np.array([s[1] for s in rollout]), dtype=torch.bool)
+    actions = torch.tensor(np.array([s[2] for s in rollout]))
+    old_logp = torch.tensor(np.array([s[3] for s in rollout]), dtype=torch.float32)
+    rewards = torch.tensor([s[4] for s in rollout], dtype=torch.float32)
+    with torch.no_grad():
+        values = model.value(x, mask)
+        adv = torch.zeros_like(rewards)
+        last = torch.tensor(0.)
+        # Fixed-length episodes end here: no cross-episode GAE or bootstrapping.
+        for t in reversed(range(len(rollout))):
+            next_v = values[t+1] if t+1 < len(rollout) else 0.
+            last = rewards[t] + .99*next_v - values[t] + .99*.95*last
+            adv[t] = last
+        returns = adv+values
+        adv = (adv-adv.mean())/adv.std(unbiased=False).clamp_min(1e-6)
+    for _ in range(epochs):
+        dist = model.distribution(x, mask)
+        ratio = (dist.log_prob(actions)-old_logp).exp()
+        actor_loss = -torch.minimum(ratio*adv[:,None], ratio.clamp(.8,1.2)*adv[:,None]).mean()
+        value_loss = (model.value(x, mask)-returns).square().mean()
+        loss = actor_loss + .5*value_loss - entropy_coef*dist.entropy().mean()
+        if not torch.isfinite(loss):
+            raise FloatingPointError('Non-finite PPO loss; training halted before optimizer update')
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), .5)
+        optimizer.step()
+    return float(loss.detach())
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--episodes', type=int, default=40)
+    parser.add_argument('--steps', type=int, default=48)
+    parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--test-seeds', type=int, nargs='+', default=[1001,1002,1003])
+    parser.add_argument('--output', type=Path, default=Path('artifacts/mappo-2d'))
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--drop', type=float, default=0.)
+    parser.add_argument('--exploration-candidates', type=int, default=None,
+                        help='Shared adapted-policy exploration quota; default from checkpoint, otherwise 0')
+    parser.add_argument('--communication-mode',choices=['direct','chain'],default=None)
+    parser.add_argument('--safety-filter',choices=['legacy','cbf'],default=None)
+    parser.add_argument('--moving-ground',action=argparse.BooleanOptionalAction,default=None)
+    parser.add_argument('--reward-mode',choices=['legacy','cadmm_exploration'],default=None)
+    parser.add_argument('--no-preference', action='store_true')
+    parser.add_argument('--no-exploration', action='store_true')
+    args = parser.parse_args()
+    if args.episodes < 0 or args.steps <= 0 or not 0 <= args.drop <= 1:
+        parser.error('episodes >= 0, steps > 0, and 0 <= drop <= 1 required')
+    args.output.mkdir(parents=True, exist_ok=True)
+    torch.set_num_threads(1)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    model = ActorCritic()
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    previous_episodes = 0
+    saved = {}
+    if args.checkpoint:
+        saved = torch.load(args.checkpoint, weights_only=True)
+        model.load_state_dict(saved['model'])
+        previous_episodes = saved.get('training_episodes', 0)
+    exploration_candidates = (args.exploration_candidates if args.exploration_candidates is not None
+                              else saved.get('exploration_candidates',0))
+    if not 0 <= exploration_candidates <= 20:
+        parser.error('exploration-candidates must be between 0 and 20')
+    communication_mode=args.communication_mode or saved.get('communication_mode','direct')
+    safety_filter=args.safety_filter or saved.get('safety_filter','legacy')
+    moving_ground=args.moving_ground if args.moving_ground is not None else saved.get('moving_ground',False)
+    reward_mode=args.reward_mode or saved.get('reward_mode','legacy')
+    runtime=dict(moving_ground=moving_ground,reward_mode=reward_mode,
+                 ground_speed=saved.get('ground_speed',1.),path_reward_scale=saved.get('path_reward_scale',100.),
+                 exploration_weight=saved.get('exploration_weight'))
+    if reward_mode=='cadmm_exploration' and not moving_ground:
+        parser.error('CADMM reward requires --moving-ground')
+    training, results, trajectories = [], [], {}
+    for episode in range(args.episodes):
+        with contextlib.redirect_stdout(io.StringIO()):
+            env = Experiment(args.seed+episode, model, stochastic=True, drop=args.drop,
+                exploration_candidates=exploration_candidates,
+                communication_mode=communication_mode,safety_filter=safety_filter,
+                preference=not args.no_preference, exploration=not args.no_exploration,**runtime)
+            rollout = []
+            for frame in range(args.steps):
+                samples, reward, _ = env.step(frame)
+                rollout.append((*[np.array([s[k] for s in samples]) for k in range(4)], reward))
+            loss = update(model, optimizer, rollout)
+        training.append(dict(episode=episode, loss=loss, **env.summary()))
+        print(f'train {episode+1}/{args.episodes}: reward={training[-1]["reward"]:.3f} loss={loss:.3f}', flush=True)
+        env.env.close()
+    torch.save({'model':model.state_dict(), 'seed':args.seed, 'steps':args.steps,
+                'training_episodes':previous_episodes+args.episodes, 'feature_version':1,
+                'fov_radius':12., 'exploration_candidates':exploration_candidates,
+                'world_bounds':[0.,0.,120.,120.],'communication_mode':communication_mode,
+                'safety_filter':safety_filter,**runtime}, args.output/'model.pt')
+    for algorithm in ('mappo','greedy','cadmm_controlled','cadmm_original'):
+        for seed in args.test_seeds:
+            with contextlib.redirect_stdout(io.StringIO()):
+                env = Experiment(seed, model, algorithm, drop=args.drop,
+                    exploration_candidates=exploration_candidates,
+                    communication_mode=('direct' if algorithm=='cadmm_original' else communication_mode),
+                    safety_filter=('legacy' if algorithm=='cadmm_original' else safety_filter),
+                    preference=not args.no_preference, exploration=not args.no_exploration,**runtime)
+                for frame in range(args.steps):
+                    env.step(frame)
+            result = dict(algorithm=algorithm,seed=seed,communication_mode=env.communication_mode,
+                          safety_filter=env.safety_filter,**env.summary())
+            results.append(result)
+            trajectories[f'{algorithm}:{seed}'] = dict(goal=env.goal.tolist(), trace=env.trace)
+            print(f'test {algorithm} seed={seed}: confidence={result["confidence_area"]:.1f} task_share={result["task_share"]:.3f}',flush=True)
+            env.env.close()
+    config = {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
+    config['training_episodes_total'] = previous_episodes+args.episodes
+    config['exploration_candidates'] = exploration_candidates
+    config['communication_mode']=communication_mode
+    config['safety_filter']=safety_filter
+    config.update(runtime)
+    (args.output/'results.json').write_text(json.dumps(dict(config=config, training=training,
+        evaluation=results, trajectories=trajectories),indent=2),encoding='utf-8')
+    print(f'Saved {args.output.resolve()}',flush=True)
+
+
+if __name__ == '__main__':
+    main()

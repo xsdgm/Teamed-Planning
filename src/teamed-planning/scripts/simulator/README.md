@@ -1,5 +1,7 @@
 # Simple 2D Heterogeneous Multi-Robot Simulator
 
+MAPPO training, controlled baselines and offline 2D replay: [implementation and experiment instructions](MAPPO.md).
+
 A kilometer-scale multi-robot forest simulation environment designed for reinforcement learning.
 
 ## ✨ Core Features

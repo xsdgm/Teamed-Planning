@@ -107,6 +107,8 @@ class DroneROSNode:
             communication_range=self.communication_range,
             max_speed=self.max_speed,
             total_drones=self.num_drones,
+            navigation_algorithm=rospy.get_param('~navigation_algorithm', 'cadmm'),
+            mappo_checkpoint=rospy.get_param('~mappo_checkpoint', None),
         )
         self.local_planner = DroneLocalPlanner(
             max_speed=self.max_speed,
@@ -549,11 +551,13 @@ class DroneROSNode:
             lt = self.last_graph_times.get(did)
             if lt and (now - lt).to_sec() < self.comm_timeout:
                 real_pos = self.other_drone_positions.get(did)
+                if real_pos is None:
+                    continue  # An absent neighbor position is not our own position.
                 neighbors.append({
                     'type': 'drone',
                     'broadcast': {
                         'drone_id': did,
-                        'position': list(real_pos) if real_pos else list(pos_map),
+                        'position': list(real_pos),
                         'graph': graph.to_message(),
                     },
                 })

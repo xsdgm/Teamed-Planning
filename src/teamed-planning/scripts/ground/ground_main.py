@@ -556,6 +556,15 @@ class GroundRobotController:
                     desired_heading = np.arctan2(current_waypoint[1] - self.position[1],
                                                  current_waypoint[0] - self.position[0])
                     heading_error = self.local_planner._normalize_angle(desired_heading - self.heading)
+                    dt=simulator_obs.get('time_step')
+                    if dt is not None and dt>0:
+                        # At a 1 s simulator step the proportional turn gain
+                        # can overshoot forever (+error, -error), while the
+                        # alignment gate keeps translation at zero. Limit the
+                        # turn to the remaining bearing for this sample.
+                        angular_limit=abs(heading_error)/dt
+                        velocity_cmd=(velocity_cmd[0],float(np.clip(velocity_cmd[1],
+                            -angular_limit,angular_limit)))
                     if abs(heading_error) > 0.25:
                         velocity_cmd = (0., velocity_cmd[1])
         

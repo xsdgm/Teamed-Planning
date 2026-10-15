@@ -39,7 +39,10 @@ class DroneController:
                  max_speed: float = 15.0,
                  waypoint_threshold: float = 10.0,
                  total_drones: int = 1,
-                 dispatch_interval: float = 1.0):
+                 dispatch_interval: float = 1.0,
+                 navigation_algorithm: str = 'cadmm',
+                 mappo_checkpoint: Optional[str] = None,
+                 communication_mode: Optional[str] = None, safety_filter: Optional[str] = None):
         """
         Initialize drone controller.
 
@@ -67,6 +70,13 @@ class DroneController:
         self._last_dispatch_time = float('-inf')
         self._last_graph_broadcast_time = float('-inf')
         self._broadcast_graph = None
+        if safety_filter not in (None,'legacy','cbf'):
+            raise ValueError('safety_filter must be legacy or cbf')
+        self.safety_filter=safety_filter or 'legacy'
+        self.safety_stats={}
+        self.communication_mode=communication_mode or 'direct'
+        from drone.chain_state import ChainState
+        self._chain_state=ChainState(drone_id,total_drones if self.communication_mode=='chain' else 1)
 
         # Initialize modules
         self.semantic_processor = SemanticProcessor(resolution=resolution)
@@ -87,6 +97,23 @@ class DroneController:
             waypoint_threshold=waypoint_threshold,
             comm_range=communication_range,
         )
+        if navigation_algorithm != 'cadmm':
+            from drone.mappo import CandidateNavigator
+            if navigation_algorithm not in ('mappo', 'greedy', 'cadmm_controlled'):
+                raise ValueError(f'Unknown navigation algorithm: {navigation_algorithm}')
+            if navigation_algorithm == 'mappo' and not mappo_checkpoint:
+                raise ValueError('MAPPO requires a trained mappo_checkpoint')
+            self.navigator = CandidateNavigator(
+                drone_id=drone_id, total_drones=total_drones,
+                waypoint_threshold=waypoint_threshold, comm_range=communication_range,
+                algorithm=navigation_algorithm, checkpoint=mappo_checkpoint,
+                communication_mode=communication_mode,
+                max_speed=max_speed, decision_dt=dispatch_interval)
+        if communication_mode is None:
+            self.communication_mode=getattr(self.navigator,'communication_mode','direct')
+        if safety_filter is None:
+            self.safety_filter=getattr(self.navigator,'checkpoint_safety_filter','legacy')
+        self._chain_state=ChainState(drone_id,total_drones if self.communication_mode=='chain' else 1)
         
         # NOTE: GraphBroadcaster and RobotDetector are kept for future ground robot integration
         # Currently using unified dict-based broadcast in get_action()
@@ -170,7 +197,7 @@ class DroneController:
                         if waypoint is not None:
                             neighbor_waypoints[other_drone_id] = tuple(waypoint)
                         for robot_id, mission in broadcast_msg.get('ground_missions', {}).items():
-                            ground_robots.setdefault(robot_id, mission)
+                            ground_robots.setdefault(robot_id,dict(mission,direct=False))
             # Handle ground robots
             elif neighbor['type'] in ['diff_drive', 'holonomic']:
                 # Get broadcast data from ground robot
@@ -184,6 +211,8 @@ class DroneController:
                             'position': tuple(robot_position),
                             'target': tuple(robot_target) if robot_target else None,
                             'planned_path': broadcast_msg.get('planned_path', []),
+                            'source_time': broadcast_msg.get('timestamp',sim_obs.get('full_state',{}).get('time',time.time())),
+                            'direct': True,
                             'broadcast': broadcast_msg
                         }
         
@@ -249,7 +278,37 @@ class DroneController:
         """
         dt = observation.get('time_step')
         if dt is None or dt <= 0:
+            if self.safety_filter=='cbf':
+                raise ValueError('CBF simulator control requires time_step')
             return velocity
+        if self.safety_filter=='cbf':
+            from drone.cbf_safety import CBFSafetyFilter
+            peers={}
+            for neighbor in observation.get('neighbors',[]):
+                if neighbor['type']=='drone':
+                    did=(neighbor.get('broadcast') or {}).get('drone_id',f"robot_{neighbor['id']}")
+                    peers[did]=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
+            chain=getattr(self.navigator,'chain',self._chain_state)
+            if self.communication_mode=='chain' and chain is not None:
+                required=chain.required
+                task=chain.task()
+                ground=task['position'] if task is not None and '__ground__' in chain.visible else None
+            else:
+                required=('__ground__',)
+                ground=self.navigator.ground_robot_position
+            self._nominal_velocity=np.asarray(velocity,float).copy()
+            # Broadcast positions precede the last physical step. Direct
+            # received relative geometry is the fresh CBF endpoint sample.
+            for neighbor in observation.get('neighbors',[]):
+                if neighbor['type'] in ('diff_drive','holonomic') and ground is not None:
+                    ground=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
+                    break
+            filtered,self.safety_stats=CBFSafetyFilter(self.navigator.min_separation,
+                self.communication_range,self.max_speed).filter(velocity,self.position,peers,dt,
+                required_links=required,ground=ground,
+                ground_max_speed=getattr(self,'ground_max_speed',0.),
+                world_bounds=getattr(self.navigator,'world_bounds',None),drone_id=self.drone_id)
+            return tuple(filtered)
         v = np.asarray(velocity, dtype=float).copy()
         constraints = []
         for neighbor in observation.get('neighbors', []):
@@ -290,6 +349,8 @@ class DroneController:
             When mode='real':
                 {'target_waypoint': (x,y,z) or None, 'broadcast': dict}
         """
+        if mode=='real' and self.safety_filter=='cbf':
+            raise NotImplementedError('CBF velocity filter is currently validated for fixed-height 2D simulation only')
         current_time = simulator_obs.get('full_state', {}).get('time', time.time())
         
         # Step 1: Parse simulator observation (adapter)
@@ -349,6 +410,7 @@ class DroneController:
             'fusion_stats': self.last_fusion_stats,
             'time': current_time
         }
+        self._chain_state.update(nav_obs)
         
         # Step 6: Compute navigation target
         with self.timer.measure("navigation"):
@@ -384,6 +446,14 @@ class DroneController:
             }
         else:
             velocity = self._compute_velocity_to_target(target) if target else (0.0, 0.0, 0.0)
+            # Arrival clipping must happen BEFORE the safety filter. Never
+            # zero a CBF recovery command just because the selected action holds.
+            dt=simulator_obs.get('time_step')
+            if target is not None and dt is not None and dt>0:
+                distance=np.linalg.norm(np.asarray(target)-self.position)
+                speed=np.linalg.norm(velocity)
+                if speed*dt>distance:
+                    velocity=tuple(np.asarray(velocity)*distance/max(speed*dt,1e-9))
             velocity = self._safe_simulation_velocity(velocity, simulator_obs)
             return {
                 'motion': np.array([velocity[0], velocity[1], velocity[2]]),

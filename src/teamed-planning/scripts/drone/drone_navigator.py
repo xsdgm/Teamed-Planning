@@ -327,6 +327,7 @@ class DroneNavigator:
                      drone_positions: Dict[str, tuple],
                      current_pos: Tuple[float, float, float],
                      frontier=None,
+                     fixed_candidates=False,
                      ) -> Optional[Tuple[float, float, float]]:
         """Run K C-ADMM iterations over the candidate set.
 
@@ -360,7 +361,7 @@ class DroneNavigator:
                 chain_wps[did] = np.array(pos[:2])
 
         # ── Rank 0 hard constraint: filter candidates ─────────────────
-        if self._chain_rank == 0 and self.ground_robot_position is not None:
+        if not fixed_candidates and self._chain_rank == 0 and self.ground_robot_position is not None:
             robot_arr = np.array(self.ground_robot_position)
             # The radio limit is spatial; the ground endpoint is at z=0.
             horizontal_range = np.sqrt(max(0., self.comm_range ** 2 - current_pos[2] ** 2))
@@ -394,7 +395,7 @@ class DroneNavigator:
         # selecting the same point. Add nearby alternatives before filtering.
         reserved = [np.asarray(wp[:2]) for did, wp in neighbor_waypoints.items()
                     if did < self.drone_id]
-        if reserved:
+        if reserved and not fixed_candidates:
             alternatives = list(candidates)
             for w in candidates[:4]:
                 for angle in np.linspace(0., 2. * np.pi, 8, endpoint=False):
