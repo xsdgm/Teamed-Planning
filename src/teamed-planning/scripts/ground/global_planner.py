@@ -50,6 +50,20 @@ class GlobalPlanner:
         self.using_graph = False
         self.waiting_at_frontier = False
         self.start_connection_idx = None
+        self.entry_validator = None
+
+    def _entry_node(self, start_pos, graph):
+        """Choose the nearest entry that local observations allow approaching."""
+        if self.entry_validator is None:
+            return graph.find_nearest_node(start_pos)
+        candidates = sorted(
+            ((node, float(np.linalg.norm(np.asarray(data['position']) - start_pos)))
+             for node, data in graph.graph.nodes(data=True)),
+            key=lambda item: (item[1], str(item[0])))
+        for node, distance in candidates:
+            if self.entry_validator(graph.get_node_position(node)):
+                return node, distance
+        return None
         
     def plan_path(self, start_pos: Tuple[float, float],
                  goal_pos: Tuple[float, float],
@@ -122,7 +136,7 @@ class GlobalPlanner:
             True if should use graph
         """
         # Find nearest nodes
-        start_node = graph.find_nearest_node(start_pos)
+        start_node = self._entry_node(start_pos, graph)
         goal_node = graph.find_nearest_node(goal_pos)
         
         if start_node is None or goal_node is None:
@@ -204,7 +218,7 @@ class GlobalPlanner:
             List of waypoints (destinations only) or None if planning fails
         """
         # Find nearest nodes in graph
-        start_node = graph.find_nearest_node(start_pos)
+        start_node = self._entry_node(start_pos, graph)
         goal_node = graph.find_nearest_node(goal_pos)
         
         if start_node is None or goal_node is None:
@@ -561,7 +575,7 @@ class GlobalPlanner:
         
         for comp_nodes in components:
             # Compute component centroid and find entry/exit points
-            positions = [graph.get_node_position(nid) for nid in comp_nodes]
+            positions = [graph.get_node_position(nid) for nid in sorted(comp_nodes, key=str)]
             centroid = np.mean(positions, axis=0)
             
             # Find nearest node in component to start (entry point)
@@ -572,7 +586,7 @@ class GlobalPlanner:
             nearest_to_goal = None
             min_dist_to_goal = float('inf')
             
-            for node_id in comp_nodes:
+            for node_id in sorted(comp_nodes, key=str):
                 node_pos = graph.get_node_position(node_id)
                 
                 dist_to_start = np.sqrt((node_pos[0] - start_pos[0])**2 + 
@@ -723,14 +737,20 @@ class GlobalPlanner:
             entry_node_id = None
             min_entry_dist = float('inf')
             
-            for node_id in comp['nodes']:
+            for node_id in sorted(comp['nodes'], key=str):
                 node_pos = graph.get_node_position(node_id)
+                if (i == 0 and self.entry_validator is not None
+                        and not self.entry_validator(node_pos)):
+                    continue
                 dist = np.sqrt((node_pos[0] - current_pos[0])**2 + 
                              (node_pos[1] - current_pos[1])**2)
                 if dist < min_entry_dist:
                     min_entry_dist = dist
                     entry_node_id = node_id
             
+            if entry_node_id is None:
+                return None
+
             # Find exit point (nearest node to next position)
             if i < len(component_sequence) - 1:
                 # Next component exists - exit toward it
@@ -743,7 +763,7 @@ class GlobalPlanner:
             exit_node_id = None
             min_exit_dist = float('inf')
             
-            for node_id in comp['nodes']:
+            for node_id in sorted(comp['nodes'], key=str):
                 node_pos = graph.get_node_position(node_id)
                 dist = np.sqrt((node_pos[0] - next_target[0])**2 + 
                              (node_pos[1] - next_target[1])**2)
@@ -765,7 +785,7 @@ class GlobalPlanner:
                 
                 # Find path within component
                 try:
-                    internal_path = nx.shortest_path(subgraph, entry_node_id, exit_node_id)
+                    internal_path = nx.shortest_path(subgraph, entry_node_id, exit_node_id, weight='weight')
                     
                     # Add intermediate nodes (skip first as it's already added)
                     for node_id in internal_path[1:]:

@@ -42,7 +42,8 @@ class DroneController:
                  dispatch_interval: float = 1.0,
                  navigation_algorithm: str = 'cadmm',
                  mappo_checkpoint: Optional[str] = None,
-                 communication_mode: Optional[str] = None, safety_filter: Optional[str] = None):
+                 communication_mode: Optional[str] = None, safety_filter: Optional[str] = None,
+                 graph_min_clearance: float = 3.0):
         """
         Initialize drone controller.
 
@@ -85,7 +86,7 @@ class DroneController:
             drone_id=drone_id,
             resolution=resolution,
             node_spacing=10.0,    # graph node spacing in metres
-            min_clearance=3.0,    # minimum clearance from obstacles (metres) — wider for forest trunks
+            min_clearance=graph_min_clearance,
             max_edge_distance=15.0,
             k_neighbors=4,
             # perception_radius removed — derived from map shape at call time
@@ -383,13 +384,13 @@ class DroneController:
             if self.current_graph is None:
                 self.current_graph = self.graph_builder.build_graph(
                     semantic_map=semantic_map,
-                    drone_position=self.position
-                )
-            else:
+                    drone_position=self.position, observation_id=current_time
+                ) if simulator_obs.get('sensor_valid', True) else TopologicalGraph(self.drone_id)
+            elif simulator_obs.get('sensor_valid', True):
                 self.graph_builder.update_graph(
                     existing_graph=self.current_graph,
                     semantic_map=semantic_map,
-                    drone_position=self.position
+                    drone_position=self.position, observation_id=current_time
                 )
         
         # Step 4: Perform fusion with nearby drones

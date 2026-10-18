@@ -1,7 +1,6 @@
 """Persistent MAPPO training with fixed rewards and resumable checkpoints.
 
-Training randomness, optimizer state, curriculum position and configuration are
-saved together. Legacy curricula remain available for historical diagnostics.
+Training randomness, optimizer state and configuration are saved together.
 Validation uses fixed reward weights and held-out seeds;
 test seeds are never used for checkpoint selection.
 """
@@ -15,6 +14,7 @@ import shutil
 import sys
 import time
 import traceback
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 from drone.mappo import ActorCritic
-from simulator.mappo_experiment import Experiment, update
+from simulator.mappo_experiment import Experiment, SafetyTermination, update
+from simulator.large_world_scenarios import generate_training_scene
+from simulator.scenarios import ENVIRONMENT_VERSION
 
 
 DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
@@ -30,26 +32,25 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     train_seed_start=10000, train_seed_count=8000,
     validation_seeds=[20000,20001,20002,20003,20004],
     test_seeds=[30000,30001,30002,30003,30004,30005,30006,30007,30008,30009],
+    # Inert historical fields retained solely for v4 checkpoint config equality.
     exploration_candidates=5, drop=0., curriculum_start=.15, curriculum_end=.70,
     beta_early=.2, beta_late=2.5, eta_early=.6, eta_late=.05,
     entropy_early=.03,entropy_late=.005,communication_mode='chain',safety_filter='cbf',
     spacing_penalty_weight=0.,intervention_weight=0.,moving_ground=True,
     reward_mode='cadmm_exploration',ground_speed=1.,path_reward_scale=100.,
-    reward_schedule='fixed',exploration_weight=.6,entropy_coefficient=.01)
+    reward_schedule='fixed',exploration_weight=.6,entropy_coefficient=.01,
+    world_size=120.,task_distances=[350,550,750],budget_multiplier=3.,budget_extra=240,
+    min_episode_steps=600,map_stability_steps=30,safety_failure_penalty=10.,
+    discount=.99,gae_lambda=.95,initial_validation=True,
+    environment_version=ENVIRONMENT_VERSION)
 
 
-def curriculum(config, completed):
+def fixed_schedule(config, completed):
+    if config.get('reward_schedule', 'fixed') != 'fixed':
+        raise ValueError('Historical curriculum rewards have been removed')
     progress = min(1., max(0., completed/max(config['episodes']-1,1)))
-    if config.get('reward_schedule','curriculum')=='fixed':
-        return dict(progress=progress,focus=0.,beta=1.,eta=config['exploration_weight'],
-                    entropy=config['entropy_coefficient'])
-    phase = np.clip((progress-config['curriculum_start']) /
-                    (config['curriculum_end']-config['curriculum_start']), 0., 1.)
-    focus = float(phase*phase*(3.-2.*phase))
-    def blend(name):
-        return config[name+'_early']*(1-focus)+config[name+'_late']*focus
-    return dict(progress=progress, focus=focus, beta=blend('beta'),
-                eta=blend('eta'), entropy=blend('entropy'))
+    return dict(progress=progress,focus=0.,beta=1.,eta=config['exploration_weight'],
+                entropy=config['entropy_coefficient'])
 
 
 def validate_config(config):
@@ -57,7 +58,9 @@ def validate_config(config):
     if unknown:
         raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
     config = dict(DEFAULTS, **config)
-    if config['reward_schedule'] not in ('fixed','curriculum'):
+    if config['environment_version'] != ENVIRONMENT_VERSION:
+        raise ValueError('Environment version differs; start a separate corrected training run')
+    if config['reward_schedule'] != 'fixed':
         raise ValueError('Invalid reward schedule')
     for name in ('exploration_weight','entropy_coefficient'):
         if not np.isfinite(config[name]) or config[name]<0:
@@ -80,16 +83,31 @@ def validate_config(config):
             raise ValueError('Reward and entropy coefficients must be nonnegative')
     if config['learning_rate'] <= 0:
         raise ValueError('learning_rate must be positive')
-    if config['communication_mode'] not in ('chain','direct') or config['safety_filter'] not in ('cbf','legacy'):
-        raise ValueError('Invalid communication mode or safety filter')
+    if config['communication_mode'] != 'chain' or config['safety_filter'] != 'cbf':
+        raise ValueError('Current training requires chain communication and CBF safety')
     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
         raise ValueError('Safety penalty weights must be nonnegative')
-    if not isinstance(config['moving_ground'],bool) or config['reward_mode'] not in ('legacy','cadmm_exploration'):
+    if config['moving_ground'] is not True or config['reward_mode'] != 'cadmm_exploration':
         raise ValueError('Invalid ground mode or reward mode')
     if config['reward_mode']=='cadmm_exploration' and not config['moving_ground']:
         raise ValueError('CADMM reward requires the ground map receiver/controller')
     if not 0 < config['ground_speed'] <= 2 or not np.isfinite(config['path_reward_scale']) or config['path_reward_scale']<=0:
         raise ValueError('Invalid ground speed or path reward scale')
+    if config['world_size'] not in (120.,1000.):
+        raise ValueError('Supported training worlds are 120m and 1000m')
+    if config['world_size']==1000. and (not config['task_distances'] or any(
+        type(d) is not int or not 0<d<config['world_size']-70 for d in config['task_distances'])):
+        raise ValueError('Invalid large-world task distances')
+    for name in ('budget_multiplier','discount','gae_lambda','safety_failure_penalty'):
+        if not np.isfinite(config[name]) or config[name]<=0:
+            raise ValueError(f'{name} must be positive and finite')
+    if config['discount']>1 or config['gae_lambda']>1:
+        raise ValueError('Discount and GAE lambda cannot exceed 1')
+    for name in ('budget_extra','min_episode_steps','map_stability_steps'):
+        if type(config[name]) is not int or config[name]<1:
+            raise ValueError(f'{name} must be a positive integer')
+    if type(config['initial_validation']) is not bool:
+        raise ValueError('initial_validation must be bool')
     return config
 
 
@@ -111,42 +129,82 @@ def append_json(path, value):
         stream.flush()
 
 
-def run_episode(model, config, scene_seed, schedule, stochastic):
+def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, stop=None):
+    large=config['world_size']==1000.
+    scene=generate_training_scene(scene_seed,config['task_distances']) if large else None
+    options={} if scene is None else dict(world_size=1000.,start=scene['start'],
+        scene=(scene['goal'],scene['circles'],scene['attempts']),stop_on_ground_arrival=False)
+    requested_budget=config['steps'] if scene is None else max(config['min_episode_steps'],
+        math.ceil(config['budget_multiplier']*scene['reference_length']+config['budget_extra']))
+    budget=min(config['steps'],requested_budget)
     with contextlib.redirect_stdout(io.StringIO()):
         env=Experiment(scene_seed,model,stochastic=stochastic,drop=config['drop'],
-            curriculum=schedule,exploration_candidates=config['exploration_candidates'],
+            exploration_weight=schedule['eta'],exploration_candidates=config['exploration_candidates'],
             communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
             spacing_penalty_weight=config['spacing_penalty_weight'],intervention_weight=config['intervention_weight'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
-            ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'])
-        rollout=[]
+            ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],**options)
+        rollout=[];reason='budget';stable=0;max_link=0.
         try:
-            for frame in range(config['steps']):
-                samples,reward,_=env.step(frame)
+            for frame in range(budget):
+                if stop is not None and stop() and rollout:
+                    reason='user_stop';break
+                try:
+                    samples,reward,_=env.step(frame)
+                except SafetyTermination as exc:
+                    if not large:raise
+                    # The proposed joint action transitions to an absorbing failure
+                    # without executing infeasible velocities or relaxing safety.
+                    samples=exc.samples;reward=-config['safety_failure_penalty']
+                    rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward))
+                    reason='cbf_infeasible';break
                 rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward))
-                if env.moving_ground and env.goal_reached:
-                    break
+                points=np.asarray(env.trace[-1]['positions'])
+                ground=np.asarray(env.obs[env.ground]['self']['position'])
+                ground=np.r_[ground[:2],ground[2] if len(ground)>2 else 0.]
+                max_link=max(max_link,float(np.linalg.norm(points[0]-ground)),
+                    float(np.linalg.norm(points[1:]-points[:-1],axis=1).max()))
+                stable=stable+1 if env.trace[-1]['graph_task_connected'] else 0
+                if progress is not None and (frame%25==0 or frame+1==budget):
+                    progress(dict(step=frame+1,budget=budget,scene_seed=scene_seed,
+                        world_size=config['world_size'],task_distance_m=env.initial_goal_distance,
+                        graph_connected=bool(stable),ground_remaining_m=env.trace[-1]['ground_goal_distance'],
+                        delivered_area_m2=float(env.ledger.seen.sum()*4),max_link_distance_m=max_link))
+                if large and stable>=config['map_stability_steps']:
+                    reason='map_connected';break
+                if not large and env.done:
+                    reason='vehicle_arrival';break
             summary=env.summary()
+            if reason=='cbf_infeasible':summary['reward']-=config['safety_failure_penalty']
+            summary.update(safety_terminated=float(reason=='cbf_infeasible'),
+                map_completed=float(reason=='map_connected'),budget_exhausted=float(reason=='budget'),
+                user_stopped=float(reason=='user_stop'),episode_budget_steps=budget,
+                task_distance_m=env.initial_goal_distance,max_link_distance_m=max_link,
+                reference_length_m=scene['reference_length'] if scene else env.initial_goal_distance,
+                rollout_steps=len(rollout))
         finally:
             env.env.close()
     return rollout,summary
 
 
 def validation(model, config):
-    # Fixed objective throughout training: raw reward values from different
-    # curriculum stages must not be compared to choose a checkpoint.
-    schedule=curriculum(config,config['episodes']-1)
+    # Use the same fixed weights for validation throughout training.
+    schedule=fixed_schedule(config,config['episodes']-1)
     records=[]
     model.eval()
     for seed in config['validation_seeds']:
         _,summary=run_episode(model,config,seed,schedule,False)
         records.append(dict(seed=seed,**summary))
     averages={key:float(np.mean([row[key] for row in records])) for key in records[0] if key!='seed'}
-    score=averages['confidence_area']+2*averages['task_gain']-500*averages['spacing_violation'] \
-        -10000*averages['collisions']-200*averages['out_of_bounds']
-    if config['reward_mode']=='cadmm_exploration':
-        score=averages['reward']-100*averages['ground_collisions'] \
-            -100*averages['collisions']-10*averages['chain_link_violation']
+    # Select navigation graphs by connectivity, time, efficiency and safety.
+    delays=[r['graph_first_connection_step'] if r['graph_first_connection_step']>=0
+            else config['steps'] for r in records]
+    score=1000*averages['graph_task_connected']-float(np.mean(delays))/config['steps'] \
+        -.1*averages['graph_task_path_ratio']+.001*averages['reward'] \
+        -10000*averages['ground_collisions']-10000*averages['collisions'] \
+        -10*averages['chain_link_violation']
+    if config['world_size']==1000.:
+        score-=1000*averages['safety_terminated']
     return dict(score=score,means=averages,scenes=records)
 
 
@@ -168,7 +226,7 @@ def train(config, output, resume=False):
     joint_steps=0
     if resume:
         saved=torch.load(latest,map_location='cpu',weights_only=True)
-        if saved['config']!=config:
+        if validate_config(saved['config'])!=config:
             raise ValueError('Resume configuration differs from saved training configuration')
         model.load_state_dict(saved['model'])
         optimizer.load_state_dict(saved['optimizer'])
@@ -192,12 +250,8 @@ def train(config, output, resume=False):
                 path.write_text('\n'.join(kept)+ ('\n' if kept else ''),encoding='utf-8')
     atomic_json(output/'config.json',config)
     scripts=Path(__file__).resolve().parents[1]
-    source_files=['simulator/train_mappo.py','simulator/mappo_experiment.py',
-        'drone/mappo.py','drone/drone_navigator.py','drone/drone_main.py',
-        'common/graph_structure.py','simulator/env.py','simulator/robots.py',
-        'drone/chain_state.py','drone/cbf_safety.py',
-        'ground/ground_main.py','ground/graph_fusion.py','ground/global_planner.py',
-        'ground/local_planner.py','ground/local_perception.py']
+    source_files=sorted(str(path.relative_to(scripts)).replace('\\','/')
+                        for path in scripts.rglob('*.py'))
     source_hashes={name:hashlib.sha256((scripts/name).read_bytes()).hexdigest() for name in source_files}
     provenance=dict(python=sys.version,torch=str(torch.__version__),numpy=np.__version__,
                     source_sha256=source_hashes)
@@ -218,31 +272,45 @@ def train(config, output, resume=False):
         return dict(model=model.state_dict(),optimizer=optimizer.state_dict(),
             scene_rng=rng.bit_generator.state,torch_rng=torch.get_rng_state(),
             training_episodes=completed,joint_steps=joint_steps,config=config,feature_version=1,fov_radius=12.,
-            exploration_candidates=config['exploration_candidates'],world_bounds=[0.,0.,120.,120.],
+            exploration_candidates=config['exploration_candidates'],world_bounds=[0.,0.,config['world_size'],config['world_size']],
             communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
+            environment_version=ENVIRONMENT_VERSION,
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
-            exploration_weight=curriculum(config,completed)['eta'],
+            exploration_weight=fixed_schedule(config,completed)['eta'],
             best_score=best_score,best_episode=best_episode)
     status('running',start)
     if not resume:
         atomic_checkpoint(latest,checkpoint(0))
     completed=start
     try:
+        if not resume and config['initial_validation']:
+            status('validating',0,reason='untrained baseline')
+            atomic_json(output/'initial_validation.json',validation(model,config))
+            status('running',0)
         for episode in range(start,config['episodes']):
             if (output/'STOP').exists():
                 status('stopped',completed,reason='STOP file found; resume with --resume')
                 return
-            schedule=curriculum(config,episode)
+            schedule=fixed_schedule(config,episode)
             scene_seed=int(rng.integers(config['train_seed_start'],
                                        config['train_seed_start']+config['train_seed_count']))
             model.train()
             tic=time.monotonic()
-            rollout,summary=run_episode(model,config,scene_seed,schedule,True)
-            loss=update(model,optimizer,rollout,epochs=config['ppo_epochs'],entropy_coef=schedule['entropy'])
+            if config['world_size']==1000.:
+                def episode_progress(value):
+                    atomic_json(output/'episode_progress.json',dict(episode=episode+1,
+                        updated_utc=datetime.now(timezone.utc).isoformat(),**value))
+                rollout,summary=run_episode(model,config,scene_seed,schedule,True,
+                    progress=episode_progress,stop=lambda:(output/'STOP').exists())
+            else:
+                rollout,summary=run_episode(model,config,scene_seed,schedule,True)
+            loss,ppo=update(model,optimizer,rollout,epochs=config['ppo_epochs'],
+                entropy_coef=schedule['entropy'],return_metrics=True,
+                discount=config['discount'],gae_lambda=config['gae_lambda'])
             completed=episode+1
             joint_steps+=len(rollout)
-            record=dict(episode=completed,scene_seed=scene_seed,loss=loss,schedule=schedule,
+            record=dict(episode=completed,scene_seed=scene_seed,loss=loss,ppo=ppo,schedule=schedule,
                 elapsed_seconds=round(time.monotonic()-tic,3),**summary)
             append_json(output/'training.jsonl',record)
             report=None
@@ -265,7 +333,9 @@ def train(config, output, resume=False):
                 f'task_share={summary["task_share"]:.3f} '
                 f'ground_m={summary.get("ground_distance",0.):.1f} '
                 f'goal_remaining={summary.get("ground_goal_distance",0.):.1f} '
-                f'cadmm_gain={summary.get("cadmm_gain",0.):.1f} loss={loss:.4f}',flush=True)
+                f'cadmm_gain={summary.get("cadmm_gain",0.):.1f} loss={loss:.4f} '
+                f'kl={ppo["approx_kl"]:.6f} entropy={ppo["entropy"]:.3f} '
+                f'ev={ppo["explained_variance"]:.3f}',flush=True)
         status('completed',completed)
     except BaseException:
         status('failed',completed,error=traceback.format_exc())
@@ -278,7 +348,7 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--resume',action='store_true')
     args=parser.parse_args()
-    config=json.loads(args.config.read_text(encoding='utf-8'))
+    config=json.loads(args.config.read_text(encoding='utf-8-sig'))
     train(config,args.output,args.resume)
 
 

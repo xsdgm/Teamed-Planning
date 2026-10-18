@@ -1,4 +1,4 @@
-"""Curriculum invariants and exact optimizer/RNG checkpoint continuation."""
+"""Fixed reward invariants and exact optimizer/RNG checkpoint continuation."""
 import contextlib
 import io
 import json
@@ -10,8 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
-from simulator.train_mappo import DEFAULTS,curriculum,train,validate_config
-from simulator.mappo_experiment import Reward
+from simulator.train_mappo import DEFAULTS,fixed_schedule,train,validate_config
 from drone.mappo import CandidateNavigator
 
 
@@ -19,46 +18,16 @@ class TrainingTests(unittest.TestCase):
     def test_fixed_weights_do_not_depend_on_training_progress(self):
         config=validate_config({})
         for i in (0,300,1000,1999):
-            schedule=curriculum(config,i)
+            schedule=fixed_schedule(config,i)
             self.assertEqual(schedule['beta'],1.)
             self.assertEqual(schedule['eta'],.6)
             self.assertEqual(schedule['entropy'],.01)
             self.assertEqual(schedule['focus'],0.)
 
-    def test_curriculum_moves_from_exploration_to_task(self):
-        config=validate_config(dict(reward_schedule='curriculum'))
-        stages=[curriculum(config,i) for i in range(config['episodes'])]
-        self.assertEqual(stages[0]['beta'],.2)
-        self.assertEqual(stages[0]['eta'],.6)
-        self.assertEqual(stages[-1]['beta'],2.5)
-        self.assertEqual(stages[-1]['eta'],.05)
-        for previous,current in zip(stages,stages[1:]):
-            self.assertGreaterEqual(current['beta'],previous['beta'])
-            self.assertLessEqual(current['eta'],previous['eta'])
-            self.assertLessEqual(current['entropy'],previous['entropy'])
-
-    def test_feedback_cannot_reverse_curriculum(self):
-        cfg=validate_config(dict(reward_schedule='curriculum'))
-        for episode in (0,cfg['episodes']-1):
-            schedule=curriculum(cfg,episode)
-            reward=Reward(curriculum=schedule)
-            before=np.zeros((1,2))
-            after=np.array([[.2,.4]])
-            seen=np.ones((1,2),bool)
-            for _ in range(100):
-                reward.compute(before,after,~seen,seen,np.array([[True,False]]),0.)
-            self.assertTrue(.85*schedule['beta']<=reward.beta<=1.15*schedule['beta'])
-            self.assertTrue(.85*schedule['eta']<=reward.eta<=1.15*schedule['eta'])
-
-    def test_late_reward_prefers_same_task_gain_more(self):
-        cfg=validate_config(dict(reward_schedule='curriculum'))
-        before=np.zeros((1,2))
-        after=np.array([[.5,0.]])
-        seen=np.ones((1,2),bool)
-        def result(i):
-            return Reward(curriculum=curriculum(cfg,i)).compute(before,after,~seen,seen,
-                np.array([[True,False]]),0.)[0]
-        self.assertGreater(result(cfg['episodes']-1),result(0))
+    def test_historical_reward_modes_are_rejected(self):
+        for overrides in ({'reward_schedule':'curriculum'}, {'reward_mode':'legacy'}):
+            with self.assertRaises(ValueError):
+                validate_config(overrides)
 
     def test_seed_splits_do_not_overlap(self):
         with self.assertRaises(ValueError):
@@ -92,7 +61,8 @@ class TrainingTests(unittest.TestCase):
                 rollout.append((x.numpy(),mask.numpy(),a.numpy(),lp.numpy(),float((seed+t)%3)))
             return rollout,dict(confidence_area=1.,task_gain=1.,spacing_violation=0.,
                 collisions=0.,out_of_bounds=0.,task_share=.5,reward_beta=schedule['beta'],
-                reward_eta=schedule['eta'],reward=1.,ground_collisions=0.,chain_link_violation=0.)
+                reward_eta=schedule['eta'],reward=1.,ground_collisions=0.,chain_link_violation=0.,
+                graph_task_connected=1.,graph_first_connection_step=1.,graph_task_path_ratio=1.)
         artifact_root=Path(__file__).resolve().parents[4]/'artifacts'/'training-tests'
         artifact_root.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(dir=artifact_root) as directory:

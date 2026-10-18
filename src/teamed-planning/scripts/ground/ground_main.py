@@ -132,6 +132,7 @@ class GroundRobotController:
         self._observed_obstacles = set()
         self._obstacle_tree = None
         self._obstacle_filter_cache = None
+        self._last_route_review = float('-inf')
     
     def set_goal(self, goal_pos: Tuple[float, float]):
         """
@@ -440,6 +441,9 @@ class GroundRobotController:
                 planning_graph.graph.remove_edges_from(blocked_edges)
                 planning_graph._spatial_index_valid = False
         old_waypoint = self.global_planner.get_current_waypoint()
+        self.global_planner.entry_validator = lambda target: (
+            self.local_planner.observed_connection_waypoint(
+                self.position, target, semantic_map, self.resolution) is not None)
         # A blocked straight connector can have a valid local detour. Keep
         # that destination while executing the detour instead of repeatedly
         # resetting the route to a nearest node behind the robot.
@@ -462,7 +466,8 @@ class GroundRobotController:
                     # Initial planning
                     needs_replan = True
                     print(f"[{self.robot_id}] Initial planning...")
-                elif route_blocked or (graphs_received and self.unified_graph is not None):
+                elif route_blocked or (graphs_received and self.unified_graph is not None
+                        and (self.global_planner.waiting_at_frontier or not self.global_planner.using_graph)):
                     # New graph fused - re-evaluate planning strategy
                     needs_replan = True
                     print(f"[{self.robot_id}] New graph fused, re-evaluating route...")
@@ -480,9 +485,34 @@ class GroundRobotController:
                         if self.global_planner.should_replan(self.position):
                             print(f"[{self.robot_id}] Deviated from path, replanning...")
                             needs_replan = True
+
+                # Review new maps without resetting a healthy route on every
+                # fusion. Adopt only a materially shorter candidate route.
+                if (not needs_replan and self.goal_position is not None
+                        and graphs_received and planning_graph is not None
+                        and current_time - self._last_route_review >= 5.):
+                    self._last_route_review = current_time
+                    candidate = GlobalPlanner(
+                        self.robot_id,
+                        replan_threshold=self.global_planner.replan_threshold,
+                        direct_waypoint_distance=self.global_planner.direct_waypoint_distance,
+                        graph_preference_threshold=self.global_planner.graph_preference_threshold)
+                    candidate.entry_validator = self.global_planner.entry_validator
+                    proposed = candidate.plan_path(self.position, self.goal_position, planning_graph)
+                    remaining = [self.position] + (self.global_planner.get_remaining_path() or [])
+                    old_cost = self.global_planner._compute_path_length(remaining)
+                    new_cost = candidate._compute_path_length(proposed or [])
+                    if (candidate.using_graph and proposed
+                            and old_cost - new_cost > max(2., .1 * old_cost)):
+                        self.global_planner.current_path = candidate.current_path
+                        self.global_planner.current_waypoint_idx = 0
+                        self.global_planner.start_connection_idx = candidate.start_connection_idx
+                        self.global_planner.using_graph = True
+                        self.global_planner.advance_waypoint(self.position, self.waypoint_threshold)
                 
                 # Execute replanning if needed
                 if needs_replan:
+                    self._last_route_review = current_time
                     self.global_planner.plan_path(
                         start_pos=self.position,
                         goal_pos=self.goal_position,
@@ -521,7 +551,8 @@ class GroundRobotController:
                         # The artificial START -> first graph node connector
                         # has no graph evidence yet. Local sensing can support
                         # a short approach to that node, without authorizing
-                        # internal graph gaps or the final unknown goal edge.
+                        # internal graph gaps. A final goal connector can also
+                        # advance incrementally inside observed free space.
                         is_entry = (self.global_planner.using_graph
                                     and self.global_planner.start_connection_idx is not None
                                     and self.global_planner.current_waypoint_idx
@@ -529,7 +560,9 @@ class GroundRobotController:
                         current_waypoint = (
                             self.local_planner.observed_connection_waypoint(
                                 self.position, current_waypoint, semantic_map, self.resolution)
-                            if is_entry else None)
+                            if (is_entry or (self.goal_position is not None and
+                                np.linalg.norm(np.asarray(current_waypoint) - self.goal_position) < 1e-6))
+                            else None)
                         self.global_planner.waiting_at_frontier = current_waypoint is None
                         local_route_used = current_waypoint is not None
                     else:
@@ -539,6 +572,7 @@ class GroundRobotController:
                     current_waypoint = self.local_planner.observed_connection_waypoint(
                         self.position, current_waypoint, semantic_map, self.resolution)
                     local_route_used = current_waypoint is not None
+                    self.global_planner.waiting_at_frontier = current_waypoint is None
         
         # Step 5: Local planning (compute velocity command)
         with self.timer.measure("local_planning"):
@@ -628,6 +662,11 @@ class GroundRobotController:
         self.goal_position = None
         self.unified_graph = None
         self.graphs_received = 0
+        self.last_fusion_time = 0
+        self.last_fusion_per_drone.clear()
+        self._last_cooldown_print.clear()
+        self._last_route_review = float('-inf')
+        self.global_planner.entry_validator = None
         self._observed_obstacles.clear()
         self._obstacle_tree = None
         self._obstacle_filter_cache = None

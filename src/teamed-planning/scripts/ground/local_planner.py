@@ -8,7 +8,7 @@ from typing import Tuple, Optional
 import sys
 import os
 import heapq
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, distance_transform_edt
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -41,7 +41,7 @@ class LocalPlanner:
 
     def observed_connection_waypoint(self, current_pos, target, semantic_map,
                                      resolution):
-        """Return a short collision-free step toward a graph entry node.
+        """Return a short collision-free step toward a navigation target.
 
         Only explicitly observed, traversable cells may be used. A distant
         entry is approached in increments inside the current sensor footprint;
@@ -55,9 +55,13 @@ class LocalPlanner:
                                            TerrainType.CLEARNING.value,
                                            TerrainType.DIFFICULT.value):
                 return None
-            # Recentring a raster can expand an adjacent obstacle into the
-            # robot's current free cell. Allow departure toward a clear cell;
-            # all other inflated cells remain forbidden.
+            free = np.isin(semantic_map, [TerrainType.TRAVERSABLE.value,
+                                          TerrainType.CLEARNING.value,
+                                          TerrainType.DIFFICULT.value])
+            clearance = distance_transform_edt(np.pad(free, 1))[1:-1, 1:-1]
+            # If initialized inside the safety margin, allow escape without
+            # reducing the existing clearance. Never enter occupied cells.
+            blocked = ~free | (clearance < clearance[start])
             blocked[start] = False
         delta = np.asarray(target, dtype=float) - np.asarray(current_pos, dtype=float)
         distance = float(np.linalg.norm(delta))
@@ -136,7 +140,7 @@ class LocalPlanner:
 
     def observed_blocked_cells(self, semantic_map, resolution, include_boundary=True):
         """Inflate non-traversable cells by the robot footprint and margin."""
-        radius = max(1, int(np.ceil(0.5 / resolution)))
+        radius = max(1, int(np.ceil(self.safety_distance / resolution)))
         yy, xx = np.mgrid[-radius:radius + 1, -radius:radius + 1]
         footprint = xx * xx + yy * yy <= radius * radius
         blocked = ~np.isin(semantic_map, [TerrainType.TRAVERSABLE.value,

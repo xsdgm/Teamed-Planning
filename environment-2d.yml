@@ -4,6 +4,9 @@ channels:
 dependencies:
   - python=3.11
   - pip
+  - libblas=*=*openblas
+  - libcblas=*=*openblas
+  - liblapack=*=*openblas
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cpu
       - -r src/teamed-planning/scripts/requirements.txt

@@ -97,6 +97,8 @@ class GraphFusion:
                     # Merge with existing node
                     node_mapping[(drone_id, node_id)] = merged_node_id
                     unified_to_sources[merged_node_id].append((drone_id, node_id))
+                    existing = self.unified_graph.graph.nodes[merged_node_id]
+                    existing.update(TopologicalGraph.merge_observation_attributes(existing, node_data))
                     
                     # Update position as weighted average
                     self._update_merged_node_position(merged_node_id, position,

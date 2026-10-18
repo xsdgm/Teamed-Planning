@@ -9,6 +9,7 @@ from scipy.spatial import KDTree
 from typing import Dict, List, Tuple, Optional, Any
 import json
 import time
+import copy
 
 
 class TopologicalGraph:
@@ -64,14 +65,15 @@ class TopologicalGraph:
             position: (x, y) position of the node
             attributes: Additional attributes (terrain_type, traversability, etc.)
         """
-        if attributes is None:
-            attributes = {}
+        attributes = copy.deepcopy(attributes or {})
         
         # Add default fusion attributes if not provided
         if 'observation_count' not in attributes:
             attributes['observation_count'] = 1
         if 'confidence' not in attributes:
-            attributes['confidence'] = 0.1  # Initial confidence
+            attributes['confidence'] = float(1. - np.exp(
+                -attributes['observation_count'] * self._terrain_reliability(
+                    attributes.get('terrain_type', 'UNKNOWN'))))
         if 'last_updated' not in attributes:
             attributes['last_updated'] = time.time()
         
@@ -150,13 +152,12 @@ class TopologicalGraph:
             return []
         
         indices = self.spatial_index.query_ball_point(position, radius)
-        results = []
-        
-        for idx in indices:
-            node_id = self._node_id_list[idx]
-            node_pos = np.array(self.graph.nodes[node_id]['position'])
-            distance = np.linalg.norm(np.array(position) - node_pos)
-            results.append((node_id, distance))
+        if not indices:
+            return []
+        positions = self.spatial_index.data[indices]
+        distances = np.linalg.norm(positions-np.asarray(position),axis=1)
+        results = [(self._node_id_list[idx],float(distance))
+                   for idx,distance in zip(indices,distances)]
         
         return sorted(results, key=lambda x: x[1])  # Sort by distance
     
@@ -199,11 +200,11 @@ class TopologicalGraph:
             Dictionary containing graph data and metadata
         """
         # Use NetworkX's node-link format
-        graph_data = nx.node_link_data(self.graph)
+        graph_data = copy.deepcopy(nx.node_link_data(self.graph))
         
         return {
             'graph_data': graph_data,
-            'metadata': self.metadata
+            'metadata': dict(self.metadata)
         }
     
     @classmethod
@@ -218,8 +219,8 @@ class TopologicalGraph:
             TopologicalGraph instance
         """
         graph = cls(drone_id=message_data['metadata'].get('drone_id'))
-        graph.graph = nx.node_link_graph(message_data['graph_data'])
-        graph.metadata = message_data['metadata']
+        graph.graph = nx.node_link_graph(copy.deepcopy(message_data['graph_data']))
+        graph.metadata = dict(message_data['metadata'])
         graph._spatial_index_valid = False
         
         return graph
@@ -350,16 +351,9 @@ class TopologicalGraph:
                 # Update existing node with fusion logic
                 existing_node = self.graph.nodes[nearest_node_id]
                 
-                # Update observation count (cap to avoid int32 overflow on
-                # repeated inter-drone fusion — confidence saturates anyway)
-                existing_count = existing_node.get('observation_count', 1)
-                other_count = other_node_data.get('observation_count', 1)
-                new_count = min(existing_count + other_count, 1000)
-                
-                # Update confidence using the formal model c(v) = 1-exp(-obs*r)
-                r_val = self._terrain_reliability(
-                    existing_node.get('terrain_type', 'UNKNOWN'))
-                new_confidence = float(1.0 - np.exp(-new_count * r_val))
+                old_count = existing_node.get('observation_count', 1)
+                evidence = self.merge_observation_attributes(existing_node, other_node_data)
+                new_count = evidence['observation_count']
                 
                 # Update position with weighted average based on confidence
                 existing_confidence = existing_node.get('confidence', 0.1)
@@ -368,8 +362,9 @@ class TopologicalGraph:
                 
                 existing_pos = np.array(existing_node['position'])
                 other_pos_arr = np.array(other_pos)
-                new_pos = (existing_pos * existing_confidence + 
-                          other_pos_arr * other_confidence) / total_confidence
+                new_pos = ((existing_pos * existing_confidence +
+                           other_pos_arr * other_confidence) / max(total_confidence, 1e-12)
+                           if new_count > old_count else existing_pos)
                 old_cell, new_cell = cell(existing_pos), cell(new_pos)
                 if old_cell != new_cell:
                     buckets[old_cell].remove(nearest_node_id)
@@ -379,9 +374,9 @@ class TopologicalGraph:
                 self.update_node_attributes(
                     nearest_node_id,
                     position=tuple(new_pos),
-                    observation_count=new_count,
-                    confidence=new_confidence,
-                    last_updated=current_time
+                    **evidence,
+                    last_updated=max(existing_node.get('last_updated', 0.),
+                                     other_node_data.get('last_updated', 0.))
                 )
                 
                 stats['nodes_merged'] += 1
@@ -428,6 +423,47 @@ class TopologicalGraph:
             self.fusion_history[other_drone_id] = current_time
         
         return stats
+
+    @staticmethod
+    def merge_observation_attributes(first, second):
+        """Max-merge per-origin monotonic counters; relaying is not sensing.
+
+        Legacy/ROS packets without provenance contribute only a conservative
+        maximum, never an additive count. Python broadcasts retain provenance.
+        """
+        sources, frames = {}, {}
+        legacy = 0
+        for data in (first, second):
+            received = data.get('observation_sources', {})
+            legacy = max(legacy, int(data.get('legacy_observation_count',
+                         0 if received else data.get('observation_count', 1))))
+            for key, count in received.items():
+                sources[key] = max(sources.get(key, 0), int(count))
+            for key, frame in data.get('observation_frames', {}).items():
+                frames[key] = max(frames.get(key, float('-inf')), float(frame))
+        count = min(2_000_000_000, legacy + sum(sources.values()))
+        terrain = first.get('terrain_type', second.get('terrain_type', 'UNKNOWN'))
+        reliability = TopologicalGraph._TERRAIN_RELIABILITY.get(str(terrain), .1)
+        return dict(observation_sources=sources, observation_frames=frames,
+                    legacy_observation_count=legacy, observation_count=count,
+                    confidence=float(-np.expm1(-count * reliability)))
+
+    def observe_node(self, node_id, source, frame):
+        """Record one received camera frame at a node, once per local sample."""
+        data = self.graph.nodes[node_id]
+        key = f'{source}:{node_id}'
+        frames = data.get('observation_frames', {})
+        if float(frame) <= frames.get(key, float('-inf')):
+            return False
+        sources = dict(data.get('observation_sources', {}))
+        sources[key] = sources.get(key, 0) + 1
+        updated_frames = dict(frames, **{key: float(frame)})
+        updated = dict(data, observation_sources=sources, observation_frames=updated_frames,
+                       legacy_observation_count=data.get('legacy_observation_count',
+                           0 if data.get('observation_sources') else data.get('observation_count', 1)))
+        data.update(self.merge_observation_attributes(updated, updated))
+        data['last_updated'] = float(frame)
+        return True
     
     def should_fuse_with_drone(self, other_drone_id: str, 
                                current_time: float,
@@ -683,7 +719,7 @@ class TopologicalGraph:
         goal_id, goal_dist = goal
 
         if start_id == goal_id:
-            return start_dist + goal_dist
+            return (start_dist + goal_dist) / epsilon
 
         try:
             cost = nx.astar_path_length(
@@ -714,12 +750,29 @@ class TopologicalGraph:
         if cached is not None and cached[0] == signature:
             return cached[1]
         rows, columns, expected, lengths, endpoints, valid = [], [], [], [], [], []
+        from scipy.spatial import cKDTree
+        if edges:
+            first_positions = positions[[index[a] for a,b,d in edges]]
+            second_positions = positions[[index[b] for a,b,d in edges]]
+            edge_lengths = np.linalg.norm(second_positions-first_positions,axis=1)
+            neighborhoods = cKDTree(positions).query_ball_point(
+                (first_positions+second_positions)/2., edge_lengths/2.+scale/2.)
         for edge_index, (first, second, data) in enumerate(edges):
             a, b = positions[index[first]], positions[index[second]]
             length = float(np.linalg.norm(b - a))
-            corridor = self._find_corridor_nodes(a, b, scale / 2.)
+            candidates = np.asarray(neighborhoods[edge_index],dtype=int)
+            if length < 1e-6:
+                corridor = []
+            else:
+                direction = (b-a)/length
+                relative = positions[candidates]-a
+                along = np.sum(relative*direction,axis=1)
+                perpendicular = np.linalg.norm(relative-along[:,None]*direction,axis=1)
+                tolerance = 1e-9*max(1.,length,scale/2.)
+                corridor = candidates[(along>=-tolerance)&(along<=length+tolerance)&
+                                      (perpendicular<=scale/2.+tolerance)].tolist()
             rows.extend([edge_index] * len(corridor))
-            columns.extend(index[node] for node in corridor)
+            columns.extend(corridor)
             expected.append(max(1., length / scale))
             weight = data.get('weight', 0.)
             lengths.append(weight if weight > 0 else length)
@@ -750,7 +803,7 @@ class TopologicalGraph:
         goal_node, goal_distance = self.find_nearest_node(goal)
         start_index, goal_index = index[start_node], index[goal_node]
         if start_index == goal_index:
-            return np.full(len(centers), start_distance + goal_distance)
+            return np.full(len(centers), (start_distance + goal_distance) / epsilon)
         geometry = self._corridor_geometry(self.mean_edge_length())
         positions = geometry['positions']
         evidence = np.asarray([self._terrain_reliability(self.graph.nodes[node].get('terrain_type', 'UNKNOWN'))
@@ -774,8 +827,7 @@ class TopologicalGraph:
                 cost = distances[goal_index] + (start_distance + goal_distance) / epsilon
             else:
                 frontier_index = int(np.argmin(distances + remaining / epsilon))
-                prefix = (start_distance if frontier_index == start_index else
-                          distances[frontier_index] + start_distance / epsilon)
+                prefix = distances[frontier_index] + start_distance / epsilon
                 cost = prefix + remaining[frontier_index] / epsilon
             costs.append(float(cost))
         return np.asarray(costs)

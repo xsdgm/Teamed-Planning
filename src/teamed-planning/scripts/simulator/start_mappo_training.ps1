@@ -1,15 +1,20 @@
 param(
     [string]$Config = '',
-    [string]$Output = 'artifacts/mappo-moving-ground-fixed-20261015',
+    [string]$Output = 'artifacts/mappo-1000m-20261018',
     [string]$Python = '',
     [switch]$Resume
 )
 $ErrorActionPreference = 'Stop'
 $taskRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../../..')).Path
-if (-not $Config) { $Config = Join-Path $taskRoot 'src/teamed-planning/config/algorithm/mappo_training.json' }
+if (-not $Config) { $Config = Join-Path $taskRoot 'src/teamed-planning/config/algorithm/mappo_training_1000m.json' }
 $taskConfig = (Resolve-Path -LiteralPath $Config).Path
+if (-not $Python -and $env:CONDA_PREFIX) { $Python = Join-Path $env:CONDA_PREFIX 'python.exe' }
 if (-not $Python) { $Python = Join-Path $env:USERPROFILE '.conda/envs/teamedplanning-2d/python.exe' }
 $taskPython = (Resolve-Path -LiteralPath $Python).Path
+$taskEnvironment = Split-Path -Parent $taskPython
+# Conda numerical DLLs must be visible in both the check and background child.
+$env:PATH = "$taskEnvironment;$taskEnvironment/Library/bin;$taskEnvironment/Scripts;" + $env:PATH
+$env:OPENBLAS_NUM_THREADS = '1'
 if ([IO.Path]::IsPathRooted($Output)) { $taskOutput = [IO.Path]::GetFullPath($Output) }
 else { $taskOutput = [IO.Path]::GetFullPath((Join-Path $taskRoot $Output)) }
 New-Item -ItemType Directory -Force -Path $taskOutput | Out-Null

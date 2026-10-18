@@ -123,6 +123,9 @@ class CandidateNavigator(DroneNavigator):
         x = np.zeros((MAX_ACTIONS, FEATURES), np.float32)
         mask = np.zeros(MAX_ACTIONS, bool)
         neighbors = obs['nearby_drones']
+        nodes = [] if graph is None else list(graph.graph.nodes(data=True))
+        node_positions = np.asarray([d['position'][:2] for _,d in nodes]).reshape(-1,2)
+        node_confidences = np.asarray([graph.node_confidence(nid) for nid,_ in nodes])
         for a, w in enumerate(candidates):
             q = np.asarray(w)
             delta = q - p
@@ -152,15 +155,15 @@ class CandidateNavigator(DroneNavigator):
                     safe &= max(np.linalg.norm(r),np.linalg.norm(end-other_end))<=self.comm_range
             # Hold always remains selectable as the documented fallback.
             mask[a] = bool(safe or a == 0)
-            nodes = [] if graph is None else list(graph.graph.nodes(data=True))
-            local = [d for _, d in nodes if np.linalg.norm(np.asarray(d['position'])[:2] - q[:2]) < self.fov_radius]
-            confidence = np.mean([float(d.get('confidence', .1)) for d in local]) if local else 0.
+            local = np.linalg.norm(node_positions-q[:2],axis=1) < self.fov_radius
+            local_count = int(local.sum())
+            confidence = float(node_confidences[local].mean()) if local_count else 0.
             direction = goal - start
             t = np.clip(np.dot(q[:2] - start, direction) / max(np.dot(direction, direction), 1e-8), 0, 1)
             corridor = np.linalg.norm(q[:2] - start - t * direction)
             x[a] = [delta[0]/100, delta[1]/100, distance/100,
                     np.linalg.norm(q[:2]-start)/100, np.linalg.norm(q[:2]-goal)/100,
-                    corridor/100, confidence, min(len(local)/20, 1),
+                    corridor/100, confidence, min(local_count/20, 1),
                     closest/100, float(a == 0), float(mission), p[2]/100]
         return x, mask, candidates, obs
 

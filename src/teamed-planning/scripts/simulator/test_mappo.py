@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from drone.mappo import ActorCritic, CandidateNavigator
 from common.graph_structure import TopologicalGraph
-from simulator.mappo_experiment import DeliveredEvidence, Reward, update
+from simulator.mappo_experiment import DeliveredEvidence, evidence_metrics, update
 
 
 class MAPPOTests(unittest.TestCase):
@@ -79,12 +79,11 @@ class MAPPOTests(unittest.TestCase):
         self.assertGreater(nav.fallbacks,0)
 
     def test_negative_gain_and_first_seen_persist(self):
-        reward = Reward()
         before = np.array([[.8,.8]])
         after = np.array([[.2,.2]])
         seen = np.ones_like(before,bool)
-        r,m = reward.compute(before,after,seen,seen,np.array([[True,False]]),0.)
-        self.assertLess(r,0.)
+        m = evidence_metrics(before,after,seen,seen,np.array([[True,False]]))
+        self.assertLess(m['task_gain'],0.)
         self.assertEqual(m['outside_new'],0.)
 
     def test_ppo_updates_actor_and_critic(self):

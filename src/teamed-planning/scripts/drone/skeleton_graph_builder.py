@@ -38,7 +38,8 @@ class SkeletonGraphBuilder:
                  node_spacing: float = 8.0,
                  min_clearance: float = 1.5,
                  max_edge_distance: float = 4.0,
-                 k_neighbors: int = 3):
+                 k_neighbors: int = 3,
+                 world_bounds=None):
         """
         Initialize skeleton-based graph builder.
 
@@ -60,23 +61,31 @@ class SkeletonGraphBuilder:
         self.min_clearance = min_clearance
         self.max_edge_distance = max_edge_distance
         self.k_neighbors = k_neighbors
+        self.world_bounds = world_bounds
 
         # Convert fixed spatial params to pixels
-        self.node_spacing_pixels = int(node_spacing / resolution)
-        self.min_clearance_pixels = int(min_clearance / resolution)
-        self.max_edge_pixels = int(max_edge_distance / resolution)
+        # Leave room for intermediate nodes even with a small camera footprint.
+        self.node_spacing_pixels = max(1., min(node_spacing, max_edge_distance / 2.) / resolution)
+        self.min_clearance_pixels = min_clearance / resolution
+        self.max_edge_pixels = max_edge_distance / resolution
+        self._path_mask_source = None
         
         self.semantic_processor = SemanticProcessor(resolution=resolution)
-        
+        self._observation_sequence = 0
+
         # Timing statistics
         self.timing_stats = {
             'skeleton_extraction': 0.0,
             'node_sampling': 0.0,
             'edge_creation': 0.0
         }
+
+    def _frame(self, observation_id):
+        self._observation_sequence += 1
+        return float(self._observation_sequence if observation_id is None else observation_id)
     
     def build_graph(self, semantic_map: np.ndarray,
-                   drone_position: Tuple[float, float, float]) -> TopologicalGraph:
+                   drone_position: Tuple[float, float, float], observation_id=None) -> TopologicalGraph:
         """
         Build topological graph from semantic map using skeleton-based approach.
         
@@ -88,6 +97,7 @@ class SkeletonGraphBuilder:
             TopologicalGraph instance
         """
         start_time = time.time()
+        frame = self._frame(observation_id)
         
         # Process semantic data
         semantic_data = self.semantic_processor.process_segmentation(
@@ -108,7 +118,7 @@ class SkeletonGraphBuilder:
         # instead of a single circular radius uses the full camera footprint
         # — especially important for wide-aspect (landscape) cameras where
         # the x half-extent is much larger than the y half-extent.
-        margin = self.max_edge_distance / 2.0
+        margin = self.min_clearance
         safe_build_half_x = max(0.0, (semantic_map.shape[0] * self.resolution) / 2.0 - margin)
         safe_build_half_y = max(0.0, (semantic_map.shape[1] * self.resolution) / 2.0 - margin)
         
@@ -145,11 +155,13 @@ class SkeletonGraphBuilder:
                 node_id,
                 position=world_pos,
                 attributes={
+                    'observation_count': 0, 'legacy_observation_count': 0,
                     'terrain_type': terrain_type.name,
                     'traversability_cost': self.semantic_processor.get_traversability_cost(terrain_type),
                     'clearance': distance_map[py, px] * self.resolution  # Store clearance
                 }
             )
+            graph.observe_node(node_id, self.drone_id, frame)
         
         # Step 3: Connect nodes with sparse edges
         edge_time = time.time()
@@ -184,7 +196,7 @@ class SkeletonGraphBuilder:
     def update_graph(self, existing_graph: TopologicalGraph,
                     semantic_map: np.ndarray,
                     drone_position: Tuple[float, float, float],
-                    merge_distance_threshold: float = 3.0):
+                    merge_distance_threshold: float = 3.0, observation_id=None):
         """
         Update existing graph with new observations.
         
@@ -194,10 +206,26 @@ class SkeletonGraphBuilder:
             drone_position: Current drone position
             merge_distance_threshold: Distance threshold to consider nodes as duplicates (meters)
         """
+        frame = self._frame(observation_id)
         # Process semantic data
         semantic_data = self.semantic_processor.process_segmentation(
             semantic_map, drone_position
         )
+
+        # Every already mapped, actually visible traversable node receives one
+        # vote per local sensor frame, independent of skeleton resampling.
+        for node_id, data in list(existing_graph.graph.nodes(data=True)):
+            min_x,min_y,max_x,max_y=semantic_data['coverage_bounds']
+            wx,wy=data['position'][:2]
+            if not (min_x<=wx<max_x and min_y<=wy<max_y):
+                continue
+            pixel = self.semantic_processor.world_to_pixel(data['position'],
+                semantic_data['coverage_bounds'], semantic_map.shape)
+            if pixel is not None:
+                x, y = pixel
+                if semantic_map[y, x] in (TerrainType.TRAVERSABLE.value,
+                        TerrainType.DIFFICULT.value, TerrainType.CLEARNING.value):
+                    existing_graph.observe_node(node_id, self.drone_id, frame)
         
         # Create traversability mask
         traversable_mask = self._create_traversability_mask(semantic_map)
@@ -208,7 +236,7 @@ class SkeletonGraphBuilder:
         self.timing_stats['skeleton_extraction'] += time.time() - skeleton_time
 
         # safe bounds derived from current map dimensions (altitude-adaptive)
-        margin = self.max_edge_distance / 2.0
+        margin = self.min_clearance
         safe_build_half_x = max(0.0, (semantic_map.shape[0] * self.resolution) / 2.0 - margin)
         safe_build_half_y = max(0.0, (semantic_map.shape[1] * self.resolution) / 2.0 - margin)
 
@@ -256,25 +284,20 @@ class SkeletonGraphBuilder:
                 node_id,
                 position=world_pos,
                 attributes={
+                    'observation_count': 0, 'legacy_observation_count': 0,
                     'terrain_type': terrain_type.name,
                     'traversability_cost': self.semantic_processor.get_traversability_cost(terrain_type),
                     'clearance': distance_map[py, px] * self.resolution
                 }
             )
+            existing_graph.observe_node(node_id, self.drone_id, frame)
             new_node_ids.append((node_id, world_pos))
         
-        # Add edges for new nodes
-        if len(new_node_ids) > 0:
-            existing_graph.build_spatial_index()
-            
-            edge_time = time.time()
-            self._add_edges_incremental(
-                existing_graph,
-                new_node_ids,
-                semantic_map,
-                semantic_data
-            )
-            self.timing_stats['edge_creation'] += time.time() - edge_time
+        # Re-observation can reveal a connection between two OLD nodes too.
+        existing_graph.build_spatial_index()
+        edge_time = time.time()
+        self._refresh_visible_edges(existing_graph, semantic_map, semantic_data)
+        self.timing_stats['edge_creation'] += time.time() - edge_time
         
         # Update metadata
         existing_graph.update_metadata(
@@ -317,7 +340,8 @@ class SkeletonGraphBuilder:
             (skeleton, distance_map) tuple
         """
         # Compute distance transform (distance to nearest obstacle)
-        distance_map = distance_transform_edt(traversable_mask)
+        # Unknown outside the current observation is not evidence of free space.
+        distance_map = distance_transform_edt(np.pad(traversable_mask, 1))[1:-1, 1:-1]
         
         # Extract skeleton using medial axis
         # This gives us paths that maximize clearance from obstacles
@@ -328,7 +352,7 @@ class SkeletonGraphBuilder:
         skeleton = skeleton & (distance_map >= self.min_clearance_pixels)
         
         # Clean up skeleton: remove isolated pixels and small branches MORE AGGRESSIVELY
-        skeleton = self._clean_skeleton(skeleton, min_branch_length=self.node_spacing_pixels)
+        # Preserve endpoints: peeling every endpoint also erases useful corridors.
         
         return skeleton, distance_map
     
@@ -387,7 +411,11 @@ class SkeletonGraphBuilder:
             List of (y, x) pixel coordinates for nodes
         """
         # Get all skeleton pixels
-        skeleton_pixels = np.argwhere(skeleton)
+        # A local skeleton alone does not cover open space or view boundaries.
+        # Keep it as the preferred backbone, then fill observed safe space.
+        safe = self._create_traversability_mask(semantic_map) & (
+            distance_map >= self.min_clearance_pixels + .5)
+        skeleton_pixels = np.argwhere(safe)
 
         if len(skeleton_pixels) == 0:
             return []
@@ -402,6 +430,15 @@ class SkeletonGraphBuilder:
         for py, px in skeleton_pixels:
             world_x = min_x + (py + 0.5) * self.resolution   # row → X
             world_y = min_y + (px + 0.5) * self.resolution   # col → Y
+            local = (np.asarray([py,px])+.5)*self.resolution
+            if not self._observed_segment_clear(semantic_map,local,local):
+                continue
+
+            if self.world_bounds is not None:
+                lo_x, lo_y, hi_x, hi_y = self.world_bounds
+                if not (lo_x+self.min_clearance <= world_x <= hi_x-self.min_clearance and
+                        lo_y+self.min_clearance <= world_y <= hi_y-self.min_clearance):
+                    continue
 
             if (abs(world_x - drone_position[0]) <= safe_build_half_x and
                     abs(world_y - drone_position[1]) <= safe_build_half_y):
@@ -414,11 +451,15 @@ class SkeletonGraphBuilder:
         
         # Sort by clearance (prioritize high-clearance nodes)
         clearances = [distance_map[py, px] for py, px in skeleton_pixels]
-        sorted_indices = np.argsort(clearances)[::-1]  # Descending order
+        backbone = [bool(skeleton[py, px]) for py, px in skeleton_pixels]
+        sorted_indices = sorted(range(len(clearances)),
+            key=lambda i: (not backbone[i], -clearances[i], tuple(skeleton_pixels[i])))
         skeleton_pixels = skeleton_pixels[sorted_indices]
         
         # Greedy sampling: add nodes that are far from all existing nodes
         nodes = []
+        # At least several support points must fit across a small observation.
+        spacing_pixels = min(self.node_spacing_pixels, min(semantic_map.shape)/4.)
         
         for py, px in skeleton_pixels:
             # Check terrain type (should be traversable)
@@ -433,7 +474,7 @@ class SkeletonGraphBuilder:
             if len(nodes) > 0:
                 nodes_array = np.array(nodes)
                 distances = np.sqrt((nodes_array[:, 0] - py)**2 + (nodes_array[:, 1] - px)**2)
-                if np.min(distances) < self.node_spacing_pixels:
+                if np.min(distances) < spacing_pixels:
                     continue
             
             # Add node (clearance already verified by skeleton filtering)
@@ -455,46 +496,18 @@ class SkeletonGraphBuilder:
             node_id_mapping: Mapping from pixel position to node ID
             semantic_map: Semantic segmentation map
         """
-        # For each node, find k nearest TRAVERSABLE neighbors
-        for i, (py1, px1) in enumerate(node_positions_pixel):
-            node_id1 = node_id_mapping[(py1, px1)]
-            pos1 = graph.get_node_position(node_id1)
-            
-            # Find all traversable candidates
-            traversable_candidates = []
-            
-            for j, (py2, px2) in enumerate(node_positions_pixel):
-                if i == j:
-                    continue
-                
-                # Check distance
-                pixel_dist = np.sqrt((px1 - px2)**2 + (py1 - py2)**2)
-                if pixel_dist > self.max_edge_pixels:
-                    continue
-                
-                # Check traversability
-                if self._is_path_traversable(semantic_map, (px1, py1), (px2, py2)):
-                    traversable_candidates.append((j, pixel_dist))
-            
-            # Sort by distance and take k nearest
-            traversable_candidates.sort(key=lambda x: x[1])
-            nearest = traversable_candidates[:self.k_neighbors]
-            
-            # Add edges
-            for j, pixel_dist in nearest:
-                py2, px2 = node_positions_pixel[j]
-                node_id2 = node_id_mapping[(py2, px2)]
-                
-                # Skip if edge exists
-                if graph.graph.has_edge(node_id1, node_id2):
-                    continue
-                
-                pos2 = graph.get_node_position(node_id2)
-                world_dist = np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
-                
-                # Compute edge weight
-                weight = self._compute_edge_weight(semantic_map, (px1, py1), (px2, py2), world_dist)
-                graph.add_edge(node_id1, node_id2, weight=weight)
+        bounds = graph.metadata.get('bounds')
+        # build_graph has not published its metadata yet; derive it from the
+        # sampled pixel/world correspondence without assuming a camera origin.
+        if node_positions_pixel:
+            py, px = node_positions_pixel[0]
+            p = graph.get_node_position(node_id_mapping[(py, px)])
+            min_x = p[0] - (py + .5) * self.resolution
+            min_y = p[1] - (px + .5) * self.resolution
+            bounds = (min_x, min_y, min_x + semantic_map.shape[0]*self.resolution,
+                      min_y + semantic_map.shape[1]*self.resolution)
+            self._refresh_visible_edges(graph, semantic_map,
+                dict(coverage_bounds=bounds, map_shape=semantic_map.shape))
     
     def _add_edges_incremental(self, graph: TopologicalGraph,
                                new_nodes: List[Tuple[str, Tuple[float, float]]],
@@ -509,42 +522,7 @@ class SkeletonGraphBuilder:
             semantic_map: Semantic segmentation map
             semantic_data: Processed semantic data
         """
-        for new_node_id, new_pos in new_nodes:
-            # Find nearby nodes
-            nearby = graph.find_nearby_nodes(new_pos, self.max_edge_distance)
-            
-            # Sort by distance and take k nearest
-            nearby.sort(key=lambda x: x[1])
-            
-            edges_added = 0
-            for nearby_node_id, distance in nearby:
-                if edges_added >= self.k_neighbors:
-                    break
-                
-                if nearby_node_id == new_node_id:
-                    continue
-                
-                if graph.graph.has_edge(new_node_id, nearby_node_id):
-                    continue
-                
-                nearby_pos = graph.get_node_position(nearby_node_id)
-                
-                # Convert to pixel coordinates
-                pixel_pos1 = self.semantic_processor.world_to_pixel(
-                    new_pos, semantic_data['coverage_bounds'], semantic_data['map_shape']
-                )
-                pixel_pos2 = self.semantic_processor.world_to_pixel(
-                    nearby_pos, semantic_data['coverage_bounds'], semantic_data['map_shape']
-                )
-                
-                if pixel_pos1 is None or pixel_pos2 is None:
-                    continue
-                
-                # Check traversability
-                if self._is_path_traversable(semantic_map, pixel_pos1, pixel_pos2):
-                    weight = self._compute_edge_weight(semantic_map, pixel_pos1, pixel_pos2, distance)
-                    graph.add_edge(new_node_id, nearby_node_id, weight=weight)
-                    edges_added += 1
+        self._refresh_visible_edges(graph, semantic_map, semantic_data)
     
     def _is_path_traversable(self, semantic_map: np.ndarray,
                             start_pixel: Tuple[int, int],
@@ -561,28 +539,77 @@ class SkeletonGraphBuilder:
         Returns:
             True if path is traversable
         """
-        x1, y1 = start_pixel
-        x2, y2 = end_pixel
-        
-        # Sample along the line
-        pixel_distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-        num_samples = int(pixel_distance * 2) + 1
-        
-        for i in range(num_samples):
-            t = i / max(num_samples - 1, 1)
-            x = int(x1 + t * (x2 - x1))
-            y = int(y1 + t * (y2 - y1))
-            
-            # Check bounds
-            if not (0 <= y < semantic_map.shape[0] and 0 <= x < semantic_map.shape[1]):
-                return False
-            
-            # Check terrain
-            terrain_type = TerrainType(semantic_map[y, x])
-            if terrain_type in [TerrainType.OBSTACLE, TerrainType.WATER]:
-                return False
-        
-        return True
+        a = (np.asarray(start_pixel)[::-1] + .5) * self.resolution
+        b = (np.asarray(end_pixel)[::-1] + .5) * self.resolution
+        return self._observed_segment_clear(semantic_map, a, b)
+
+    def _observed_segment_clear(self, semantic_map, a, b):
+        """Exact segment versus inflated pixel rectangles; coordinates relative
+        to footprint minimum, ordered world X/Y. Unknown pixels block edges.
+        """
+        a, b = np.asarray(a), np.asarray(b)
+        if ((np.minimum(a,b) < self.min_clearance).any() or
+                (np.maximum(a,b) > np.asarray(semantic_map.shape)*self.resolution-self.min_clearance).any()):
+            return False
+        if self._path_mask_source is not semantic_map:
+            blocked = np.argwhere(~self._create_traversability_mask(semantic_map))
+            self._blocked_lo = blocked*self.resolution-self.min_clearance
+            self._blocked_hi = (blocked+1)*self.resolution+self.min_clearance
+            self._path_mask_source = semantic_map
+        if not len(self._blocked_lo):
+            return True
+        near = np.zeros(len(self._blocked_lo))
+        far = np.ones(len(self._blocked_lo))
+        possible = np.ones(len(near),bool)
+        for axis in (0,1):
+            delta = b[axis]-a[axis]
+            if abs(delta) < 1e-12:
+                possible &= (a[axis] >= self._blocked_lo[:,axis]) & (a[axis] <= self._blocked_hi[:,axis])
+            else:
+                first=(self._blocked_lo[:,axis]-a[axis])/delta
+                second=(self._blocked_hi[:,axis]-a[axis])/delta
+                near=np.maximum(near,np.minimum(first,second))
+                far=np.minimum(far,np.maximum(first,second))
+        return not bool(np.any(possible & (near <= far)))
+
+    def _refresh_visible_edges(self, graph, semantic_map, semantic_data):
+        """Connect visible components before spending degree on redundant edges.
+
+        Every edge is supported by this actual observation, including clearance.
+        No edge is inferred from Euclidean proximity alone.
+        """
+        import networkx as nx
+        from scipy.spatial import cKDTree
+        bounds = semantic_data['coverage_bounds']
+        visible = []
+        for node, data in graph.graph.nodes(data=True):
+            x, y = data['position'][:2]
+            if bounds[0] <= x < bounds[2] and bounds[1] <= y < bounds[3]:
+                pixel = self.semantic_processor.world_to_pixel(data['position'], bounds, semantic_map.shape)
+                visible.append((node, data['position'], pixel))
+        if len(visible) < 2:
+            return
+        components = nx.utils.UnionFind()
+        for component in nx.connected_components(graph.graph):
+            components.union(*component)
+        points = np.asarray([v[1] for v in visible])
+        candidates = []
+        for i, j in cKDTree(points).query_pairs(self.max_edge_distance):
+            a, b = visible[i][0], visible[j][0]
+            if graph.graph.has_edge(a, b):
+                continue
+            distance = float(np.linalg.norm(points[i]-points[j]))
+            candidates.append((distance, i, j))
+        for distance, i, j in sorted(candidates):
+            a, b = visible[i][0], visible[j][0]
+            bridge = components[a] != components[b]
+            if not bridge and min(graph.graph.degree(a), graph.graph.degree(b)) >= self.k_neighbors:
+                continue
+            origin = np.asarray(bounds[:2])
+            if self._observed_segment_clear(semantic_map, points[i]-origin, points[j]-origin):
+                weight = self._compute_edge_weight(semantic_map, visible[i][2], visible[j][2], distance)
+                graph.add_edge(a, b, weight=weight)
+                components.union(a, b)
     
     def _compute_edge_weight(self, semantic_map: np.ndarray,
                            start_pixel: Tuple[int, int],
