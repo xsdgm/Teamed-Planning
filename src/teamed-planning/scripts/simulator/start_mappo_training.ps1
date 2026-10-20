@@ -2,6 +2,7 @@ param(
     [string]$Config = '',
     [string]$Output = 'artifacts/mappo-1000m-20261018',
     [string]$Python = '',
+    [int]$Workers = 1,
     [switch]$Resume
 )
 $ErrorActionPreference = 'Stop'
@@ -36,13 +37,13 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Training dependency check failed. Install requirements into the selected Conda environment.'
 }
 $taskTrainer = Join-Path $PSScriptRoot 'train_mappo.py'
-$taskArguments = @('-I', '-u', ('"'+$taskTrainer+'"'), '--config', ('"'+$taskConfig+'"'), '--output', ('"'+$taskOutput+'"'))
+$taskArguments = @('-I', '-u', ('"'+$taskTrainer+'"'), '--config', ('"'+$taskConfig+'"'), '--output', ('"'+$taskOutput+'"'), '--workers', $Workers)
 if ($Resume) { $taskArguments += '--resume' }
 $taskProcess = Start-Process -FilePath $taskPython -ArgumentList $taskArguments `
     -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $taskOutput 'stdout.log') `
     -RedirectStandardError (Join-Path $taskOutput 'stderr.log')
 @{pid=$taskProcess.Id; started_utc=[DateTime]::UtcNow.ToString('o'); python=$taskPython;
-  config=$taskConfig; output=$taskOutput; resume=[bool]$Resume} |
+  config=$taskConfig; output=$taskOutput; workers=$Workers; resume=[bool]$Resume} |
     ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath $taskLaunchPath
 Write-Output "Started training PID=$($taskProcess.Id) output=$taskOutput"

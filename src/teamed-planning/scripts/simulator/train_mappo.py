@@ -3,18 +3,26 @@
 Training randomness, optimizer state and configuration are saved together.
 Validation uses fixed reward weights and held-out seeds;
 test seeds are never used for checkpoint selection.
+
+With --workers N>1, episodes are collected asynchronously by N processes, each
+using a frozen copy of the latest policy; every finished episode still receives
+one PPO update in the main process. Validation scenes run as separate tasks on
+the weights saved at their episode.
 """
 import argparse
 import contextlib
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 import shutil
+import signal
 import sys
 import time
 import traceback
 import math
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -195,6 +203,10 @@ def validation(model, config):
     for seed in config['validation_seeds']:
         _,summary=run_episode(model,config,seed,schedule,False)
         records.append(dict(seed=seed,**summary))
+    return score_validation(records,config)
+
+
+def score_validation(records, config):
     averages={key:float(np.mean([row[key] for row in records])) for key in records[0] if key!='seed'}
     # Select navigation graphs by connectivity, time, efficiency and safety.
     delays=[r['graph_first_connection_step'] if r['graph_first_connection_step']>=0
@@ -208,7 +220,51 @@ def validation(model, config):
     return dict(score=score,means=averages,scenes=records)
 
 
-def train(config, output, resume=False):
+def _worker_init():
+    # Rollout processes are single-threaded and exit together with the trainer.
+    torch.set_num_threads(1)
+    signal.signal(signal.SIGINT,signal.SIG_IGN)
+    if sys.platform.startswith('linux'):
+        import ctypes
+        ctypes.CDLL(None).prctl(1,signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
+def _rollout_task(kind, state, config, scene_seed, sample_seed, schedule, output, tag):
+    """One episode on a frozen policy copy; validation returns no rollout."""
+    tic=time.monotonic()
+    torch.manual_seed(sample_seed)
+    model=ActorCritic()
+    model.load_state_dict(state)
+    model.train(kind=='train')
+    output=Path(output)
+    def progress(value):
+        atomic_json(output/'running'/f'{tag}.json',dict(task=tag,
+            updated_utc=datetime.now(timezone.utc).isoformat(),**value))
+    rollout,summary=run_episode(model,config,scene_seed,schedule,kind=='train',
+        progress=progress,stop=lambda:(output/'STOP').exists())
+    return (rollout if kind=='train' else None),summary,time.monotonic()-tic
+
+
+def _terminate(pool):
+    for process in list((getattr(pool,'_processes',None) or {}).values()):
+        process.terminate()
+
+
+def episode_line(completed, config, summary, loss, ppo):
+    return (f'episode {completed}/{config["episodes"]} '
+        f'beta={summary["reward_beta"]:.3f} eta={summary["reward_eta"]:.3f} '
+        f'confidence={summary["confidence_area"]:.1f} '
+        f'task_share={summary["task_share"]:.3f} '
+        f'ground_m={summary.get("ground_distance",0.):.1f} '
+        f'goal_remaining={summary.get("ground_goal_distance",0.):.1f} '
+        f'cadmm_gain={summary.get("cadmm_gain",0.):.1f} loss={loss:.4f} '
+        f'kl={ppo["approx_kl"]:.6f} entropy={ppo["entropy"]:.3f} '
+        f'ev={ppo["explained_variance"]:.3f}')
+
+
+def train(config, output, resume=False, workers=1, mp_context='spawn'):
+    if type(workers) is not int or workers<1:
+        raise ValueError('workers must be a positive integer')
     config=validate_config(config)
     output=Path(output).resolve()
     output.mkdir(parents=True,exist_ok=True)
@@ -254,7 +310,7 @@ def train(config, output, resume=False):
                         for path in scripts.rglob('*.py'))
     source_hashes={name:hashlib.sha256((scripts/name).read_bytes()).hexdigest() for name in source_files}
     provenance=dict(python=sys.version,torch=str(torch.__version__),numpy=np.__version__,
-                    source_sha256=source_hashes)
+                    workers=workers,source_sha256=source_hashes)
     atomic_json(output/('resume_provenance.json' if resume else 'provenance.json'),provenance)
     if not resume:
         for name in source_files:
@@ -279,11 +335,136 @@ def train(config, output, resume=False):
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
             exploration_weight=fixed_schedule(config,completed)['eta'],
             best_score=best_score,best_episode=best_episode)
+    def parallel():
+        nonlocal completed,joint_steps,best_score,best_episode
+        running,pending=output/'running',output/'pending_validation'
+        running.mkdir(exist_ok=True)
+        pending.mkdir(exist_ok=True)
+        for stale in running.glob('*.json'):
+            stale.unlink()
+        queue,tasks,snapshots,results=[],{},{},{}
+        dispatched=completed
+        validation_schedule=fixed_schedule(config,config['episodes']-1)
+        def enqueue_validation(path):
+            # Saved weights are reloaded, so later updates cannot alter them.
+            snapshot=torch.load(path,map_location='cpu',weights_only=True)
+            episode=snapshot['training_episodes']
+            snapshots[episode],results[episode]=snapshot,{}
+            queue.extend((episode,seed) for seed in config['validation_seeds'])
+        # Validations interrupted by STOP are repeated with their saved weights.
+        for path in sorted(pending.glob('episode_*.pt')):
+            enqueue_validation(path)
+        if not resume and config['initial_validation']:
+            atomic_checkpoint(pending/'episode_00000.pt',checkpoint(0))
+            enqueue_validation(pending/'episode_00000.pt')
+        def in_flight():
+            return [dict(task=t['tag'],started_utc=t['started_utc']) for t in tasks.values()]
+        def submit(pool):
+            nonlocal dispatched
+            started_utc=datetime.now(timezone.utc).isoformat()
+            if queue:
+                episode,seed=queue.pop(0)
+                tag=f'validation_{episode:05d}_{seed}'
+                future=pool.submit(_rollout_task,'validation',snapshots[episode]['model'],config,
+                    seed,seed,validation_schedule,str(output),tag)
+                tasks[future]=dict(kind='validation',tag=tag,episode=episode,seed=seed,started_utc=started_utc)
+                return True
+            if completed+sum(t['kind']=='train' for t in tasks.values())>=config['episodes']:
+                return False
+            schedule=fixed_schedule(config,dispatched)
+            scene_seed=int(rng.integers(config['train_seed_start'],
+                                       config['train_seed_start']+config['train_seed_count']))
+            sample_seed=int(np.random.SeedSequence([config['seed'],dispatched]).generate_state(1)[0])
+            dispatched+=1
+            tag=f'train_{dispatched:05d}'
+            state={key:value.detach().clone() for key,value in model.state_dict().items()}
+            future=pool.submit(_rollout_task,'train',state,config,scene_seed,sample_seed,
+                schedule,str(output),tag)
+            tasks[future]=dict(kind='train',tag=tag,dispatch=dispatched,scene_seed=scene_seed,
+                schedule=schedule,policy_episodes=completed,started_utc=started_utc)
+            return True
+        def finish(future):
+            nonlocal completed,joint_steps,best_score,best_episode
+            task=tasks.pop(future)
+            (running/f'{task["tag"]}.json').unlink(missing_ok=True)
+            rollout,summary,elapsed=future.result()
+            if task['kind']=='validation':
+                if summary.get('user_stopped'):
+                    return
+                episode=task['episode']
+                results[episode][task['seed']]=summary
+                if len(results[episode])<len(config['validation_seeds']):
+                    return
+                scenes=results.pop(episode)
+                report=score_validation([dict(seed=seed,**scenes[seed])
+                                         for seed in config['validation_seeds']],config)
+                snapshot=snapshots.pop(episode)
+                if episode==0:
+                    atomic_json(output/'initial_validation.json',report)
+                else:
+                    append_json(output/'validation.jsonl',dict(episode=episode,**report))
+                    if best_score is None or report['score']>best_score:
+                        best_score,best_episode=report['score'],episode
+                        atomic_checkpoint(output/'best.pt',dict(snapshot,best_score=best_score,
+                                                               best_episode=best_episode))
+                        atomic_checkpoint(latest,checkpoint(completed))
+                (pending/f'episode_{episode:05d}.pt').unlink()
+                status('running',completed,workers=workers,in_flight=in_flight(),
+                       last_validation=dict(episode=episode,**report))
+                return
+            loss,ppo=update(model,optimizer,rollout,epochs=config['ppo_epochs'],
+                entropy_coef=task['schedule']['entropy'],return_metrics=True,
+                discount=config['discount'],gae_lambda=config['gae_lambda'])
+            completed+=1
+            joint_steps+=len(rollout)
+            # policy_lag counts updates applied after this episode's weights were copied.
+            record=dict(episode=completed,scene_seed=task['scene_seed'],loss=loss,ppo=ppo,
+                schedule=task['schedule'],elapsed_seconds=round(elapsed,3),dispatch=task['dispatch'],
+                policy_lag=completed-1-task['policy_episodes'],**summary)
+            append_json(output/'training.jsonl',record)
+            atomic_checkpoint(latest,checkpoint(completed))
+            if completed % config['validation_interval']==0 or completed==config['episodes']:
+                atomic_checkpoint(pending/f'episode_{completed:05d}.pt',checkpoint(completed))
+                enqueue_validation(pending/f'episode_{completed:05d}.pt')
+            if completed % config['snapshot_interval']==0:
+                atomic_checkpoint(output/f'episode_{completed:05d}.pt',checkpoint(completed))
+            status('running',completed,workers=workers,in_flight=in_flight(),last_training=record)
+            print(episode_line(completed,config,summary,loss,ppo)+
+                  f' lag={record["policy_lag"]} seconds={elapsed:.0f}',flush=True)
+        pool=ProcessPoolExecutor(workers,mp_context=multiprocessing.get_context(mp_context),
+                                 initializer=_worker_init)
+        stopping=False
+        try:
+            while True:
+                # STOP ends dispatch; running episodes return partial rollouts.
+                stopping=stopping or (output/'STOP').exists()
+                submitted=False
+                while not stopping and len(tasks)<workers and submit(pool):
+                    submitted=True
+                if not tasks:
+                    break
+                if submitted:
+                    status('running',completed,workers=workers,in_flight=in_flight())
+                done,_=wait(list(tasks),timeout=5,return_when=FIRST_COMPLETED)
+                for future in done:
+                    finish(future)
+        except BaseException:
+            _terminate(pool)
+            pool.shutdown(wait=False,cancel_futures=True)
+            raise
+        pool.shutdown()
+        if stopping and (completed<config['episodes'] or queue):
+            status('stopped',completed,reason='STOP file found; resume with --resume')
+        else:
+            status('completed',completed)
     status('running',start)
     if not resume:
         atomic_checkpoint(latest,checkpoint(0))
     completed=start
     try:
+        if workers>1:
+            parallel()
+            return
         if not resume and config['initial_validation']:
             status('validating',0,reason='untrained baseline')
             atomic_json(output/'initial_validation.json',validation(model,config))
@@ -327,15 +508,7 @@ def train(config, output, resume=False):
             if completed % config['snapshot_interval']==0:
                 atomic_checkpoint(output/f'episode_{completed:05d}.pt',checkpoint(completed))
             status('running',completed,last_training=record,last_validation=report)
-            print(f'episode {completed}/{config["episodes"]} '
-                f'beta={summary["reward_beta"]:.3f} eta={summary["reward_eta"]:.3f} '
-                f'confidence={summary["confidence_area"]:.1f} '
-                f'task_share={summary["task_share"]:.3f} '
-                f'ground_m={summary.get("ground_distance",0.):.1f} '
-                f'goal_remaining={summary.get("ground_goal_distance",0.):.1f} '
-                f'cadmm_gain={summary.get("cadmm_gain",0.):.1f} loss={loss:.4f} '
-                f'kl={ppo["approx_kl"]:.6f} entropy={ppo["entropy"]:.3f} '
-                f'ev={ppo["explained_variance"]:.3f}',flush=True)
+            print(episode_line(completed,config,summary,loss,ppo),flush=True)
         status('completed',completed)
     except BaseException:
         status('failed',completed,error=traceback.format_exc())
@@ -347,9 +520,14 @@ def main():
     parser.add_argument('--config',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--workers',type=int,default=1,
+                        help='parallel rollout processes; 1 keeps the serial trainer')
     args=parser.parse_args()
     config=json.loads(args.config.read_text(encoding='utf-8-sig'))
-    train(config,args.output,args.resume)
+    if args.workers>1:
+        # Record the failure status and stop rollout processes on termination.
+        signal.signal(signal.SIGTERM,lambda *_:sys.exit(143))
+    train(config,args.output,args.resume,workers=args.workers)
 
 
 if __name__=='__main__':

@@ -6,7 +6,7 @@
 
 - `../drone/mappo.py`：各无人机共享候选 Actor、集中 Critic、动作掩码与 PPO 模型。
 - `mappo_experiment.py`：当前 2D 环境、证据送达账本、固定奖励、轨迹指标、PPO 更新；作为模块使用。
-- `train_mappo.py` / `start_mappo_training.ps1`：唯一训练入口，支持检查点恢复。
+- `train_mappo.py` / `start_mappo_training.ps1` / `start_mappo_training.sh`（Linux）：唯一训练入口，支持检查点恢复与 `--workers` 并行采样。
 - `validate_mappo_2d.py`：最佳模型与停止模型在新 2D 场景上的比较。
 - `evaluate_large_world.py` / `large_world_scenarios.py`：冻结第 1505 轮模型的 1000 米地图测试。
 - `navigation_metrics.py` / `scenarios.py`：导航图指标与可行场景生成。
@@ -29,6 +29,18 @@
 保持原 12 维特征及 /100 尺度、传感器、链路和速度。训练种子 50000–57999，验证种子 60000/60001/60003 分别覆盖 350/550/750 米，保留测试种子 70000–70009。每 10 回合验证、每 25 回合保存快照，启动器默认使用大地图配置。首轮前不运行完整长回合验证；已先进行独立短程训练检查。
 
 `progress.json` 记录已完成回合，`episode_progress.json` 每 25 步记录当前回合进度、已送达面积和最大链路距离。`training.jsonl` 区分 CBF 终止、预算耗尽和成图完成；车辆进展仅作诊断。`map_completed` 代表连续连通达到时长要求；`graph_task_connected` 代表回合末连通，不等同于连续完成指标。
+
+## 并行采样（`--workers N`）
+
+`--workers 1`（默认）为上述串行训练，行为不变。`N>1` 时 N 个进程异步采集回合：每个回合使用派发时 Actor 权重的冻结副本，旧 log-prob 由该副本记录；回合结束后主进程立即用原 `update` 做一次 PPO 更新，再向空闲进程派发新回合。每回合一次更新、总更新次数、奖励、场景种子序列（按派发顺序抽取）与串行一致；差别是采样策略最多落后约 N 次更新，记录在 `training.jsonl` 的 `policy_lag`，`dispatch` 为派发序号。
+
+验证在第 10 的倍数回合时把完整检查点写入 `pending_validation/episode_XXXXX.pt`，三个验证场景作为独立任务并行运行，用该检查点权重打分并决定 `best.pt`，不阻塞训练；验证结果可能晚于后续训练回合写入 `validation.jsonl`。每个运行中任务的 25 步进度写在 `running/<任务>.json`（替代 `episode_progress.json`），`progress.json` 的 `in_flight` 列出在跑任务。
+
+放置 `STOP` 后不再派发；在跑的训练回合在下一控制步返回已采集轨迹并完成更新，被打断的验证保留在 `pending_validation`，`--resume` 后用原权重重跑。异常终止（非 STOP）时未完成回合丢弃，其场景种子不会重复。工作进程随主进程退出（Linux 下 `PR_SET_PDEATHSIG`）。
+
+```bash
+src/teamed-planning/scripts/simulator/start_mappo_training.sh --workers 16 --output artifacts/mappo-1000m-parallel-new
+```
 
 ## 运行
 
