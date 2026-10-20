@@ -9,7 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
-from drone.mappo import ActorCritic
+from drone.mappo import ActorCritic,GLOBAL_FEATURES
 from simulator.large_world_scenarios import generate_training_scene
 from simulator.mappo_experiment import SafetyTermination
 from simulator.train_mappo import fixed_schedule,run_episode,validate_config
@@ -43,6 +43,11 @@ class LargeTrainingTests(unittest.TestCase):
             rollout,summary=run_episode(ActorCritic(),config,50001,
                 fixed_schedule(config,0),True,progress=progress.append)
         self.assertEqual(len(rollout),3)
+        # Critic state: elapsed budget fraction, then remaining steps/1000.
+        self.assertEqual([len(r[5]) for r in rollout],[GLOBAL_FEATURES]*3)
+        np.testing.assert_allclose([r[5][0] for r in rollout],[0.,1/3,2/3],rtol=1e-6)
+        np.testing.assert_allclose(rollout[0][5][1],.003,rtol=1e-6)
+        self.assertTrue(all(np.isfinite(r[5]).all() for r in rollout))
         self.assertEqual(summary['task_distance_m'],750.)
         self.assertEqual(summary['episode_budget_steps'],3)
         self.assertEqual(summary['budget_exhausted'],1.)
@@ -63,7 +68,8 @@ class LargeTrainingTests(unittest.TestCase):
             rollout,summary=run_episode(ActorCritic(),config,50001,fixed_schedule(config,0),True)
         self.assertEqual(calls,[0])
         self.assertEqual(len(rollout),2)
-        self.assertEqual(rollout[-1][-1],-10.)
+        self.assertEqual(rollout[-1][4],-10.)
+        self.assertEqual(len(rollout[-1][5]),GLOBAL_FEATURES)
         self.assertEqual(summary['safety_terminated'],1.)
         self.assertEqual(summary['episode_steps'],1)
         self.assertEqual(summary['rollout_steps'],2)

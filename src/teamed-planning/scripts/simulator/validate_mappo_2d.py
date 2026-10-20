@@ -54,7 +54,7 @@ def evaluate(run,output,seeds):
         path=run/name;saved=torch.load(path,map_location='cpu',weights_only=True)
         assert saved['environment_version']==ENVIRONMENT_VERSION==4
         assert saved['config']==config
-        model=ActorCritic();model.load_state_dict(saved['model']);model.eval()
+        model=ActorCritic.from_state_dict(saved['model']);model.eval()
         models[label]=model
         checkpoints[label]=dict(path=str(path),sha256=digest(path),episode=saved['training_episodes'])
     output.mkdir(parents=True)

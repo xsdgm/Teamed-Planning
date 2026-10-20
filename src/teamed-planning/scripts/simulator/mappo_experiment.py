@@ -215,6 +215,25 @@ class Experiment:
             self.goal_reached=True
         return action
 
+    def critic_state(self, frame, budget, stability=0.):
+        """Centralized critic input at decision time; training only, never acting.
+
+        Remaining budget, delivered coverage, the ground's own path cost and
+        task-graph status, and chain geometry. No obstacle truth or reference route.
+        """
+        ground=np.asarray(self.obs[self.ground]['self']['position'],float)[:2]
+        drones=np.asarray([self.obs[r]['self']['position'] for r in self.ids],float)[:,:2]
+        links=[np.linalg.norm(drones[0]-ground)]+[np.linalg.norm(drones[i]-drones[i-1])
+                                                  for i in range(1,len(drones))]
+        separation=min(np.linalg.norm(drones[i]-drones[j]) for i in range(len(drones)) for j in range(i))
+        scale=max(self.initial_goal_distance,1.)
+        # Path cost after the previous step's map update; empty map before the first step.
+        cost=self.trace[-1]['ground_path_cost'] if self.trace else scale/.05
+        connected=bool(self._graph_metrics and self._graph_metrics['graph_task_connected'])
+        return np.array([frame/budget,(budget-frame)/1000.,self.ledger.seen.sum()*4/1e5,
+            float(connected),stability,np.linalg.norm(ground-self.goal)/scale,scale/1000.,
+            min(float(cost)*.05/scale,2.),max(links)/95.,separation/100.],np.float32)
+
     def step(self, frame):
         before, old_seen = self.ledger.confidence().copy(), self.ledger.seen.copy()
         old_ground=np.asarray(self.obs[self.ground]['self']['position']).copy()
@@ -418,11 +437,17 @@ def update(model, optimizer, rollout, epochs=4, entropy_coef=.01, return_metrics
     actions = torch.tensor(np.array([s[2] for s in rollout]))
     old_logp = torch.tensor(np.array([s[3] for s in rollout]), dtype=torch.float32)
     rewards = torch.tensor([s[4] for s in rollout], dtype=torch.float32)
+    states = None
+    if model.global_features:
+        if len(rollout[0]) < 6:
+            raise ValueError('Rollout lacks the global critic state required by this model')
+        states = torch.tensor(np.array([s[5] for s in rollout]), dtype=torch.float32)
     with torch.no_grad():
-        values = model.value(x, mask)
+        values = model.value(x, mask, states)
         adv = torch.zeros_like(rewards)
         last = torch.tensor(0.)
-        # Fixed-length episodes end here: no cross-episode GAE or bootstrapping.
+        # Episodes end here: no cross-episode GAE or bootstrapping. A critic
+        # given the remaining budget treats budget exhaustion as a true terminal.
         for t in reversed(range(len(rollout))):
             next_v = values[t+1] if t+1 < len(rollout) else 0.
             last = rewards[t] + discount*next_v - values[t] + discount*gae_lambda*last
@@ -434,7 +459,7 @@ def update(model, optimizer, rollout, epochs=4, entropy_coef=.01, return_metrics
         dist = model.distribution(x, mask)
         ratio = (dist.log_prob(actions)-old_logp).exp()
         actor_loss = -torch.minimum(ratio*adv[:,None], ratio.clamp(.8,1.2)*adv[:,None]).mean()
-        value_loss = (model.value(x, mask)-returns).square().mean()
+        value_loss = (model.value(x, mask, states)-returns).square().mean()
         loss = actor_loss + .5*value_loss - entropy_coef*dist.entropy().mean()
         if not torch.isfinite(loss):
             raise FloatingPointError('Non-finite PPO loss; training halted before optimizer update')
@@ -446,7 +471,7 @@ def update(model, optimizer, rollout, epochs=4, entropy_coef=.01, return_metrics
         final_dist=model.distribution(x,mask)
         log_ratio=final_dist.log_prob(actions)-old_logp
         final_ratio=log_ratio.exp()
-        final_values=model.value(x,mask)
+        final_values=model.value(x,mask,states)
         final_policy=-torch.minimum(final_ratio*adv[:,None],
             final_ratio.clamp(.8,1.2)*adv[:,None]).mean()
         counts=mask.sum(-1)

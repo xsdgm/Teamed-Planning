@@ -1,8 +1,10 @@
 """Persistent MAPPO training with fixed rewards and resumable checkpoints.
 
 Training randomness, optimizer state and configuration are saved together.
-Validation uses fixed reward weights and held-out seeds;
-test seeds are never used for checkpoint selection.
+Validation uses fixed reward weights and held-out seeds and samples actions
+like training (validation_samples runs per seed, fixed sample seeds), so it
+scores the policy being trained; checkpoints record policy_mode='sample'.
+Test seeds are never used for checkpoint selection.
 
 With --workers N>1, episodes are collected asynchronously by N processes, each
 using a frozen copy of the latest policy; every finished episode still receives
@@ -29,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
-from drone.mappo import ActorCritic
+from drone.mappo import ActorCritic, GLOBAL_FEATURES
 from simulator.mappo_experiment import Experiment, SafetyTermination, update
 from simulator.large_world_scenarios import generate_training_scene
 from simulator.scenarios import ENVIRONMENT_VERSION
@@ -38,7 +40,7 @@ from simulator.scenarios import ENVIRONMENT_VERSION
 DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     ppo_epochs=4, validation_interval=50, snapshot_interval=100,
     train_seed_start=10000, train_seed_count=8000,
-    validation_seeds=[20000,20001,20002,20003,20004],
+    validation_seeds=[20000,20001,20002,20003,20004],validation_samples=2,
     test_seeds=[30000,30001,30002,30003,30004,30005,30006,30007,30008,30009],
     # Inert historical fields retained solely for v4 checkpoint config equality.
     exploration_candidates=5, drop=0., curriculum_start=.15, curriculum_end=.70,
@@ -73,7 +75,8 @@ def validate_config(config):
     for name in ('exploration_weight','entropy_coefficient'):
         if not np.isfinite(config[name]) or config[name]<0:
             raise ValueError(f'{name} must be finite and nonnegative')
-    for field in ('episodes','steps','ppo_epochs','validation_interval','snapshot_interval','train_seed_count'):
+    for field in ('episodes','steps','ppo_epochs','validation_interval','snapshot_interval','train_seed_count',
+                  'validation_samples'):
         if not isinstance(config[field],int) or config[field] < 1:
             raise ValueError(f'{field} must be a positive integer')
     if not 0 <= config['curriculum_start'] < config['curriculum_end'] <= 1:
@@ -157,6 +160,7 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             for frame in range(budget):
                 if stop is not None and stop() and rollout:
                     reason='user_stop';break
+                state=env.critic_state(frame,budget,min(stable/config['map_stability_steps'],1.))
                 try:
                     samples,reward,_=env.step(frame)
                 except SafetyTermination as exc:
@@ -164,9 +168,9 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                     # The proposed joint action transitions to an absorbing failure
                     # without executing infeasible velocities or relaxing safety.
                     samples=exc.samples;reward=-config['safety_failure_penalty']
-                    rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward))
+                    rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward,state))
                     reason='cbf_infeasible';break
-                rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward))
+                rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward,state))
                 points=np.asarray(env.trace[-1]['positions'])
                 ground=np.asarray(env.obs[env.ground]['self']['position'])
                 ground=np.r_[ground[:2],ground[2] if len(ground)>2 else 0.]
@@ -195,19 +199,29 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
     return rollout,summary
 
 
+def validation_runs(config):
+    """(scene seed, sample index, sample seed); identical for every checkpoint."""
+    return [(seed,k,int(np.random.SeedSequence([config['seed'],seed,k]).generate_state(1)[0]))
+            for seed in config['validation_seeds'] for k in range(config['validation_samples'])]
+
+
 def validation(model, config):
     # Use the same fixed weights for validation throughout training.
     schedule=fixed_schedule(config,config['episodes']-1)
     records=[]
     model.eval()
-    for seed in config['validation_seeds']:
-        _,summary=run_episode(model,config,seed,schedule,False)
-        records.append(dict(seed=seed,**summary))
+    for seed,k,sample_seed in validation_runs(config):
+        # Sample like training without disturbing the training random stream.
+        with torch.random.fork_rng():
+            torch.manual_seed(sample_seed)
+            _,summary=run_episode(model,config,seed,schedule,True)
+        records.append(dict(seed=seed,sample=k,**summary))
     return score_validation(records,config)
 
 
 def score_validation(records, config):
-    averages={key:float(np.mean([row[key] for row in records])) for key in records[0] if key!='seed'}
+    averages={key:float(np.mean([row[key] for row in records]))
+              for key in records[0] if key not in ('seed','sample')}
     # Select navigation graphs by connectivity, time, efficiency and safety.
     delays=[r['graph_first_connection_step'] if r['graph_first_connection_step']>=0
             else config['steps'] for r in records]
@@ -230,17 +244,19 @@ def _worker_init():
 
 
 def _rollout_task(kind, state, config, scene_seed, sample_seed, schedule, output, tag):
-    """One episode on a frozen policy copy; validation returns no rollout."""
+    """One episode on a frozen policy copy; validation returns no rollout.
+
+    Validation samples actions exactly like training, from its fixed sample seed.
+    """
     tic=time.monotonic()
     torch.manual_seed(sample_seed)
-    model=ActorCritic()
-    model.load_state_dict(state)
+    model=ActorCritic.from_state_dict(state)
     model.train(kind=='train')
     output=Path(output)
     def progress(value):
         atomic_json(output/'running'/f'{tag}.json',dict(task=tag,
             updated_utc=datetime.now(timezone.utc).isoformat(),**value))
-    rollout,summary=run_episode(model,config,scene_seed,schedule,kind=='train',
+    rollout,summary=run_episode(model,config,scene_seed,schedule,True,
         progress=progress,stop=lambda:(output/'STOP').exists())
     return (rollout if kind=='train' else None),summary,time.monotonic()-tic
 
@@ -276,12 +292,15 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
     torch.set_num_threads(1)
     torch.manual_seed(config['seed'])
     rng=np.random.default_rng(config['seed'])
-    model=ActorCritic()
+    model=ActorCritic(GLOBAL_FEATURES)
     optimizer=torch.optim.Adam(model.parameters(),lr=config['learning_rate'])
     start,best_score,best_episode=0,None,None
     joint_steps=0
     if resume:
         saved=torch.load(latest,map_location='cpu',weights_only=True)
+        if saved.get('critic_global_features',0)!=GLOBAL_FEATURES or saved.get('policy_mode')!='sample':
+            raise ValueError('Checkpoint predates the global-state critic and sampled validation; '
+                             'start a separate training run')
         if validate_config(saved['config'])!=config:
             raise ValueError('Resume configuration differs from saved training configuration')
         model.load_state_dict(saved['model'])
@@ -328,6 +347,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
         return dict(model=model.state_dict(),optimizer=optimizer.state_dict(),
             scene_rng=rng.bit_generator.state,torch_rng=torch.get_rng_state(),
             training_episodes=completed,joint_steps=joint_steps,config=config,feature_version=1,fov_radius=12.,
+            critic_global_features=GLOBAL_FEATURES,policy_mode='sample',
             exploration_candidates=config['exploration_candidates'],world_bounds=[0.,0.,config['world_size'],config['world_size']],
             communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
@@ -350,7 +370,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
             snapshot=torch.load(path,map_location='cpu',weights_only=True)
             episode=snapshot['training_episodes']
             snapshots[episode],results[episode]=snapshot,{}
-            queue.extend((episode,seed) for seed in config['validation_seeds'])
+            queue.extend((episode,*run) for run in validation_runs(config))
         # Validations interrupted by STOP are repeated with their saved weights.
         for path in sorted(pending.glob('episode_*.pt')):
             enqueue_validation(path)
@@ -363,11 +383,12 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
             nonlocal dispatched
             started_utc=datetime.now(timezone.utc).isoformat()
             if queue:
-                episode,seed=queue.pop(0)
-                tag=f'validation_{episode:05d}_{seed}'
+                episode,seed,k,sample_seed=queue.pop(0)
+                tag=f'validation_{episode:05d}_{seed}_{k}'
                 future=pool.submit(_rollout_task,'validation',snapshots[episode]['model'],config,
-                    seed,seed,validation_schedule,str(output),tag)
-                tasks[future]=dict(kind='validation',tag=tag,episode=episode,seed=seed,started_utc=started_utc)
+                    seed,sample_seed,validation_schedule,str(output),tag)
+                tasks[future]=dict(kind='validation',tag=tag,episode=episode,seed=seed,sample=k,
+                                   started_utc=started_utc)
                 return True
             if completed+sum(t['kind']=='train' for t in tasks.values())>=config['episodes']:
                 return False
@@ -392,12 +413,13 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
                 if summary.get('user_stopped'):
                     return
                 episode=task['episode']
-                results[episode][task['seed']]=summary
-                if len(results[episode])<len(config['validation_seeds']):
+                results[episode][task['seed'],task['sample']]=summary
+                runs=validation_runs(config)
+                if len(results[episode])<len(runs):
                     return
                 scenes=results.pop(episode)
-                report=score_validation([dict(seed=seed,**scenes[seed])
-                                         for seed in config['validation_seeds']],config)
+                report=score_validation([dict(seed=seed,sample=k,**scenes[seed,k])
+                                         for seed,k,_ in runs],config)
                 snapshot=snapshots.pop(episode)
                 if episode==0:
                     atomic_json(output/'initial_validation.json',report)

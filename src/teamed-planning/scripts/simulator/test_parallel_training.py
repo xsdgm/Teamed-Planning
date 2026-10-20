@@ -8,12 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import numpy as np
 import torch
+from drone.mappo import GLOBAL_FEATURES
 from simulator.train_mappo import train,validate_config
 
 
 def fake_episode(model,config,seed,schedule,stochastic,progress=None,stop=None):
-    rollout=[]
+    rollout=[];draw=float(torch.rand(()))  # Reveals the task's sample seed.
     for t in range(config['steps']):
         if stop is not None and stop() and rollout:
             break
@@ -23,14 +25,15 @@ def fake_episode(model,config,seed,schedule,stochastic,progress=None,stop=None):
             dist=model.distribution(x,mask)
             a=dist.sample() if stochastic else dist.logits.argmax(-1)
             lp=dist.log_prob(a)
-        rollout.append((x.numpy(),mask.numpy(),a.numpy(),lp.numpy(),float((seed+t)%3)))
+        rollout.append((x.numpy(),mask.numpy(),a.numpy(),lp.numpy(),float((seed+t)%3),
+                       np.full(GLOBAL_FEATURES,t/config['steps'],np.float32)))
         if progress is not None:
             progress(dict(step=t+1))
     return rollout,dict(confidence_area=1.,task_gain=1.,spacing_violation=0.,
         collisions=0.,out_of_bounds=0.,task_share=.5,reward_beta=schedule['beta'],
         reward_eta=schedule['eta'],reward=float(seed%7),ground_collisions=0.,chain_link_violation=0.,
         graph_task_connected=1.,graph_first_connection_step=1.,graph_task_path_ratio=1.,
-        user_stopped=float(len(rollout)<config['steps']))
+        user_stopped=float(len(rollout)<config['steps']),sampled=float(stochastic),draw=draw)
 
 
 def rows(path):
@@ -67,7 +70,15 @@ class ParallelTrainingTests(unittest.TestCase):
         self.assertEqual(progress['joint_steps'],6*config['steps'])
         validation=rows(run/'validation.jsonl')
         self.assertEqual(sorted(r['episode'] for r in validation),[2,4,6])
-        self.assertTrue(all(len(r['scenes'])==2 for r in validation))
+        # Every validation samples like training: seeds x samples, distinct sample seeds.
+        self.assertTrue(all(len(r['scenes'])==2*config['validation_samples'] for r in validation))
+        self.assertTrue(all(s['sampled']==1. for r in validation for s in r['scenes']))
+        for r in validation:
+            self.assertEqual([(s['seed'],s['sample']) for s in r['scenes']],
+                             [(20000,0),(20000,1),(20001,0),(20001,1)])
+            self.assertEqual(len({s['draw'] for s in r['scenes']}),4)
+        # The same sample seeds are reused for every checkpoint.
+        self.assertEqual(len({tuple(s['draw'] for s in r['scenes']) for r in validation}),1)
         self.assertTrue((run/'initial_validation.json').exists())
         self.assertEqual(list((run/'pending_validation').iterdir()),[])
         best=max(validation,key=lambda r:r['score'])

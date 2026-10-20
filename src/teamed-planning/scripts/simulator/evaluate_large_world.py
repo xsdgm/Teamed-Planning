@@ -90,7 +90,7 @@ def evaluate(run,output,seeds,distances,resume=False):
         for name in hashes:
             target=output/'sources'/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(scripts/name,target)
     atomic_json(output/'results.json',report);write_report(report,output)
-    torch.set_num_threads(1);model=ActorCritic();model.load_state_dict(saved['model']);model.eval()
+    torch.set_num_threads(1);model=ActorCritic.from_state_dict(saved['model']);model.eval()
     completed={(r['seed'],r['distance']) for r in report['records']}
     try:
         for seed in seeds:

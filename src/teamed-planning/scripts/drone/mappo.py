@@ -9,6 +9,9 @@ from drone.chain_state import ChainState
 
 FEATURES = 12
 MAX_ACTIONS = 21
+# Training-only centralized state (time, delivered map, task graph, chain);
+# see Experiment.critic_state. The actor never receives these features.
+GLOBAL_FEATURES = 10
 
 
 def legal_observation(obs):
@@ -29,19 +32,34 @@ def legal_observation(obs):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self):
+    def __init__(self, global_features=0):
         super().__init__()
+        self.global_features = int(global_features)
         self.actor = nn.Sequential(nn.Linear(FEATURES, 64), nn.Tanh(),
                                    nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 1))
-        # Mean pooling is invariant to fleet order/size; only legal observations.
-        self.critic = nn.Sequential(nn.Linear(FEATURES, 64), nn.Tanh(), nn.Linear(64, 1))
+        # Mean pooling is invariant to fleet order/size. The optional global
+        # state is used only for training targets, never for acting.
+        self.critic = nn.Sequential(nn.Linear(FEATURES+self.global_features, 64), nn.Tanh(),
+                                    nn.Linear(64, 1))
+
+    @classmethod
+    def from_state_dict(cls, state):
+        """Rebuild with the critic width stored in the weights (older checkpoints: 0)."""
+        model = cls(global_features=state['critic.0.weight'].shape[1]-FEATURES)
+        model.load_state_dict(state)
+        return model
 
     def distribution(self, x, mask):
         return Categorical(logits=self.actor(x).squeeze(-1).masked_fill(~mask, -1e9))
 
-    def value(self, x, mask):
+    def value(self, x, mask, state=None):
         pooled = (x * mask[..., None]).sum(-2) / mask.sum(-1, keepdim=True).clamp_min(1)
-        return self.critic(pooled.mean(-2)).squeeze(-1)
+        pooled = pooled.mean(-2)
+        if self.global_features:
+            if state is None:
+                raise ValueError('This critic requires the global training state')
+            pooled = torch.cat([pooled, state], -1)
+        return self.critic(pooled).squeeze(-1)
 
 
 class CandidateNavigator(DroneNavigator):
@@ -52,7 +70,7 @@ class CandidateNavigator(DroneNavigator):
     Missing expected neighbors forces hold, rather than assuming connectivity.
     """
     def __init__(self, *args, model=None, algorithm='mappo', checkpoint=None,
-                 deterministic=True, max_speed=6., decision_dt=1.,
+                 deterministic=None, max_speed=6., decision_dt=1.,
                  exploration_candidates=0, world_bounds=None,
                  communication_mode=None, fleet_ids=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -61,12 +79,14 @@ class CandidateNavigator(DroneNavigator):
         self.communication_mode=communication_mode or 'direct'
         self.checkpoint_safety_filter='legacy'
         self.model = model
+        policy_mode = 'argmax'
         if checkpoint:
-            self.model = ActorCritic()
             saved = torch.load(Path(checkpoint), map_location='cpu', weights_only=True)
             if saved.get('feature_version') != 1:
                 raise ValueError('Unsupported MAPPO checkpoint feature version')
-            self.model.load_state_dict(saved['model'])
+            self.model = ActorCritic.from_state_dict(saved['model'])
+            # Act as the checkpoint was validated; older checkpoints used argmax.
+            policy_mode = saved.get('policy_mode', 'argmax')
             self.fov_radius = float(saved.get('fov_radius', 12.))
             self.exploration_candidates = int(saved.get('exploration_candidates', 0))
             self.world_bounds = saved.get('world_bounds', world_bounds)
@@ -75,8 +95,10 @@ class CandidateNavigator(DroneNavigator):
             self.model.eval()
         if not 0 <= self.exploration_candidates <= 20:
             raise ValueError('exploration_candidates must be between 0 and 20')
+        if policy_mode not in ('argmax', 'sample'):
+            raise ValueError('policy_mode must be argmax or sample')
         self.algorithm = algorithm
-        self.deterministic = deterministic
+        self.deterministic = policy_mode == 'argmax' if deterministic is None else bool(deterministic)
         self.max_speed, self.decision_dt = max_speed, decision_dt
         self.last_sample = None
         self.fallbacks = 0

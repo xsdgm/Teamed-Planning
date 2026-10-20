@@ -11,7 +11,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 from simulator.train_mappo import DEFAULTS,fixed_schedule,train,validate_config
-from drone.mappo import CandidateNavigator
+from drone.mappo import CandidateNavigator,GLOBAL_FEATURES
 
 
 class TrainingTests(unittest.TestCase):
@@ -58,7 +58,8 @@ class TrainingTests(unittest.TestCase):
                     dist=model.distribution(x,mask)
                     a=dist.sample()
                     lp=dist.log_prob(a)
-                rollout.append((x.numpy(),mask.numpy(),a.numpy(),lp.numpy(),float((seed+t)%3)))
+                rollout.append((x.numpy(),mask.numpy(),a.numpy(),lp.numpy(),float((seed+t)%3),
+                               np.full(GLOBAL_FEATURES,t/config['steps'],np.float32)))
             return rollout,dict(confidence_area=1.,task_gain=1.,spacing_violation=0.,
                 collisions=0.,out_of_bounds=0.,task_share=.5,reward_beta=schedule['beta'],
                 reward_eta=schedule['eta'],reward=1.,ground_collisions=0.,chain_link_violation=0.,

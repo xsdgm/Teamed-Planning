@@ -1,11 +1,12 @@
 """Information-boundary, evidence-accounting and optimizer regression tests."""
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
-from drone.mappo import ActorCritic, CandidateNavigator
+from drone.mappo import ActorCritic, CandidateNavigator, GLOBAL_FEATURES
 from common.graph_structure import TopologicalGraph
 from simulator.mappo_experiment import DeliveredEvidence, evidence_metrics, update
 
@@ -104,6 +105,49 @@ class MAPPOTests(unittest.TestCase):
         self.assertTrue(np.isfinite(loss))
         self.assertFalse(torch.equal(initial_actor,model.actor[0].weight))
         self.assertFalse(torch.equal(initial_critic,model.critic[0].weight))
+
+    def test_global_state_critic_trains_and_requires_state(self):
+        torch.manual_seed(2)
+        model = ActorCritic(GLOBAL_FEATURES)
+        rollout=[]
+        for t in range(8):
+            x = torch.randn(3,21,12)
+            mask = torch.ones(3,21,dtype=torch.bool)
+            with torch.no_grad():
+                dist=model.distribution(x,mask)
+                actions=dist.sample()
+                logp=dist.log_prob(actions)
+            rollout.append((x.numpy(),mask.numpy(),actions.numpy(),logp.numpy(),float(t%3),
+                            np.full(GLOBAL_FEATURES,t/8,np.float32)))
+        x=torch.from_numpy(rollout[0][0]);mask=torch.from_numpy(rollout[0][1])
+        with self.assertRaises(ValueError):
+            model.value(x,mask)
+        with self.assertRaises(ValueError):
+            update(model,torch.optim.Adam(model.parameters(),lr=3e-4),[r[:5] for r in rollout])
+        # The critic reads the state: changing it alone changes the value.
+        state=torch.zeros(GLOBAL_FEATURES)
+        self.assertNotEqual(float(model.value(x,mask,state)),float(model.value(x,mask,state+1)))
+        initial_critic = model.critic[0].weight.detach().clone()
+        loss=update(model,torch.optim.Adam(model.parameters(),lr=3e-4),rollout)
+        self.assertTrue(np.isfinite(loss))
+        self.assertFalse(torch.equal(initial_critic,model.critic[0].weight))
+
+    def test_checkpoint_sets_policy_mode_and_critic_width(self):
+        artifact_root=Path(__file__).resolve().parents[4]/'artifacts'/'mappo-tests'
+        artifact_root.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=artifact_root) as directory:
+            new,old=Path(directory)/'new.pt',Path(directory)/'old.pt'
+            torch.save(dict(model=ActorCritic(GLOBAL_FEATURES).state_dict(),feature_version=1,
+                            policy_mode='sample'),new)
+            torch.save(dict(model=ActorCritic().state_dict(),feature_version=1),old)
+            sampled=CandidateNavigator('drone_0',checkpoint=str(new))
+            self.assertFalse(sampled.deterministic)
+            self.assertEqual(sampled.model.global_features,GLOBAL_FEATURES)
+            # Older checkpoints were validated with argmax and keep it.
+            legacy=CandidateNavigator('drone_0',checkpoint=str(old))
+            self.assertTrue(legacy.deterministic)
+            self.assertEqual(legacy.model.global_features,0)
+            self.assertTrue(CandidateNavigator('drone_0',checkpoint=str(new),deterministic=True).deterministic)
 
 
 if __name__ == '__main__':
