@@ -52,6 +52,11 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     world_size=120.,task_distances=[350,550,750],budget_multiplier=3.,budget_extra=240,
     min_episode_steps=600,map_stability_steps=30,safety_failure_penalty=10.,
     discount=.99,gae_lambda=.95,initial_validation=True,
+    # Relay subgoals (ground/subgoal_manager.py), episode end at vehicle arrival
+    # instead of a stable task graph, its terminal reward, and initial weights.
+    subgoal_radius=None,termination='map',arrival_reward=0.,init_checkpoint=None,
+    # Candidate chain slack below the 95 m link limit (None: no slack).
+    chain_ground_range=None,chain_link_range=None,
     environment_version=ENVIRONMENT_VERSION)
 
 
@@ -119,6 +124,22 @@ def validate_config(config):
             raise ValueError(f'{name} must be a positive integer')
     if type(config['initial_validation']) is not bool:
         raise ValueError('initial_validation must be bool')
+    if config['subgoal_radius'] is not None and (isinstance(config['subgoal_radius'],bool) or
+            not isinstance(config['subgoal_radius'],(int,float)) or not 25<config['subgoal_radius']<1000):
+        raise ValueError('subgoal_radius must be null or a distance between 25 and 1000 m')
+    if config['termination'] not in ('map','arrival'):
+        raise ValueError('termination must be map or arrival')
+    if config['termination']=='arrival' and config['world_size']!=1000.:
+        raise ValueError('Arrival termination is defined for the 1000m world')
+    if not np.isfinite(config['arrival_reward']) or config['arrival_reward']<0:
+        raise ValueError('arrival_reward must be finite and nonnegative')
+    if config['init_checkpoint'] is not None and not isinstance(config['init_checkpoint'],str):
+        raise ValueError('init_checkpoint must be null or a checkpoint path')
+    for name,low in (('chain_ground_range',0.),('chain_link_range',15.)):
+        value=config[name]
+        if value is not None and (isinstance(value,bool) or not isinstance(value,(int,float))
+                                  or not low<value<=95.):
+            raise ValueError(f'{name} must be null or in ({low:g}, 95] m')
     return config
 
 
@@ -148,13 +169,16 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
     requested_budget=config['steps'] if scene is None else max(config['min_episode_steps'],
         math.ceil(config['budget_multiplier']*scene['reference_length']+config['budget_extra']))
     budget=min(config['steps'],requested_budget)
+    termination=config['termination']
     with contextlib.redirect_stdout(io.StringIO()):
         env=Experiment(scene_seed,model,stochastic=stochastic,drop=config['drop'],
             exploration_weight=schedule['eta'],exploration_candidates=config['exploration_candidates'],
             communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
             spacing_penalty_weight=config['spacing_penalty_weight'],intervention_weight=config['intervention_weight'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
-            ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],**options)
+            ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
+            subgoal_radius=config['subgoal_radius'],chain_ground_range=config['chain_ground_range'],
+            chain_link_range=config['chain_link_range'],**options)
         rollout=[];reason='budget';stable=0;max_link=0.
         try:
             for frame in range(budget):
@@ -182,12 +206,18 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                         world_size=config['world_size'],task_distance_m=env.initial_goal_distance,
                         graph_connected=bool(stable),ground_remaining_m=env.trace[-1]['ground_goal_distance'],
                         delivered_area_m2=float(env.ledger.seen.sum()*4),max_link_distance_m=max_link))
-                if large and stable>=config['map_stability_steps']:
+                if large and termination=='map' and stable>=config['map_stability_steps']:
                     reason='map_connected';break
-                if not large and env.done:
-                    reason='vehicle_arrival';break
+                if (env.done if not large else termination=='arrival' and env.goal_reached):
+                    reason='vehicle_arrival'
+                    if large and config['arrival_reward']:
+                        # Terminal success reward on the arrival transition.
+                        *head,reward,state=rollout[-1]
+                        rollout[-1]=(*head,reward+config['arrival_reward'],state)
+                    break
             summary=env.summary()
             if reason=='cbf_infeasible':summary['reward']-=config['safety_failure_penalty']
+            if reason=='vehicle_arrival' and large:summary['reward']+=config['arrival_reward']
             summary.update(safety_terminated=float(reason=='cbf_infeasible'),
                 map_completed=float(reason=='map_connected'),budget_exhausted=float(reason=='budget'),
                 user_stopped=float(reason=='user_stop'),episode_budget_steps=budget,
@@ -222,10 +252,16 @@ def validation(model, config):
 def score_validation(records, config):
     averages={key:float(np.mean([row[key] for row in records]))
               for key in records[0] if key not in ('seed','sample')}
-    # Select navigation graphs by connectivity, time, efficiency and safety.
-    delays=[r['graph_first_connection_step'] if r['graph_first_connection_step']>=0
-            else config['steps'] for r in records]
-    score=1000*averages['graph_task_connected']-float(np.mean(delays))/config['steps'] \
+    # Select navigation graphs by connectivity, time, efficiency and safety;
+    # with arrival termination, by vehicle arrival and its time instead.
+    if config['termination']=='arrival':
+        success=averages['goal_reached']
+        delays=[r['episode_steps'] if r['goal_reached'] else config['steps'] for r in records]
+    else:
+        success=averages['graph_task_connected']
+        delays=[r['graph_first_connection_step'] if r['graph_first_connection_step']>=0
+                else config['steps'] for r in records]
+    score=1000*success-float(np.mean(delays))/config['steps'] \
         -.1*averages['graph_task_path_ratio']+.001*averages['reward'] \
         -10000*averages['ground_collisions']-10000*averages['collisions'] \
         -10*averages['chain_link_violation']
@@ -293,6 +329,16 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
     torch.manual_seed(config['seed'])
     rng=np.random.default_rng(config['seed'])
     model=ActorCritic(GLOBAL_FEATURES)
+    initial_weights=None
+    if config['init_checkpoint'] is not None and not resume:
+        # Fine-tuning: network weights only; optimizer, counters and RNG start fresh.
+        path=Path(config['init_checkpoint']).resolve()
+        initial=torch.load(path,map_location='cpu',weights_only=True)
+        if initial.get('critic_global_features',0)!=GLOBAL_FEATURES or initial.get('feature_version')!=1:
+            raise ValueError('init_checkpoint must use the current actor features and global-state critic')
+        model.load_state_dict(initial['model'])
+        initial_weights=dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                             training_episodes=initial.get('training_episodes'))
     optimizer=torch.optim.Adam(model.parameters(),lr=config['learning_rate'])
     start,best_score,best_episode=0,None,None
     joint_steps=0
@@ -329,7 +375,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
                         for path in scripts.rglob('*.py'))
     source_hashes={name:hashlib.sha256((scripts/name).read_bytes()).hexdigest() for name in source_files}
     provenance=dict(python=sys.version,torch=str(torch.__version__),numpy=np.__version__,
-                    workers=workers,source_sha256=source_hashes)
+                    workers=workers,source_sha256=source_hashes,init_checkpoint=initial_weights)
     atomic_json(output/('resume_provenance.json' if resume else 'provenance.json'),provenance)
     if not resume:
         for name in source_files:
@@ -354,6 +400,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
             environment_version=ENVIRONMENT_VERSION,
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
             exploration_weight=fixed_schedule(config,completed)['eta'],
+            chain_ground_range=config['chain_ground_range'],chain_link_range=config['chain_link_range'],
             best_score=best_score,best_episode=best_episode)
     def parallel():
         nonlocal completed,joint_steps,best_score,best_episode

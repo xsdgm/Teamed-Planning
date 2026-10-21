@@ -101,6 +101,54 @@ class GroundNavigationTests(unittest.TestCase):
             [{'nodes': set(graph.graph.nodes)}], (0.,0.), (10.,4.), graph)
         self.assertEqual(tuple(route[1]), (0.,4.))
 
+    def test_unreachable_leading_component_is_skipped(self):
+        graph = graph_from({'side': (5.,8.), 'b': (10.,0.), 'c': (30.,0.)}, [('b','c')])
+        planner = GlobalPlanner('test')
+        planner.entry_validator = lambda point: tuple(point) != (5.,8.)
+        route = planner._stitch_multi_component_path(
+            [{'nodes': {'side'}}, {'nodes': {'b','c'}}], (0.,0.), (40.,0.), graph)
+        self.assertEqual([tuple(p) for p in route], [(0.,0.), (10.,0.), (30.,0.), (40.,0.)])
+        self.assertEqual(planner.start_connection_idx, 1)
+        planner.entry_validator = lambda point: False
+        self.assertIsNone(planner._stitch_multi_component_path(
+            [{'nodes': {'side'}}, {'nodes': {'b','c'}}], (0.,0.), (40.,0.), graph))
+
+    def test_robot_enclosed_by_inflation_escapes_with_reduced_margin(self):
+        # Local map recorded where the vehicle waited forever (training scene 55426):
+        # a 3.3 m gap between two trees. 1 = traversable, 2 = obstacle; row 0 = lowest y.
+        rows = ['2222222111111111', '2222222111111111', '2222222211111111', '2222222111111122',
+                '2222222111111222', '2222222111112222', '2222221111112222', '2222211111122222',
+                '2222111111122222', '2111111111122222', '1111111111122222', '1111111111222222',
+                '1111111111122222', '1111111111122222', '1111111111122222', '1111111111122222']
+        semantic = np.array([[int(c) for c in row] for row in rows], np.uint8)
+        position = np.array([105.9, 713.4])
+        nodes = [(2.4, -6.77), (-1.88, 7.19), (-0.44, -8.53), (-5.04, 7.05)]
+        strict = LocalPlanner('test', escape_distance=1.5)
+        planner = LocalPlanner('test')
+        blocked = planner.observed_blocked_cells(semantic, .5)[0]
+        self.assertTrue(blocked[8, 8])  # Inside the full margin, on the ridge between trees.
+        for offset in nodes:
+            self.assertIsNone(strict.observed_connection_waypoint(position, position + offset, semantic, .5))
+        steps = [planner.observed_connection_waypoint(position, position + offset, semantic, .5)
+                 for offset in nodes]
+        self.assertTrue(any(step is not None for step in steps))
+        for step in steps:
+            if step is None:
+                continue
+            cell = np.floor((np.asarray(step) - position) / .5 + 8).astype(int)
+            self.assertEqual(semantic[cell[1], cell[0]], 1)
+            self.assertLessEqual(np.linalg.norm(np.asarray(step) - position), 2. + 1e-9)
+
+    def test_escape_margin_is_used_only_when_enclosed(self):
+        planner = LocalPlanner('test')
+        semantic = np.ones((16, 16), np.uint8)
+        self.assertEqual(planner.observed_connection_waypoint(np.zeros(2), (10., 0.), semantic, .5), (2., 0.))
+        # A wall 2 m ahead: the full 1.5 m margin already stops the robot here,
+        # and it is not enclosed, so the reduced margin must not let it closer.
+        semantic[:, 12:] = 2
+        self.assertFalse(planner._enclosed(planner.observed_blocked_cells(semantic, .5)[0], (8, 8)))
+        self.assertIsNone(planner.observed_connection_waypoint(np.zeros(2), (10., 0.), semantic, .5))
+
     def test_component_path_minimizes_length(self):
         graph = graph_from({'a': (0.,0.), 'b': (100.,0.), 'c': (10.,0.),
             'd': (20.,0.), 'z': (30.,0.), 'other': (35.,0.)},

@@ -145,7 +145,9 @@ class DroneNavigator:
 
         # --- 3. Gap midpoints between disconnected components --------------
         if graph is not None and graph.graph.number_of_nodes() > 0:
-            components = list(nx.connected_components(graph.graph))
+            # Sorted members: set order follows string hash randomization, and
+            # a different summation order changes centroids in the last bits.
+            components = [sorted(c, key=str) for c in nx.connected_components(graph.graph)]
             if len(components) > 1:
                 for ci in range(len(components)):
                     for cj in range(ci + 1, len(components)):

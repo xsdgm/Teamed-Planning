@@ -19,6 +19,7 @@ from ground.graph_receiver import GraphReceiver
 from ground.graph_fusion import GraphFusion
 from ground.global_planner import GlobalPlanner
 from ground.local_planner import LocalPlanner
+from ground.subgoal_manager import SubgoalManager
 from common.graph_structure import TopologicalGraph
 from common.timing import PerformanceTimer
 
@@ -46,7 +47,9 @@ class GroundRobotController:
                  waypoint_threshold: float = 1.0,
                  replan_threshold: float = 5.0,
                  fusion_interval: float = 20.0,
-                 edge_confidence_threshold: float = 0.0):
+                 edge_confidence_threshold: float = 0.0,
+                 subgoal_radius: Optional[float] = None,
+                 world_bounds: Optional[Tuple[float, float, float, float]] = None):
         """
         Initialize ground robot controller.
         
@@ -62,6 +65,9 @@ class GroundRobotController:
             waypoint_threshold: Distance to waypoint for "reached" (default 1.0m)
             replan_threshold: Distance from path before replanning (default 5.0m)
             fusion_interval: Minimum time between fusing graphs from same drone (default 20.0s)
+            subgoal_radius: With a goal beyond the drone chain, drive to and
+                broadcast relay subgoals at most this far ahead (None: off)
+            world_bounds: Surveyed (min_x, min_y, max_x, max_y) for subgoals
         """
         self.robot_id = robot_id
         self.resolution = resolution
@@ -114,6 +120,12 @@ class GroundRobotController:
         self.heading = None
         self.goal_position = None
         self.unified_graph = None
+        # Relay subgoals: goal_position (driven to and broadcast) is the
+        # current subgoal; final_goal is the mission goal.
+        self.subgoal_radius = subgoal_radius
+        self.world_bounds = world_bounds
+        self.subgoals = None
+        self.final_goal = None
         
         # Statistics
         self.graphs_received = 0
@@ -141,9 +153,26 @@ class GroundRobotController:
         Args:
             goal_pos: (x, y) goal position
         """
+        self.final_goal = goal_pos
+        if self.subgoal_radius:
+            # The first get_action selects the first subgoal.
+            self.subgoals = SubgoalManager(goal_pos, self.subgoal_radius, world_bounds=self.world_bounds)
+            self.global_planner.clear_path()
+            self.goal_position = None
+            print(f"[{self.robot_id}] Goal set to {goal_pos} (relay subgoals, radius {self.subgoal_radius:g}m)")
+            return
+        self._drive_to(goal_pos)
+
+    def _drive_to(self, goal_pos):
         self.global_planner.clear_path()
         self.goal_position = goal_pos
         print(f"[{self.robot_id}] Goal set to {goal_pos}")
+
+    def stop(self):
+        """Abandon the mission goal and any relay subgoal."""
+        self.goal_position = None
+        self.final_goal = None
+        self.subgoals = None
 
     def _filter_observed_obstacles(self, graph, semantic_map):
         """Retain static obstacle evidence in world coordinates across fusions.
@@ -365,6 +394,12 @@ class GroundRobotController:
                 - 'broadcast': None (ground robots don't broadcast yet)
         """
         current_time = simulator_obs.get('full_state', {}).get('time', time.time())
+        if self.subgoals is not None:
+            # Uses the position and graph before this cycle's fusion.
+            target, changed = self.subgoals.update(
+                simulator_obs['self']['position'], self.unified_graph, current_time)
+            if changed:
+                self._drive_to(tuple(target))
         
         # Step 1: Parse simulator observation
         with self.timer.measure("observation_parsing"):
@@ -661,6 +696,8 @@ class GroundRobotController:
         self.heading = None
         self.goal_position = None
         self.unified_graph = None
+        self.subgoals = None
+        self.final_goal = None
         self.graphs_received = 0
         self.last_fusion_time = 0
         self.last_fusion_per_drone.clear()

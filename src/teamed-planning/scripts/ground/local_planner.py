@@ -24,7 +24,8 @@ class LocalPlanner:
     """
     
     def __init__(self, robot_id: str, max_linear_vel: float = 1.0,
-                 max_angular_vel: float = 1.0, safety_distance: float = 1.5):
+                 max_angular_vel: float = 1.0, safety_distance: float = 1.5,
+                 escape_distance: float = 0.5):
         """
         Initialize local planner.
         
@@ -33,11 +34,14 @@ class LocalPlanner:
             max_linear_vel: Maximum linear velocity (m/s)
             max_angular_vel: Maximum angular velocity (rad/s)
             safety_distance: Minimum distance to obstacles (meters)
+            escape_distance: Reduced margin used only when the full margin
+                leaves no free neighboring cell (meters; above the 0.3m body)
         """
         self.robot_id = robot_id
         self.max_linear_vel = max_linear_vel
         self.max_angular_vel = max_angular_vel
         self.safety_distance = safety_distance
+        self.escape_distance = escape_distance
 
     def observed_connection_waypoint(self, current_pos, target, semantic_map,
                                      resolution):
@@ -62,6 +66,18 @@ class LocalPlanner:
             # If initialized inside the safety margin, allow escape without
             # reducing the existing clearance. Never enter occupied cells.
             blocked = ~free | (clearance < clearance[start])
+            blocked[start] = False
+        if self._enclosed(blocked, start):
+            # Inflation can close a gap the robot has already entered (between
+            # two trees, standing on the ridge of maximum clearance): no
+            # neighbor is enterable. Plan this step with the smaller escape
+            # margin instead of holding forever; occupied cells stay blocked.
+            if semantic_map[start] not in (TerrainType.TRAVERSABLE.value,
+                                           TerrainType.CLEARNING.value,
+                                           TerrainType.DIFFICULT.value):
+                return None
+            blocked, radius = self.observed_blocked_cells(
+                semantic_map, resolution, distance=self.escape_distance)
             blocked[start] = False
         delta = np.asarray(target, dtype=float) - np.asarray(current_pos, dtype=float)
         distance = float(np.linalg.norm(delta))
@@ -138,9 +154,23 @@ class LocalPlanner:
             waypoint = tuple(np.asarray(current_pos) + offset)
         return waypoint
 
-    def observed_blocked_cells(self, semantic_map, resolution, include_boundary=True):
+    @staticmethod
+    def _enclosed(blocked, start):
+        """No 8-neighbor is enterable (diagonals may not cut blocked corners)."""
+        y, x = start
+        height, width = blocked.shape
+        def free(cy, cx):
+            return 0 <= cy < height and 0 <= cx < width and not blocked[cy, cx]
+        if any(free(y + dy, x + dx) for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1))):
+            return False
+        # Both orthogonal cells are blocked here, so no diagonal is enterable.
+        return True
+
+    def observed_blocked_cells(self, semantic_map, resolution, include_boundary=True,
+                               distance=None):
         """Inflate non-traversable cells by the robot footprint and margin."""
-        radius = max(1, int(np.ceil(self.safety_distance / resolution)))
+        distance = self.safety_distance if distance is None else distance
+        radius = max(1, int(np.ceil(distance / resolution)))
         yy, xx = np.mgrid[-radius:radius + 1, -radius:radius + 1]
         footprint = xx * xx + yy * yy <= radius * radius
         blocked = ~np.isin(semantic_map, [TerrainType.TRAVERSABLE.value,

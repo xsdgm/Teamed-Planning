@@ -45,6 +45,11 @@ class GroundROSNode:
         self.control_rate = rospy.get_param('~control_rate', 10.0)
         self.comm_timeout = rospy.get_param('~comm_timeout', 10.0)
         self.num_drones = rospy.get_param('~num_drones', 3)
+        # Relay subgoals for goals beyond the drone chain (0 disables);
+        # world_bounds = [min_x, min_y, max_x, max_y] of the surveyed area.
+        self.subgoal_radius = float(rospy.get_param('~subgoal_radius', 0.0)) or None
+        bounds = rospy.get_param('~world_bounds', None)
+        self.world_bounds = tuple(float(v) for v in bounds) if bounds else None
 
         # libgazebo_ros_diff_drive with legacyMode=false initialises its odom
         # frame at the Gazebo world origin, so /ground_0/odom already carries
@@ -71,6 +76,8 @@ class GroundROSNode:
             perception_range=self.perception_range,
             max_linear_vel=self.max_linear_vel,
             max_angular_vel=self.max_angular_vel,
+            subgoal_radius=self.subgoal_radius,
+            world_bounds=self.world_bounds,
         )
 
         # ── Publishers ─────────────────────────────────────────────────
@@ -138,7 +145,7 @@ class GroundROSNode:
         cmd = msg.command.upper()
         rospy.loginfo(f"[{self.robot_id}] Command: {cmd}")
         if cmd == "STOP":
-            self.controller.goal_position = None
+            self.controller.stop()
         elif cmd == "RESET":
             self.controller.reset()
 

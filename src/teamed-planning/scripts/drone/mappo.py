@@ -72,8 +72,13 @@ class CandidateNavigator(DroneNavigator):
     def __init__(self, *args, model=None, algorithm='mappo', checkpoint=None,
                  deterministic=None, max_speed=6., decision_dt=1.,
                  exploration_candidates=0, world_bounds=None,
-                 communication_mode=None, fleet_ids=None, **kwargs):
+                 communication_mode=None, fleet_ids=None,
+                 chain_ground_range=None, chain_link_range=None, **kwargs):
         super().__init__(*args, **kwargs)
+        # Chain slack: candidates keep links shorter than comm_range, so the
+        # CBF retains room to follow a receding vehicle (None: comm_range).
+        self.chain_ground_range = chain_ground_range
+        self.chain_link_range = chain_link_range
         self.exploration_candidates = int(exploration_candidates)
         self.world_bounds = world_bounds
         self.communication_mode=communication_mode or 'direct'
@@ -92,6 +97,10 @@ class CandidateNavigator(DroneNavigator):
             self.world_bounds = saved.get('world_bounds', world_bounds)
             self.communication_mode=communication_mode or saved.get('communication_mode','direct')
             self.checkpoint_safety_filter=saved.get('safety_filter','legacy')
+            if chain_ground_range is None:
+                self.chain_ground_range = saved.get('chain_ground_range')
+            if chain_link_range is None:
+                self.chain_link_range = saved.get('chain_link_range')
             self.model.eval()
         if not 0 <= self.exploration_candidates <= 20:
             raise ValueError('exploration_candidates must be between 0 and 20')
@@ -104,6 +113,13 @@ class CandidateNavigator(DroneNavigator):
         self.fallbacks = 0
         if self.communication_mode not in ('direct','chain'):
             raise ValueError('communication_mode must be direct or chain')
+        self.chain_ground_range = float(self.comm_range if self.chain_ground_range is None
+                                        else self.chain_ground_range)
+        self.chain_link_range = float(self.comm_range if self.chain_link_range is None
+                                      else self.chain_link_range)
+        if not (0 < self.chain_ground_range <= self.comm_range and
+                self.min_separation < self.chain_link_range <= self.comm_range):
+            raise ValueError('Chain ranges must lie within (0 or min_separation, comm_range]')
         self.chain=ChainState(self.drone_id,self._fleet_total if self.communication_mode=='chain' else 1,
                               fleet_ids=fleet_ids)
         self.recoveries=0
@@ -159,8 +175,11 @@ class CandidateNavigator(DroneNavigator):
                 xmin,ymin,xmax,ymax = self.world_bounds
                 safe &= xmin <= q[0] <= xmax and ymin <= q[1] <= ymax
             # A convex ball contains the entire local linear motion segment.
+            # Beyond the slack range only motions that shorten the link remain.
             if self.communication_mode=='direct' or self.chain.rank==0:
-                safe &= max(np.linalg.norm(p-np.r_[start,0.]),np.linalg.norm(end-np.r_[start,0.]))<=self.comm_range
+                now, after = np.linalg.norm(p-np.r_[start,0.]), np.linalg.norm(end-np.r_[start,0.])
+                safe &= max(now, after) <= self.comm_range and (
+                    after <= self.chain_ground_range or after < now)
             closest = self.comm_range
             for did, info in neighbors.items():
                 other = np.asarray(info['position'], float)
@@ -174,7 +193,9 @@ class CandidateNavigator(DroneNavigator):
                 closest = min(closest, sep)
                 safe &= sep >= self.min_separation
                 if self.communication_mode=='chain' and did in self.chain.required:
-                    safe &= max(np.linalg.norm(r),np.linalg.norm(end-other_end))<=self.comm_range
+                    now, after = np.linalg.norm(r), np.linalg.norm(end-other_end)
+                    safe &= max(now, after) <= self.comm_range and (
+                        after <= self.chain_link_range or after < now)
             # Hold always remains selectable as the documented fallback.
             mask[a] = bool(safe or a == 0)
             local = np.linalg.norm(node_positions-q[:2],axis=1) < self.fov_radius

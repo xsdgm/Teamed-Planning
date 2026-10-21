@@ -112,6 +112,29 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(nav.chain.required,('drone_1',))
         self.assertGreater(mask.sum(),1)
 
+    def test_chain_slack_masks_lengthening_links_beyond_the_slack_range(self):
+        def link_ends(position,link_range):
+            nav=CandidateNavigator('drone_2',total_drones=3,communication_mode='chain',algorithm='greedy',
+                comm_range=95.,exploration_candidates=8,chain_link_range=link_range)
+            obs=dict(time=1.,nearby_drones={'drone_1':dict(position=[400.,500.,15.])},
+                ground_robots={'g':dict(position=[330.,500.,0.],target=[700.,500.],direct=False,source_time=1.)})
+            _,mask,candidates,_=nav.encode(position,obs)
+            p=np.asarray(position,float)
+            ends=[p+(np.asarray(w)-p)*min(1.,6./max(np.linalg.norm(np.asarray(w)-p),1e-6)) for w in candidates]
+            return [float(np.linalg.norm(e-[400.,500.,15.])) for e in ends],mask
+        lengths,mask=link_ends((488.,500.,15.),95.)
+        self.assertTrue(any(m and d>90. for d,m in zip(lengths[1:],mask[1:])))
+        lengths,mask=link_ends((488.,500.,15.),90.)
+        self.assertTrue(all(d<=90. for d,m in zip(lengths[1:],mask[1:]) if m))
+        self.assertGreater(mask.sum(),1)
+        # Already beyond the slack range: only motions that shorten the link remain.
+        lengths,mask=link_ends((492.,500.,15.),90.)
+        self.assertTrue(all(d<92. for d,m in zip(lengths[1:],mask[1:]) if m))
+        self.assertGreater(mask.sum(),1)
+        with self.assertRaises(ValueError):
+            CandidateNavigator('drone_2',total_drones=3,communication_mode='chain',comm_range=95.,
+                               chain_link_range=96.)
+
     def test_chain_never_rewires_around_missing_role(self):
         state=ChainState('drone_2',3)
         state.update(dict(time=0,nearby_drones={'drone_0':dict(position=[10,30,15])}))

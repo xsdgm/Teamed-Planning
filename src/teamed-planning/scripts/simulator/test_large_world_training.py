@@ -12,7 +12,7 @@ import torch
 from drone.mappo import ActorCritic,GLOBAL_FEATURES
 from simulator.large_world_scenarios import generate_training_scene
 from simulator.mappo_experiment import SafetyTermination
-from simulator.train_mappo import fixed_schedule,run_episode,validate_config
+from simulator.train_mappo import fixed_schedule,run_episode,score_validation,validate_config
 
 
 class LargeTrainingTests(unittest.TestCase):
@@ -73,6 +73,43 @@ class LargeTrainingTests(unittest.TestCase):
         self.assertEqual(summary['safety_terminated'],1.)
         self.assertEqual(summary['episode_steps'],1)
         self.assertEqual(summary['rollout_steps'],2)
+
+    def test_arrival_ends_the_episode_with_the_terminal_reward(self):
+        from simulator.mappo_experiment import Experiment
+        config=validate_config(dict(world_size=1000.,steps=5,initial_validation=False,
+            termination='arrival',arrival_reward=100.,subgoal_radius=200.))
+        original=Experiment.step;rewards=[]
+        def arrive_second(env,frame):
+            result=original(env,frame)
+            rewards.append(result[1])
+            env.goal_reached=frame==1
+            return result
+        torch.manual_seed(1)
+        with patch('simulator.train_mappo.generate_training_scene',return_value=self.scene()), \
+             patch.object(Experiment,'step',arrive_second):
+            rollout,summary=run_episode(ActorCritic(),config,50001,fixed_schedule(config,0),True)
+        self.assertEqual(len(rollout),2)
+        self.assertAlmostEqual(rollout[-1][4],rewards[-1]+100.)
+        self.assertAlmostEqual(summary['reward'],sum(rewards)+100.)
+        self.assertEqual((summary['goal_reached'],summary['budget_exhausted']),(1.,0.))
+        self.assertEqual(summary['subgoals_selected'],1.)
+
+    def test_arrival_validation_ranks_vehicle_arrival(self):
+        common=dict(seed=1,sample=0,graph_task_path_ratio=1.,reward=0.,ground_collisions=0.,
+                    collisions=0.,chain_link_violation=0.,safety_terminated=0.,graph_first_connection_step=10.)
+        arrived=[dict(common,goal_reached=1.,graph_task_connected=0.,episode_steps=900)]
+        connected=[dict(common,goal_reached=0.,graph_task_connected=1.,episode_steps=4000)]
+        arrival=validate_config(dict(world_size=1000.,termination='arrival'))
+        graph=validate_config(dict(world_size=1000.))
+        self.assertGreater(score_validation(arrived,arrival)['score'],score_validation(connected,arrival)['score'])
+        self.assertLess(score_validation(arrived,graph)['score'],score_validation(connected,graph)['score'])
+
+    def test_subgoal_and_arrival_options_are_validated(self):
+        for bad in (dict(world_size=1000.,termination='goal'),dict(termination='arrival'),
+                    dict(world_size=1000.,subgoal_radius=10.),dict(world_size=1000.,arrival_reward=-1.),
+                    dict(world_size=1000.,init_checkpoint=3)):
+            with self.assertRaises(ValueError):
+                validate_config(bad)
 
     def test_large_config_rejects_tasks_that_cannot_fit(self):
         with self.assertRaises(ValueError):

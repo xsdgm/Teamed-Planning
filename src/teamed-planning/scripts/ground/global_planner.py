@@ -731,6 +731,7 @@ class GlobalPlanner:
         """
         waypoints = [start_pos]
         current_pos = start_pos
+        entered = False
         
         for i, comp in enumerate(component_sequence):
             # Find entry point (nearest node to current position)
@@ -739,7 +740,7 @@ class GlobalPlanner:
             
             for node_id in sorted(comp['nodes'], key=str):
                 node_pos = graph.get_node_position(node_id)
-                if (i == 0 and self.entry_validator is not None
+                if (not entered and self.entry_validator is not None
                         and not self.entry_validator(node_pos)):
                     continue
                 dist = np.sqrt((node_pos[0] - current_pos[0])**2 + 
@@ -749,6 +750,10 @@ class GlobalPlanner:
                     entry_node_id = node_id
             
             if entry_node_id is None:
+                if not entered:
+                    # Skip leading components the robot cannot reach from
+                    # here; the route starts at the first reachable one.
+                    continue
                 return None
 
             # Find exit point (nearest node to next position)
@@ -775,8 +780,9 @@ class GlobalPlanner:
             entry_pos = graph.get_node_position(entry_node_id)
             if min_entry_dist > 1.0:  # Only add if > 1m away
                 waypoints.append(entry_pos)
-                if i == 0:
+                if not entered:
                     self.start_connection_idx = len(waypoints) - 1
+            entered = True
             
             # Path through component (if entry != exit)
             if entry_node_id != exit_node_id:
@@ -801,6 +807,8 @@ class GlobalPlanner:
             # Update current position to exit
             current_pos = graph.get_node_position(exit_node_id)
         
+        if not entered:
+            return None
         # Add final goal
         last = waypoints[-1] if waypoints else start_pos
         if np.hypot(goal_pos[0] - last[0], goal_pos[1] - last[1]) > 0.5:

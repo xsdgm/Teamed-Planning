@@ -126,9 +126,12 @@ class Experiment:
                  exploration_candidates=5, communication_mode='chain', safety_filter='cbf',
                  spacing_penalty_weight=0., intervention_weight=0., moving_ground=True,
                  reward_mode='cadmm_exploration', ground_speed=1., path_reward_scale=100.,exploration_weight=None,
-                 world_size=120., start=(15.,60.), scene=None, stop_on_ground_arrival=True):
+                 world_size=120., start=(15.,60.), scene=None, stop_on_ground_arrival=True,
+                 subgoal_radius=None, chain_ground_range=None, chain_link_range=None):
         if reward_mode != 'cadmm_exploration':
             raise ValueError('Only the current cadmm_exploration reward is supported')
+        if subgoal_radius is not None and not (subgoal_radius>0 and moving_ground):
+            raise ValueError('subgoal_radius must be positive and requires a moving ground robot')
         self.world_size=float(world_size)
         self.start=np.asarray(start,dtype=float)
         self.stop_on_ground_arrival=bool(stop_on_ground_arrival)
@@ -169,6 +172,7 @@ class Experiment:
                     min_separation=15., fov_radius=12., max_speed=6., model=model,
                     exploration_candidates=exploration_candidates, world_bounds=bounds,
                     communication_mode=communication_mode,
+                    chain_ground_range=chain_ground_range, chain_link_range=chain_link_range,
                     algorithm=algorithm, deterministic=not stochastic)
             else:
                 c.navigator.fov_radius = 12.  # Same actual 24m sensor footprint.
@@ -177,10 +181,13 @@ class Experiment:
             c.graph_builder.world_bounds = bounds
             c.ground_max_speed=ground_speed if moving_ground else 0.
         self.obs = self.env.reset()
+        # With relay subgoals the vehicle drives to, and broadcasts, the subgoal.
         self.ground_controller=GroundRobotController('ground_0',resolution=2.,
             perception_range=8.,max_linear_vel=ground_speed,max_angular_vel=1.,
-            fusion_interval=5.,safety_distance=1.5)
+            fusion_interval=5.,safety_distance=1.5,subgoal_radius=subgoal_radius,
+            world_bounds=bounds)
         self.ground_controller.set_goal(tuple(self.goal))
+        self.subgoals=self.ground_controller.subgoals
         self.goal_reached=False
         self.ground_action=self._ground_action() if moving_ground else None
         self.initial_goal_distance=float(np.linalg.norm(self.goal-self.start))
@@ -300,10 +307,13 @@ class Experiment:
         ground_position=np.asarray(self.obs[self.ground]['self']['position']).copy()
         # Evaluate both maps at the SAME new position: vehicle progress alone
         # must not masquerade as an observation-induced CADMM improvement.
-        cost_before=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],self.goal)
+        # With relay subgoals both use the subgoal current before this update,
+        # so a subgoal switch never appears as a map improvement.
+        target=self.goal if self.subgoals is None else self.subgoals.target.copy()
+        cost_before=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],target)
         if self.moving_ground:
             self.ground_action=self._ground_action(ground_received)
-        cost_after=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],self.goal)
+        cost_after=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],target)
         # Delivery must be present in the actual ground receiver's neighbor list.
         delivered = ground_received
         delivered_ids = {n['id'] for n in delivered}
@@ -427,6 +437,8 @@ class Experiment:
             if selected.any():
                 ece += float(selected.mean()*abs(certainty[selected].mean()-correct[selected].mean()))
         total['calibration_error'] = ece
+        if self.subgoals is not None:
+            total.update(self.subgoals.stats())
         return total
 
 

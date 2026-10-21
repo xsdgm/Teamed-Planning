@@ -11,7 +11,30 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 from simulator.train_mappo import DEFAULTS,fixed_schedule,train,validate_config
-from drone.mappo import CandidateNavigator,GLOBAL_FEATURES
+from drone.mappo import ActorCritic,CandidateNavigator,GLOBAL_FEATURES
+
+
+def fake_episode(model,config,seed,schedule,stochastic):
+    rollout=[]
+    for t in range(config['steps']):
+        x=torch.randn(3,21,12)
+        mask=torch.ones(3,21,dtype=torch.bool)
+        with torch.no_grad():
+            dist=model.distribution(x,mask)
+            a=dist.sample()
+            lp=dist.log_prob(a)
+        rollout.append((x.numpy(),mask.numpy(),a.numpy(),lp.numpy(),float((seed+t)%3),
+                       np.full(GLOBAL_FEATURES,t/config['steps'],np.float32)))
+    return rollout,dict(confidence_area=1.,task_gain=1.,spacing_violation=0.,
+        collisions=0.,out_of_bounds=0.,task_share=.5,reward_beta=schedule['beta'],
+        reward_eta=schedule['eta'],reward=1.,ground_collisions=0.,chain_link_violation=0.,
+        graph_task_connected=1.,graph_first_connection_step=1.,graph_task_path_ratio=1.)
+
+
+def artifact_directory():
+    root=Path(__file__).resolve().parents[4]/'artifacts'/'training-tests'
+    root.mkdir(parents=True,exist_ok=True)
+    return root
 
 
 class TrainingTests(unittest.TestCase):
@@ -49,23 +72,7 @@ class TrainingTests(unittest.TestCase):
     def test_resume_matches_uninterrupted_optimizer_and_rng(self):
         config=validate_config(dict(episodes=3,steps=3,validation_interval=3,
             snapshot_interval=3,validation_seeds=[20000],test_seeds=[30000]))
-        def fake_episode(model,config,seed,schedule,stochastic):
-            rollout=[]
-            for t in range(config['steps']):
-                x=torch.randn(3,21,12)
-                mask=torch.ones(3,21,dtype=torch.bool)
-                with torch.no_grad():
-                    dist=model.distribution(x,mask)
-                    a=dist.sample()
-                    lp=dist.log_prob(a)
-                rollout.append((x.numpy(),mask.numpy(),a.numpy(),lp.numpy(),float((seed+t)%3),
-                               np.full(GLOBAL_FEATURES,t/config['steps'],np.float32)))
-            return rollout,dict(confidence_area=1.,task_gain=1.,spacing_violation=0.,
-                collisions=0.,out_of_bounds=0.,task_share=.5,reward_beta=schedule['beta'],
-                reward_eta=schedule['eta'],reward=1.,ground_collisions=0.,chain_link_violation=0.,
-                graph_task_connected=1.,graph_first_connection_step=1.,graph_task_path_ratio=1.)
-        artifact_root=Path(__file__).resolve().parents[4]/'artifacts'/'training-tests'
-        artifact_root.mkdir(parents=True,exist_ok=True)
+        artifact_root=artifact_directory()
         with tempfile.TemporaryDirectory(dir=artifact_root) as directory:
             root=Path(directory)
             self.assertTrue(root.resolve().is_relative_to(artifact_root.resolve()))
@@ -88,6 +95,31 @@ class TrainingTests(unittest.TestCase):
                 self.assertTrue(torch.equal(full['model'][key],resumed['model'][key]),key)
             self.assertEqual(full['scene_rng'],resumed['scene_rng'])
             self.assertTrue(torch.equal(full['torch_rng'],resumed['torch_rng']))
+
+    def test_init_checkpoint_supplies_network_weights_only(self):
+        source=ActorCritic(GLOBAL_FEATURES)
+        with torch.no_grad():
+            for parameter in source.parameters():
+                parameter.fill_(.01)
+        with tempfile.TemporaryDirectory(dir=artifact_directory()) as directory:
+            root=Path(directory)
+            torch.save(dict(model=source.state_dict(),critic_global_features=GLOBAL_FEATURES,
+                            feature_version=1,training_episodes=77),root/'init.pt')
+            torch.save(dict(model=ActorCritic().state_dict(),feature_version=1),root/'old.pt')
+            # A negligible learning rate keeps the single update from moving the weights.
+            config=validate_config(dict(episodes=1,steps=3,validation_interval=1,snapshot_interval=1,
+                validation_seeds=[20000],test_seeds=[30000],learning_rate=1e-12,
+                init_checkpoint=str(root/'init.pt')))
+            with patch('simulator.train_mappo.run_episode',side_effect=fake_episode),contextlib.redirect_stdout(io.StringIO()):
+                train(config,root/'run')
+                with self.assertRaises(ValueError):
+                    train(dict(config,init_checkpoint=str(root/'old.pt')),root/'old')
+            latest=torch.load(root/'run'/'latest.pt',weights_only=True)
+            for key,value in source.state_dict().items():
+                torch.testing.assert_close(latest['model'][key],value,atol=1e-6,rtol=0.)
+            self.assertEqual(latest['training_episodes'],1)
+            provenance=json.loads((root/'run'/'provenance.json').read_text())
+            self.assertEqual(provenance['init_checkpoint']['training_episodes'],77)
 
 
 if __name__=='__main__':

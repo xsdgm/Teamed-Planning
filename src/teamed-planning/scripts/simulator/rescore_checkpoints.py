@@ -29,8 +29,10 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[2]/'config'/'algorithm'/'mappo
 def _episode(path, seed, sample_seed, stochastic, protocol):
     saved=torch.load(path,map_location='cpu',weights_only=True)
     config=dict(validate_config(saved['config']),**protocol)
-    model=ActorCritic.from_state_dict(saved['model']);model.eval()
+    # Seed before building, as in-training validation (_rollout_task) does:
+    # initialization consumes the stream, so rescores reproduce those runs.
     torch.manual_seed(sample_seed)
+    model=ActorCritic.from_state_dict(saved['model']);model.eval()
     _,summary=run_episode(model,config,seed,fixed_schedule(config,config['episodes']-1),stochastic)
     return summary
 
@@ -43,12 +45,26 @@ def main():
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG,help='source of the validation protocol')
     parser.add_argument('--samples',type=int,help='override validation_samples')
     parser.add_argument('--policy',choices=('sample','argmax'),default='sample')
+    parser.add_argument('--seeds',type=int,nargs='+',help='override validation_seeds')
+    parser.add_argument('--subgoal-radius',type=float,
+                        help='override: relay subgoals at most this far ahead (ground/subgoal_manager.py); 0 disables')
+    parser.add_argument('--termination',choices=('map','arrival'),
+                        help="override: end at a stable task graph or at vehicle arrival")
+    parser.add_argument('--chain-ranges',type=float,nargs=2,metavar=('GROUND','LINK'),
+                        help='override: candidate chain slack ranges in m (95 95 disables)')
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--output',type=Path)
     args=parser.parse_args()
     reference=validate_config(json.loads(args.config.read_text(encoding='utf-8-sig')))
-    protocol=dict(validation_seeds=reference['validation_seeds'],
+    protocol=dict(validation_seeds=args.seeds or reference['validation_seeds'],
                   validation_samples=args.samples or reference['validation_samples'])
+    # Without overrides each checkpoint keeps its own training protocol.
+    if args.subgoal_radius is not None:
+        protocol['subgoal_radius']=args.subgoal_radius or None
+    if args.termination:
+        protocol['termination']=args.termination
+    if args.chain_ranges:
+        protocol['chain_ground_range'],protocol['chain_link_range']=args.chain_ranges
     if args.policy=='argmax':
         protocol['validation_samples']=1  # Deterministic runs do not differ.
     names=args.checkpoints or [p.name for p in sorted(args.run.glob('episode_*.pt'))
@@ -72,10 +88,12 @@ def main():
             row=dict(checkpoint=name,episode=episode,policy=args.policy,protocol=protocol,
                      finished_utc=datetime.now(timezone.utc).isoformat(),
                      connected_rate=report['means']['graph_task_connected'],
-                     safety_rate=report['means']['safety_terminated'],**report)
+                     safety_rate=report['means']['safety_terminated'],
+                     arrival_rate=report['means']['goal_reached'],**report)
             stream.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n')
             print(f"{name} episode={episode} score={report['score']:.1f} "
-                  f"connected={row['connected_rate']:.2f} safety={row['safety_rate']:.2f}",flush=True)
+                  f"connected={row['connected_rate']:.2f} safety={row['safety_rate']:.2f} "
+                  f"arrival={row['arrival_rate']:.2f}",flush=True)
     print(f'{len(jobs)} episodes in {time.monotonic()-tic:.0f}s -> {output}')
 
 
