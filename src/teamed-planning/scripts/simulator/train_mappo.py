@@ -54,7 +54,7 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     discount=.99,gae_lambda=.95,initial_validation=True,
     # Relay subgoals (ground/subgoal_manager.py), episode end at vehicle arrival
     # instead of a stable task graph, its terminal reward, and initial weights.
-    subgoal_radius=None,termination='map',arrival_reward=0.,init_checkpoint=None,
+    subgoal_radius=None,subgoal_arrival=25.,termination='map',arrival_reward=0.,init_checkpoint=None,
     # Candidate chain slack below the 95 m link limit (None: no slack).
     chain_ground_range=None,chain_link_range=None,
     environment_version=ENVIRONMENT_VERSION)
@@ -127,6 +127,9 @@ def validate_config(config):
     if config['subgoal_radius'] is not None and (isinstance(config['subgoal_radius'],bool) or
             not isinstance(config['subgoal_radius'],(int,float)) or not 25<config['subgoal_radius']<1000):
         raise ValueError('subgoal_radius must be null or a distance between 25 and 1000 m')
+    if (isinstance(config['subgoal_arrival'],bool) or not isinstance(config['subgoal_arrival'],(int,float))
+            or not 0<config['subgoal_arrival']<(config['subgoal_radius'] or np.inf)):
+        raise ValueError('subgoal_arrival must be positive and below subgoal_radius')
     if config['termination'] not in ('map','arrival'):
         raise ValueError('termination must be map or arrival')
     if config['termination']=='arrival' and config['world_size']!=1000.:
@@ -177,7 +180,8 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             spacing_penalty_weight=config['spacing_penalty_weight'],intervention_weight=config['intervention_weight'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
-            subgoal_radius=config['subgoal_radius'],chain_ground_range=config['chain_ground_range'],
+            subgoal_radius=config['subgoal_radius'],subgoal_arrival=config['subgoal_arrival'],
+            chain_ground_range=config['chain_ground_range'],
             chain_link_range=config['chain_link_range'],**options)
         rollout=[];reason='budget';stable=0;max_link=0.
         try:

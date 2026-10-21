@@ -48,6 +48,7 @@ class GroundROSNode:
         # Relay subgoals for goals beyond the drone chain (0 disables);
         # world_bounds = [min_x, min_y, max_x, max_y] of the surveyed area.
         self.subgoal_radius = float(rospy.get_param('~subgoal_radius', 0.0)) or None
+        self.subgoal_arrival = float(rospy.get_param('~subgoal_arrival', 25.0))
         bounds = rospy.get_param('~world_bounds', None)
         self.world_bounds = tuple(float(v) for v in bounds) if bounds else None
 
@@ -77,6 +78,7 @@ class GroundROSNode:
             max_linear_vel=self.max_linear_vel,
             max_angular_vel=self.max_angular_vel,
             subgoal_radius=self.subgoal_radius,
+            subgoal_arrival=self.subgoal_arrival,
             world_bounds=self.world_bounds,
         )
 

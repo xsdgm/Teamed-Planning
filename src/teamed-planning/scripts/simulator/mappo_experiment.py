@@ -127,7 +127,7 @@ class Experiment:
                  spacing_penalty_weight=0., intervention_weight=0., moving_ground=True,
                  reward_mode='cadmm_exploration', ground_speed=1., path_reward_scale=100.,exploration_weight=None,
                  world_size=120., start=(15.,60.), scene=None, stop_on_ground_arrival=True,
-                 subgoal_radius=None, chain_ground_range=None, chain_link_range=None):
+                 subgoal_radius=None, subgoal_arrival=25., chain_ground_range=None, chain_link_range=None):
         if reward_mode != 'cadmm_exploration':
             raise ValueError('Only the current cadmm_exploration reward is supported')
         if subgoal_radius is not None and not (subgoal_radius>0 and moving_ground):
@@ -185,6 +185,7 @@ class Experiment:
         self.ground_controller=GroundRobotController('ground_0',resolution=2.,
             perception_range=8.,max_linear_vel=ground_speed,max_angular_vel=1.,
             fusion_interval=5.,safety_distance=1.5,subgoal_radius=subgoal_radius,
+            subgoal_arrival=subgoal_arrival,
             world_bounds=bounds)
         self.ground_controller.set_goal(tuple(self.goal))
         self.subgoals=self.ground_controller.subgoals

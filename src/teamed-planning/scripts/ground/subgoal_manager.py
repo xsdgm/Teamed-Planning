@@ -23,7 +23,7 @@ class SubgoalManager:
     Penalties decay instead of banning, so a wrongly failed area can be
     retried later.
     """
-    def __init__(self, goal, radius=200., arrival=25., snap=20., snap_distance=50.,
+    def __init__(self, goal, radius=200., arrival=25., snap=20., snap_distance=None,
                  stall=180., max_wait=600., retreat=40., corridor=30., penalty_radius=60.,
                  penalty_decay=600., directions=24, world_bounds=None, margin=10.):
         if not 0 < arrival < radius or snap < 0 or not 0 < stall <= max_wait or retreat <= 0:
@@ -31,6 +31,8 @@ class SubgoalManager:
         self.goal=np.asarray(goal,float)[:2]
         self.radius,self.arrival,self.retreat=float(radius),float(arrival),float(retreat)
         self.stall,self.max_wait=float(stall),float(max_wait)
+        # Snap a little before the arrival radius (default: arrival + 25 m).
+        snap_distance=self.arrival+25. if snap_distance is None else snap_distance
         self.snap,self.snap_distance,self.corridor=float(snap),float(snap_distance),float(corridor)
         self.penalty_radius,self.penalty_decay=float(penalty_radius),float(penalty_decay)
         self.directions=int(directions)

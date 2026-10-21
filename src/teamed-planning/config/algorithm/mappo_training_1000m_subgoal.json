@@ -60,7 +60,8 @@
   "subgoal_radius": 200.0,
   "termination": "arrival",
   "arrival_reward": 100.0,
-  "init_checkpoint": "artifacts/mappo-1000m-v3-fix-20261021/init_v2_best_ep500.pt",
+  "init_checkpoint": "artifacts/mappo-1000m-stage1-20261021/best.pt",
   "chain_ground_range": 85.0,
-  "chain_link_range": 90.0
+  "chain_link_range": 90.0,
+  "subgoal_arrival": 60.0
 }

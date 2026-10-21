@@ -29,6 +29,19 @@ class SubgoalManagerTests(unittest.TestCase):
         np.testing.assert_allclose(target,(300.,500.),atol=1e-6)
         self.assertFalse(manager.final)
 
+    def test_larger_arrival_radius_switches_earlier_but_not_at_the_final_goal(self):
+        manager=SubgoalManager((800.,500.),radius=200.,arrival=60.)
+        manager.update((100.,500.),None,0.)
+        target,changed=manager.update((245.,500.),None,145.)
+        self.assertTrue(changed)
+        self.assertEqual(manager.arrivals,1)
+        np.testing.assert_allclose(target,(445.,500.),atol=1e-6)
+        final=SubgoalManager((250.,500.),radius=200.,arrival=60.)
+        final.update((100.,500.),None,0.)
+        _,changed=final.update((200.,500.),None,100.)
+        self.assertFalse(changed)
+        self.assertEqual(final.arrivals,0)
+
     def test_goal_within_radius_is_the_final_target(self):
         manager=SubgoalManager((250.,500.),radius=200.)
         target,_=manager.update((100.,500.),None,0.)

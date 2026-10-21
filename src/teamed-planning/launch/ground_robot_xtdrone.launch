@@ -13,6 +13,7 @@
   <arg name="num_drones" default="3"/>
   <!-- Relay subgoals for goals beyond the drone chain (m); 0 disables -->
   <arg name="subgoal_radius" default="0.0"/>
+  <arg name="subgoal_arrival" default="25.0"/>
 
   <rosparam file="$(find teamed_planning)/config/algorithm/ground.yaml"
             command="load" ns="$(arg robot_id)"/>
@@ -34,6 +35,7 @@
     <param name="robot_id"   value="$(arg robot_id)"/>
     <param name="num_drones" value="$(arg num_drones)"/>
     <param name="subgoal_radius" value="$(arg subgoal_radius)"/>
+    <param name="subgoal_arrival" value="$(arg subgoal_arrival)"/>
     <!-- Optional surveyed bounds for subgoals: <rosparam param="world_bounds">[0, 0, 1000, 1000]</rosparam> -->
     <!-- spawn_offset = 0: diff_drive odom is already in world/map frame -->
     <param name="spawn_x"    value="0.0"/>

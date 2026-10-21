@@ -49,6 +49,7 @@ class GroundRobotController:
                  fusion_interval: float = 20.0,
                  edge_confidence_threshold: float = 0.0,
                  subgoal_radius: Optional[float] = None,
+                 subgoal_arrival: float = 25.0,
                  world_bounds: Optional[Tuple[float, float, float, float]] = None):
         """
         Initialize ground robot controller.
@@ -67,6 +68,8 @@ class GroundRobotController:
             fusion_interval: Minimum time between fusing graphs from same drone (default 20.0s)
             subgoal_radius: With a goal beyond the drone chain, drive to and
                 broadcast relay subgoals at most this far ahead (None: off)
+            subgoal_arrival: An intermediate subgoal counts as reached within
+                this distance (meters); the final goal still requires arrival
             world_bounds: Surveyed (min_x, min_y, max_x, max_y) for subgoals
         """
         self.robot_id = robot_id
@@ -123,6 +126,7 @@ class GroundRobotController:
         # Relay subgoals: goal_position (driven to and broadcast) is the
         # current subgoal; final_goal is the mission goal.
         self.subgoal_radius = subgoal_radius
+        self.subgoal_arrival = subgoal_arrival
         self.world_bounds = world_bounds
         self.subgoals = None
         self.final_goal = None
@@ -156,7 +160,8 @@ class GroundRobotController:
         self.final_goal = goal_pos
         if self.subgoal_radius:
             # The first get_action selects the first subgoal.
-            self.subgoals = SubgoalManager(goal_pos, self.subgoal_radius, world_bounds=self.world_bounds)
+            self.subgoals = SubgoalManager(goal_pos, self.subgoal_radius, arrival=self.subgoal_arrival,
+                                           world_bounds=self.world_bounds)
             self.global_planner.clear_path()
             self.goal_position = None
             print(f"[{self.robot_id}] Goal set to {goal_pos} (relay subgoals, radius {self.subgoal_radius:g}m)")
