@@ -140,8 +140,8 @@ class Experiment:
                  world_size=120., start=(15.,60.), scene=None, stop_on_ground_arrival=True,
                  subgoal_radius=None, subgoal_arrival=25., chain_ground_range=None, chain_link_range=None,
                  route_reward_weight=10., time_penalty=0., ground_stationary=False):
-        if reward_mode not in ('cadmm_exploration','route_graph'):
-            raise ValueError('reward_mode must be cadmm_exploration or route_graph')
+        if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route'):
+            raise ValueError('reward_mode must be cadmm_exploration, route_graph or vehicle_route')
         if ground_stationary and (subgoal_radius is not None or not moving_ground):
             raise ValueError('A stationary vehicle keeps its map receiver and has no subgoals')
         if subgoal_radius is not None and not (subgoal_radius>0 and moving_ground):
@@ -373,6 +373,11 @@ class Experiment:
         metrics.update(route_terms)
         if self.reward_mode=='route_graph':
             reward=route
+        elif self.reward_mode=='vehicle_route':
+            # v2's route reference (vehicle position, same position before and
+            # after this update; no exploration term) with route_graph scaling
+            # and time penalty.
+            reward=self.route_reward_weight*terms['cadmm_gain']/self._initial_route_cost-self.time_penalty
         metrics.update(reward_beta=1.,reward_eta=self.exploration_weight)
         # Penalties use local received safety telemetry, not evaluator truth.
         spacing_cost=self.spacing_penalty_weight*max(observed_violations,default=0.)

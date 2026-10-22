@@ -117,6 +117,18 @@ class LargeTrainingTests(unittest.TestCase):
         total=sum(route_graph_reward(a,b,4000.,10.,.01)[0] for a,b in zip(costs,costs[1:]))
         self.assertAlmostEqual(total,10.*(1-750./4000.)-.04)
 
+    def test_vehicle_route_reward_scales_v2_gain_and_charges_time(self):
+        from simulator.mappo_experiment import Experiment
+        torch.set_num_threads(1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            env=Experiment(20000,ActorCritic(),reward_mode='vehicle_route',route_reward_weight=10.,time_penalty=.01,
+                           exploration_weight=.6)
+            for frame in range(8):
+                _,reward,metrics=env.step(frame)
+                self.assertAlmostEqual(reward,10.*metrics['cadmm_gain']/env._initial_route_cost-.01)
+            self.assertGreater(env.summary()['exploration_area'],0.)  # explored, but not rewarded
+            env.env.close()
+
     def test_stationary_vehicle_map_episode_gets_route_scaled_success(self):
         from simulator.mappo_experiment import Experiment
         config=validate_config(dict(world_size=1000.,steps=6,initial_validation=False,reward_mode='route_graph',

@@ -60,6 +60,8 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     # route_graph reward: start->goal route cost decrease on the delivered graph
     # (vehicle-independent), a per-step time penalty, and on a stable connected
     # task graph a terminal reward scaled by reference/graph route length.
+    # vehicle_route: the same, but the route cost is measured from the vehicle
+    # as in cadmm_exploration (v2), without exploration reward.
     route_reward_weight=10.,time_penalty=0.,map_success_reward=0.,ground_stationary=False,
     environment_version=ENVIRONMENT_VERSION)
 
@@ -107,7 +109,7 @@ def validate_config(config):
         raise ValueError('Current training requires chain communication and CBF safety')
     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
         raise ValueError('Safety penalty weights must be nonnegative')
-    if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph'):
+    if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route'):
         raise ValueError('Invalid ground mode or reward mode')
     if config['reward_mode']=='cadmm_exploration' and not config['moving_ground']:
         raise ValueError('CADMM reward requires the ground map receiver/controller')
