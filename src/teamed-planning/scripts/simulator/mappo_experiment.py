@@ -42,6 +42,17 @@ def cadmm_exploration_reward(cost_before, cost_after, old_seen, seen, weight,
         exploration_area=area,exploration_reward=weight*area/area_scale)
 
 
+def route_graph_reward(cost_before, cost_after, initial_cost, weight, time_penalty):
+    """Vehicle-independent map reward: start->goal route cost decrease.
+
+    The fixed-start route cost on the delivered graph is a potential: the
+    episode sum telescopes to weight*(1 - final/initial cost), so a longer
+    episode earns no more; the time penalty rewards building it sooner.
+    """
+    route=weight*float(cost_before-cost_after)/max(float(initial_cost),1e-8)
+    return route-time_penalty, dict(route_reward=route, route_cost=float(cost_after))
+
+
 class DeliveredEvidence:
     """Reward-only evidence ledger. Each source/frame is accepted at most once.
 
@@ -127,9 +138,12 @@ class Experiment:
                  spacing_penalty_weight=0., intervention_weight=0., moving_ground=True,
                  reward_mode='cadmm_exploration', ground_speed=1., path_reward_scale=100.,exploration_weight=None,
                  world_size=120., start=(15.,60.), scene=None, stop_on_ground_arrival=True,
-                 subgoal_radius=None, subgoal_arrival=25., chain_ground_range=None, chain_link_range=None):
-        if reward_mode != 'cadmm_exploration':
-            raise ValueError('Only the current cadmm_exploration reward is supported')
+                 subgoal_radius=None, subgoal_arrival=25., chain_ground_range=None, chain_link_range=None,
+                 route_reward_weight=10., time_penalty=0., ground_stationary=False):
+        if reward_mode not in ('cadmm_exploration','route_graph'):
+            raise ValueError('reward_mode must be cadmm_exploration or route_graph')
+        if ground_stationary and (subgoal_radius is not None or not moving_ground):
+            raise ValueError('A stationary vehicle keeps its map receiver and has no subgoals')
         if subgoal_radius is not None and not (subgoal_radius>0 and moving_ground):
             raise ValueError('subgoal_radius must be positive and requires a moving ground robot')
         self.world_size=float(world_size)
@@ -143,6 +157,10 @@ class Experiment:
         self.intervention_weight=intervention_weight
         self.moving_ground=moving_ground
         self.reward_mode=reward_mode
+        self.route_reward_weight=float(route_reward_weight)
+        self.time_penalty=float(time_penalty)
+        # The vehicle still receives and fuses maps but does not drive.
+        self.ground_stationary=bool(ground_stationary)
         self.path_reward_scale=path_reward_scale
         self.exploration_weight=float(exploration_weight) if exploration_weight is not None else .6
         self.audit_buffers=[{} for _ in range(3)]
@@ -179,7 +197,7 @@ class Experiment:
             self.controllers.append(c)
             # Surveyed world bounds are part of the simulator task contract.
             c.graph_builder.world_bounds = bounds
-            c.ground_max_speed=ground_speed if moving_ground else 0.
+            c.ground_max_speed=ground_speed if moving_ground and not ground_stationary else 0.
         self.obs = self.env.reset()
         # With relay subgoals the vehicle drives to, and broadcasts, the subgoal.
         self.ground_controller=GroundRobotController('ground_0',resolution=2.,
@@ -192,6 +210,7 @@ class Experiment:
         self.goal_reached=False
         self.ground_action=self._ground_action() if moving_ground else None
         self.initial_goal_distance=float(np.linalg.norm(self.goal-self.start))
+        self._initial_route_cost=self._route_cost=navigation_cost(None,self.start,self.goal)
         self.ledger = DeliveredEvidence(world=self.world_size)
         self.algorithm = algorithm
         self.trace = []
@@ -218,6 +237,8 @@ class Experiment:
         received['full_state']={'time':self.env.time}
         received.pop('obstacles',None)
         action=self.ground_controller.get_action(received)
+        if self.ground_stationary:
+            action['motion']=(0.,0.)
         if np.linalg.norm(np.asarray(received['self']['position'])[:2]-self.goal)<=2.:
             action['motion']=(0.,0.)
             self.goal_reached=True
@@ -344,6 +365,14 @@ class Experiment:
         reward,terms=cadmm_exploration_reward(cost_before,cost_after,old_seen,
             self.ledger.seen,self.exploration_weight,self.path_reward_scale)
         metrics.update(terms)
+        # Fixed start->goal route on the delivered graph, independent of the vehicle.
+        route_before=self._route_cost
+        self._route_cost=navigation_cost(self.ground_controller.unified_graph,self.start,self.goal)
+        route,route_terms=route_graph_reward(route_before,self._route_cost,self._initial_route_cost,
+            self.route_reward_weight,self.time_penalty)
+        metrics.update(route_terms)
+        if self.reward_mode=='route_graph':
+            reward=route
         metrics.update(reward_beta=1.,reward_eta=self.exploration_weight)
         # Penalties use local received safety telemetry, not evaluator truth.
         spacing_cost=self.spacing_penalty_weight*max(observed_violations,default=0.)
@@ -396,7 +425,8 @@ class Experiment:
         total = {k: float(sum(t[k] for t in self.trace)) for k in
                  ('task_gain','outside_gain','outside_new','positive_task_gain',
                   'positive_outside_gain','distance','reward','spacing_violation','collisions','out_of_bounds',
-                  'cadmm_gain','cadmm_reward','exploration_area','exploration_reward','ground_distance','ground_collisions')}
+                  'cadmm_gain','cadmm_reward','exploration_area','exploration_reward','ground_distance','ground_collisions',
+                  'route_reward')}
         total['goal_reached']=float(self.goal_reached)
         total['ground_goal_distance']=self.trace[-1]['ground_goal_distance']
         total['ground_progress']=self.initial_goal_distance-total['ground_goal_distance']

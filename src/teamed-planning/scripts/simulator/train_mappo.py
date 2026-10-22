@@ -57,6 +57,10 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     subgoal_radius=None,subgoal_arrival=25.,termination='map',arrival_reward=0.,init_checkpoint=None,
     # Candidate chain slack below the 95 m link limit (None: no slack).
     chain_ground_range=None,chain_link_range=None,
+    # route_graph reward: start->goal route cost decrease on the delivered graph
+    # (vehicle-independent), a per-step time penalty, and on a stable connected
+    # task graph a terminal reward scaled by reference/graph route length.
+    route_reward_weight=10.,time_penalty=0.,map_success_reward=0.,ground_stationary=False,
     environment_version=ENVIRONMENT_VERSION)
 
 
@@ -103,7 +107,7 @@ def validate_config(config):
         raise ValueError('Current training requires chain communication and CBF safety')
     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
         raise ValueError('Safety penalty weights must be nonnegative')
-    if config['moving_ground'] is not True or config['reward_mode'] != 'cadmm_exploration':
+    if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph'):
         raise ValueError('Invalid ground mode or reward mode')
     if config['reward_mode']=='cadmm_exploration' and not config['moving_ground']:
         raise ValueError('CADMM reward requires the ground map receiver/controller')
@@ -138,6 +142,15 @@ def validate_config(config):
         raise ValueError('arrival_reward must be finite and nonnegative')
     if config['init_checkpoint'] is not None and not isinstance(config['init_checkpoint'],str):
         raise ValueError('init_checkpoint must be null or a checkpoint path')
+    for name in ('route_reward_weight','time_penalty','map_success_reward'):
+        if not np.isfinite(config[name]) or config[name]<0:
+            raise ValueError(f'{name} must be finite and nonnegative')
+    if type(config['ground_stationary']) is not bool:
+        raise ValueError('ground_stationary must be bool')
+    if config['ground_stationary'] and (config['termination']!='map' or config['subgoal_radius'] is not None):
+        raise ValueError('A stationary vehicle requires map termination and no subgoals')
+    if config['map_success_reward'] and config['world_size']!=1000.:
+        raise ValueError('map_success_reward uses the 1000m reference route')
     for name,low in (('chain_ground_range',0.),('chain_link_range',15.)):
         value=config[name]
         if value is not None and (isinstance(value,bool) or not isinstance(value,(int,float))
@@ -181,6 +194,8 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
             subgoal_radius=config['subgoal_radius'],subgoal_arrival=config['subgoal_arrival'],
+            route_reward_weight=config['route_reward_weight'],time_penalty=config['time_penalty'],
+            ground_stationary=config['ground_stationary'],
             chain_ground_range=config['chain_ground_range'],
             chain_link_range=config['chain_link_range'],**options)
         rollout=[];reason='budget';stable=0;max_link=0.
@@ -211,7 +226,15 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                         graph_connected=bool(stable),ground_remaining_m=env.trace[-1]['ground_goal_distance'],
                         delivered_area_m2=float(env.ledger.seen.sum()*4),max_link_distance_m=max_link))
                 if large and termination=='map' and stable>=config['map_stability_steps']:
-                    reason='map_connected';break
+                    reason='map_connected'
+                    if config['map_success_reward']:
+                        # Reference route: training reward only, never an input.
+                        length=env.trace[-1]['graph_task_path_length']
+                        efficiency=min(1.,scene['reference_length']/max(length,1e-8))
+                        bonus=config['map_success_reward']*efficiency
+                        *head,reward,state=rollout[-1]
+                        rollout[-1]=(*head,reward+bonus,state)
+                    break
                 if (env.done if not large else termination=='arrival' and env.goal_reached):
                     reason='vehicle_arrival'
                     if large and config['arrival_reward']:
@@ -222,6 +245,11 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             summary=env.summary()
             if reason=='cbf_infeasible':summary['reward']-=config['safety_failure_penalty']
             if reason=='vehicle_arrival' and large:summary['reward']+=config['arrival_reward']
+            if reason=='map_connected' and config['map_success_reward']:summary['reward']+=bonus
+            if large:
+                length=summary['graph_task_path_length']
+                summary['route_efficiency']=(min(1.,scene['reference_length']/length)
+                                             if summary['graph_task_connected'] and length>0 else 0.)
             summary.update(safety_terminated=float(reason=='cbf_infeasible'),
                 map_completed=float(reason=='map_connected'),budget_exhausted=float(reason=='budget'),
                 user_stopped=float(reason=='user_stop'),episode_budget_steps=budget,

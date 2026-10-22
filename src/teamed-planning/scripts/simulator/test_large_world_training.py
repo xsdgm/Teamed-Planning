@@ -111,6 +111,37 @@ class LargeTrainingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_config(bad)
 
+    def test_route_reward_telescopes_and_charges_time(self):
+        from simulator.mappo_experiment import route_graph_reward
+        costs=[4000.,3000.,3500.,800.,750.]
+        total=sum(route_graph_reward(a,b,4000.,10.,.01)[0] for a,b in zip(costs,costs[1:]))
+        self.assertAlmostEqual(total,10.*(1-750./4000.)-.04)
+
+    def test_stationary_vehicle_map_episode_gets_route_scaled_success(self):
+        from simulator.mappo_experiment import Experiment
+        config=validate_config(dict(world_size=1000.,steps=6,initial_validation=False,reward_mode='route_graph',
+            ground_stationary=True,map_success_reward=10.,time_penalty=.01,map_stability_steps=2))
+        original=Experiment.step;rewards=[]
+        def connected_from_second(env,frame):
+            result=original(env,frame)
+            rewards.append(result[1])
+            env.trace[-1].update(graph_task_connected=float(frame>=1),graph_task_path_length=1000.)
+            return result
+        torch.manual_seed(1)
+        with patch('simulator.train_mappo.generate_training_scene',return_value=self.scene()), \
+             patch.object(Experiment,'step',connected_from_second):
+            rollout,summary=run_episode(ActorCritic(),config,50001,fixed_schedule(config,0),True)
+        self.assertEqual(len(rollout),3)
+        self.assertEqual(summary['map_completed'],1.)
+        self.assertLess(summary['ground_distance'],1e-6)
+        self.assertAlmostEqual(rollout[-1][4],rewards[-1]+10.*750./1000.)
+        self.assertAlmostEqual(summary['route_efficiency'],.75)
+        for bad in (dict(world_size=1000.,ground_stationary=True,termination='arrival'),
+                    dict(world_size=1000.,ground_stationary=True,subgoal_radius=200.),
+                    dict(world_size=1000.,reward_mode='other'),dict(world_size=1000.,time_penalty=-1.)):
+            with self.assertRaises(ValueError):
+                validate_config(bad)
+
     def test_large_config_rejects_tasks_that_cannot_fit(self):
         with self.assertRaises(ValueError):
             validate_config(dict(world_size=1000.,task_distances=[950]))
