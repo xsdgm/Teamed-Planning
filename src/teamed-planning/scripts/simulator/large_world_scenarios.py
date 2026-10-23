@@ -8,6 +8,12 @@ from scipy.spatial import cKDTree
 ORIGINAL_ACTIVE_DENSITY=22./(80.*80.)
 
 
+def distance_key(distance):
+    """Keep historical integer keys without truncating continuous distances."""
+    value = float(distance)
+    return str(int(value)) if value.is_integer() else repr(value)
+
+
 def raster_free(circles,world=1000.,clearance=3.5,resolution=1.):
     n=int(world/resolution)
     coordinates=(np.arange(n)+.5)*resolution
@@ -52,7 +58,7 @@ def generate_large_scene(seed,distances=(100.,250.,500.,750.),world=1000.,densit
     rng=np.random.default_rng(seed)
     start=np.array([30.,world/2.]) if start is None else np.asarray(start,dtype=float)
     direction=np.array([np.cos(heading),np.sin(heading)])
-    goals={str(int(d)):start+d*direction for d in distances}
+    goals={distance_key(d):start+d*direction for d in distances}
     if any((p<=3.5).any() or (p>=world-3.5).any() for p in goals.values()):raise ValueError('Goal outside world')
     for attempt in range(1,129):
         circles=[]
@@ -66,9 +72,15 @@ def generate_large_scene(seed,distances=(100.,250.,500.,750.),world=1000.,densit
         if not components[sy,sx] or any(components[int(g[1]),int(g[0])]!=components[sy,sx] for g in goals.values()):continue
         reference=raster_free(circles,world,1.5+math.sqrt(.5))
         routes={d:reference_route(reference,start,g) for d,g in goals.items()}
+        # Check actual continuous segments, including endpoint-to-grid access.
+        # A disconnected or geometrically invalid sample is never dispatched.
+        if not all(reference_geometry_clear(circles, start, goals[d], route['points'], world)
+                   for d, route in routes.items()):
+            continue
         return dict(seed=seed,start=start.tolist(),world=world,goals={d:g.tolist() for d,g in goals.items()},
             circles=[(p.tolist(),r) for p,r in circles],attempts=attempt,density=density,
-            reference_resolution_m=1.,reference_clearance_m=1.5+math.sqrt(.5),references=routes)
+            reference_resolution_m=1.,reference_clearance_m=1.5+math.sqrt(.5),references=routes,
+            reference_geometry_validated=True,reference_geometric_clearance_m=1.5)
     raise RuntimeError(f'No feasible large scene for seed {seed}')
 
 
@@ -90,10 +102,34 @@ class CircleGeometry:
         return bool((np.linalg.norm(relative-t[:,None]*delta,axis=1)>self.radii[ids]+self.clearance).all())
 
 
-def generate_training_scene(seed, distances=(350,550,750), world=1000.):
+def reference_geometry_clear(circles, start, goal, points, world=1000.):
+    geometry = CircleGeometry(circles, world=world, clearance=1.5)
+    path = [start, *points, goal]
+    return all(geometry.clear(a, b) for a, b in zip(path, path[1:]))
+
+
+def reference_polyline_length(start, goal, points):
+    """Include real endpoint access, absent from the historical grid-only cost."""
+    path=np.asarray([start,*points,goal],dtype=float)
+    return float(np.linalg.norm(np.diff(path,axis=0),axis=1).sum())
+
+
+def generate_training_scene(seed, distances=(350,550,750), world=1000., distance_range=None,
+                            distance_sampling='linear'):
     """Random task pose, same obstacle density; truth used only at setup."""
     rng=np.random.default_rng(seed ^ 0x5A17)
-    distance=int(rng.choice(distances))
+    if distance_sampling not in ('linear', 'annulus_area'):
+        raise ValueError('Unknown task distance sampling mode')
+    if distance_range is None:
+        distance=int(rng.choice(distances))
+    else:
+        if (len(distance_range) != 2 or any(isinstance(d, (bool, np.bool_)) or
+                not isinstance(d, (int, float)) or not np.isfinite(d) for d in distance_range)
+                or not 0 < distance_range[0] < distance_range[1] < world-70):
+            raise ValueError('Invalid continuous task distance range')
+        # Uniform area within the annulus about the initial vehicle position.
+        distance=(float(np.sqrt(rng.uniform(distance_range[0]**2, distance_range[1]**2)))
+                  if distance_sampling == 'annulus_area' else float(rng.uniform(*distance_range)))
     heading=float(rng.uniform(-np.pi,np.pi))
     delta=distance*np.array([np.cos(heading),np.sin(heading)])
     margin=35.  # Includes initial drone formation and its complete sensor view.
@@ -103,6 +139,10 @@ def generate_training_scene(seed, distances=(350,550,750), world=1000.):
     start=rng.uniform(lower,upper)
     scene=generate_large_scene(seed,(distance,),world,start=start,heading=heading)
     scene['distance']=distance
-    scene['goal']=scene['goals'][str(distance)]
-    scene['reference_length']=scene['references'][str(distance)]['length']
+    scene['goal']=scene['goals'][distance_key(distance)]
+    scene['reference_length']=scene['references'][distance_key(distance)]['length']
+    # Preserve the historical budget/RNG contract; the full physical length is
+    # a separate training-reward baseline, never an Actor/Critic observation.
+    scene['reference_polyline_length']=reference_polyline_length(scene['start'],scene['goal'],
+        scene['references'][distance_key(distance)]['points'])
     return scene

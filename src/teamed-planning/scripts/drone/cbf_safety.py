@@ -10,7 +10,28 @@ This is a simulation velocity filter, not a certification of PX4 dynamics or
 delayed/missing measurements. Infeasibility and stale links are explicit.
 """
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import linprog, minimize
+
+
+def feasibility_margin(matrix, bound, speed, sides=32):
+    """Largest common slack (m/s) of the velocity constraints within the speed
+    limit: max t subject to a_i.v/|a_i| + t <= b_i/|a_i|. Negative exactly when
+    no admissible velocity exists; None without constraints. The disk is the
+    inscribed regular polygon, so the margin is slightly conservative."""
+    norms=np.linalg.norm(matrix,axis=1)
+    live=norms>1e-12
+    if np.any(~live & (bound<0)):
+        return float('-inf')
+    if not live.any():
+        return None
+    angles=np.arange(sides)*2*np.pi/sides
+    polygon=np.c_[np.cos(angles),np.sin(angles)]
+    rows=np.r_[np.c_[matrix[live]/norms[live,None],np.ones(live.sum())],np.c_[polygon,np.zeros(sides)]]
+    limits=np.r_[bound[live]/norms[live],np.full(sides,speed*np.cos(np.pi/sides))]
+    result=linprog([0.,0.,-1.],A_ub=rows,b_ub=limits,bounds=[(None,None)]*3,method='highs')
+    if result.status!=0:
+        raise RuntimeError(f'CBF margin program failed: {result.message}')
+    return float(-result.fun)
 
 
 class CBFSafetyFilter:
@@ -42,6 +63,7 @@ class CBFSafetyFilter:
         speed=self.max_speed
         desired*=min(1.,speed/max(np.linalg.norm(desired),1e-12))
         rows=[];limits=[]
+        link_distances={};link_outward_speeds={}
         minimum=np.inf
         required=set(required_links)
         def upper(normal,limit):
@@ -62,6 +84,8 @@ class CBFSafetyFilter:
                 lower=min(self.gain,1.)*(clearance-horizontal)/(2*dt)
                 upper(-normal,-lower)
             if did in required:
+                link_distances[did]=distance
+                link_outward_speeds[did]=float(np.dot(r[:2],desired)/max(distance,1e-12))
                 radius=self.comm_range-self.margin
                 h=radius**2-distance**2
                 # Sum the two endpoint inequalities to obtain a joint CBF.
@@ -69,6 +93,9 @@ class CBFSafetyFilter:
                 upper(r[:2],bound)
         if '__ground__' in required and ground is not None:
             r=p-np.r_[np.asarray(ground,float)[:2],0.]
+            distance=float(np.linalg.norm(r))
+            link_distances['__ground__']=distance
+            link_outward_speeds['__ground__']=float(np.dot(r[:2],desired)/max(distance,1e-12))
             h=(self.comm_range-self.margin)**2-float(np.dot(r,r))
             # Ground need not cooperate with the aerial CBF. Protect against
             # every ground displacement within its configured speed bound.
@@ -95,7 +122,11 @@ class CBFSafetyFilter:
             result=solved.x if feasible(solved.x) else np.zeros(2)
         infeasible=not feasible(result)
         return np.r_[result,0.],dict(infeasible=infeasible,
+            feasibility_margin=feasibility_margin(matrix,bound,speed),
             intervention=float(np.linalg.norm(result-desired)),
             min_received_separation=None if not np.isfinite(minimum) else minimum,
             max_constraint_residual=float(max(0.,np.max(matrix@result-bound))) if len(bound) else 0.,
-            received_peers=len(peers),missing_links=sorted(required-set(peers)-({'__ground__'} if ground is not None else set())))
+            received_peers=len(peers),
+            required_link_distances_m=link_distances,
+            required_link_nominal_outward_m_s=link_outward_speeds,
+            missing_links=sorted(required-set(peers)-({'__ground__'} if ground is not None else set())))

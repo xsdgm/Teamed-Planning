@@ -350,7 +350,7 @@ class DroneController:
             When mode='real':
                 {'target_waypoint': (x,y,z) or None, 'broadcast': dict}
         """
-        if mode=='real' and self.safety_filter=='cbf':
+        if mode=='real' and (self.safety_filter=='cbf' or getattr(self.navigator, 'uses_velocity', False)):
             raise NotImplementedError('CBF velocity filter is currently validated for fixed-height 2D simulation only')
         current_time = simulator_obs.get('full_state', {}).get('time', time.time())
         
@@ -411,12 +411,19 @@ class DroneController:
             'fusion_stats': self.last_fusion_stats,
             'time': current_time
         }
+        if getattr(self.navigator, 'uses_velocity', False):
+            nav_obs['occupancy_map'] = parsed_obs['occupancy_map']
+            nav_obs['sensor_valid'] = simulator_obs.get('sensor_valid', True)
         self._chain_state.update(nav_obs)
         
         # Step 6: Compute navigation target
         with self.timer.measure("navigation"):
             if current_time - self._last_dispatch_time >= self.dispatch_interval:
-                target = self.navigator.compute_next_target(self.position, nav_obs)
+                if getattr(self.navigator, 'uses_velocity', False):
+                    self.navigator.compute_velocity(self.position, nav_obs)
+                    target = None
+                else:
+                    target = self.navigator.compute_next_target(self.position, nav_obs)
                 self._last_dispatch_time = current_time
             else:
                 target = self.navigator._current_target
@@ -446,7 +453,10 @@ class DroneController:
                 'broadcast': broadcast_data
             }
         else:
-            velocity = self._compute_velocity_to_target(target) if target else (0.0, 0.0, 0.0)
+            if getattr(self.navigator, 'uses_velocity', False):
+                velocity = tuple(self.navigator.nominal_velocity)
+            else:
+                velocity = self._compute_velocity_to_target(target) if target else (0.0, 0.0, 0.0)
             # Arrival clipping must happen BEFORE the safety filter. Never
             # zero a CBF recovery command just because the selected action holds.
             dt=simulator_obs.get('time_step')

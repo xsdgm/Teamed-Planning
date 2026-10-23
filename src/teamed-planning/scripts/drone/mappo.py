@@ -45,6 +45,9 @@ class ActorCritic(nn.Module):
     @classmethod
     def from_state_dict(cls, state):
         """Rebuild with the critic width stored in the weights (older checkpoints: 0)."""
+        if 'velocity_actor.0.weight' in state:
+            from drone.velocity_mappo import VelocityActorCritic
+            return VelocityActorCritic.from_state_dict(state)
         model = cls(global_features=state['critic.0.weight'].shape[1]-FEATURES)
         model.load_state_dict(state)
         return model

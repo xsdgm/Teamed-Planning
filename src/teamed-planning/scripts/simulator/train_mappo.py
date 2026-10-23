@@ -6,10 +6,9 @@ like training (validation_samples runs per seed, fixed sample seeds), so it
 scores the policy being trained; checkpoints record policy_mode='sample'.
 Test seeds are never used for checkpoint selection.
 
-With --workers N>1, episodes are collected asynchronously by N processes, each
-using a frozen copy of the latest policy; every finished episode still receives
-one PPO update in the main process. Validation scenes run as separate tasks on
-the weights saved at their episode.
+Synchronous mode collects a complete batch under one frozen policy, then makes
+one guarded PPO update. Legacy asynchronous mode remains available for old
+experiments. Validation always uses the weights saved at its episode.
 """
 import argparse
 import contextlib
@@ -32,8 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 from drone.mappo import ActorCritic, GLOBAL_FEATURES
+from drone.velocity_mappo import VelocityActorCritic
 from simulator.mappo_experiment import Experiment, SafetyTermination, update
+from simulator.ppo_batch import update_batch
 from simulator.large_world_scenarios import generate_training_scene
+from simulator.env import BOUNDARY_ROUNDOFF_TOLERANCE_M
 from simulator.scenarios import ENVIRONMENT_VERSION
 
 
@@ -49,7 +51,7 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     spacing_penalty_weight=0.,intervention_weight=0.,moving_ground=True,
     reward_mode='cadmm_exploration',ground_speed=1.,path_reward_scale=100.,
     reward_schedule='fixed',exploration_weight=.6,entropy_coefficient=.01,
-    world_size=120.,task_distances=[350,550,750],budget_multiplier=3.,budget_extra=240,
+    world_size=120.,task_distances=[350,550,750],task_distance_range=None,budget_multiplier=3.,budget_extra=240,
     min_episode_steps=600,map_stability_steps=30,safety_failure_penalty=10.,
     discount=.99,gae_lambda=.95,initial_validation=True,
     # Relay subgoals (ground/subgoal_manager.py), episode end at vehicle arrival
@@ -57,13 +59,40 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     subgoal_radius=None,subgoal_arrival=25.,termination='map',arrival_reward=0.,init_checkpoint=None,
     # Candidate chain slack below the 95 m link limit (None: no slack).
     chain_ground_range=None,chain_link_range=None,
+    # velocity_mapping: fixed start->goal map improvement and local chain risk;
+    # stable map completion is independent of vehicle arrival/collisions.
     # route_graph reward: start->goal route cost decrease on the delivered graph
     # (vehicle-independent), a per-step time penalty, and on a stable connected
     # task graph a terminal reward scaled by reference/graph route length.
     # vehicle_route: the same, but the route cost is measured from the vehicle
     # as in cadmm_exploration (v2), without exploration reward.
     route_reward_weight=10.,time_penalty=0.,map_success_reward=0.,ground_stationary=False,
-    environment_version=ENVIRONMENT_VERSION)
+    action_mode='candidate',fleet_sizes=[3],environment_version=ENVIRONMENT_VERSION,
+    max_task_distance=350.,distance_sampling='linear',init_optimizer=False,
+    chain_soft_ratio=.85,chain_risk_weight=0.,chain_outward_weight=0.,chain_missing_weight=0.,
+    path_quality_weight=0.,map_quality_reward=0.,
+    # velocity_mapping: the start->goal map term stops once route quality pays.
+    mapping_reward_until_connected=False,
+    # velocity_mapping: penalty on the least CBF feasibility margin (m/s), and an
+    # improvement phase after the first stable map (+100 then); it ends at
+    # map_target_quality or after map_improvement_steps without a better route
+    # (0: legacy end at the stable map).
+    cbf_margin_weight=0.,cbf_margin_scale=8.,map_improvement_steps=0,map_target_quality=1.,
+    rollout_mode='asynchronous',ppo_target_kl=.01,ppo_max_kl=.02,ppo_max_backtracks=4,
+    # Synchronous velocity critic trained apart from the KL-guarded actor step
+    # (0: legacy shared loss), optionally on PopArt-normalized returns.
+    critic_epochs=0,critic_minibatch_size=512,value_normalization=False)
+
+OPTIMIZER_CONFIG_FIELDS={'rollout_mode','ppo_target_kl','ppo_max_kl','ppo_max_backtracks',
+                         'critic_epochs','critic_minibatch_size','value_normalization'}
+
+
+def optimizer_config_changes(previous, current, allow_upgrade=False):
+    previous,current=validate_config(previous),validate_config(current)
+    changes={k:dict(before=previous[k],after=current[k]) for k in current if previous[k]!=current[k]}
+    if changes and (not allow_upgrade or not set(changes)<=OPTIMIZER_CONFIG_FIELDS):
+        raise ValueError('Resume configuration differs; only explicit optimizer upgrades are permitted')
+    return changes
 
 
 def fixed_schedule(config, completed):
@@ -79,6 +108,40 @@ def validate_config(config):
     if unknown:
         raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
     config = dict(DEFAULTS, **config)
+    if config['rollout_mode'] not in ('asynchronous','synchronous'):
+        raise ValueError('Unknown rollout mode')
+    if not (np.isfinite(config['ppo_target_kl']) and np.isfinite(config['ppo_max_kl'])
+            and 0<config['ppo_target_kl']<=config['ppo_max_kl']):
+        raise ValueError('Require finite 0 < ppo_target_kl <= ppo_max_kl')
+    if type(config['ppo_max_backtracks']) is not int or not 0<=config['ppo_max_backtracks']<=12:
+        raise ValueError('ppo_max_backtracks must be an integer in [0, 12]')
+    if type(config['critic_epochs']) is not int or not 0<=config['critic_epochs']<=64:
+        raise ValueError('critic_epochs must be an integer in [0, 64]')
+    if type(config['critic_minibatch_size']) is not int or config['critic_minibatch_size']<1:
+        raise ValueError('critic_minibatch_size must be a positive integer')
+    if type(config['value_normalization']) is not bool or (config['value_normalization'] and not config['critic_epochs']):
+        raise ValueError('value_normalization must be bool and requires critic_epochs')
+    if config['critic_epochs'] and (config['rollout_mode']!='synchronous' or config['action_mode']!='velocity'):
+        raise ValueError('Separate critic epochs require synchronous velocity training')
+    if (isinstance(config['max_task_distance'],bool) or
+            not isinstance(config['max_task_distance'],(int,float)) or
+            not np.isfinite(config['max_task_distance']) or config['max_task_distance']<=0):
+        raise ValueError('max_task_distance must be positive and finite')
+    if config['distance_sampling'] not in ('linear','annulus_area'):
+        raise ValueError('Unknown distance_sampling mode')
+    if type(config['init_optimizer']) is not bool or (config['init_optimizer'] and not config['init_checkpoint']):
+        raise ValueError('init_optimizer requires an initial checkpoint')
+    if not config['fleet_sizes'] or any(type(n) is not int or n < 2 for n in config['fleet_sizes']):
+        raise ValueError('fleet_sizes must contain integer sizes >=2')
+    if len(set(config['fleet_sizes'])) != len(config['fleet_sizes']):
+        raise ValueError('fleet_sizes must be unique')
+    if config['action_mode'] not in ('candidate', 'velocity'):
+        raise ValueError('action_mode must be candidate or velocity')
+    if config['action_mode']=='velocity':
+        if config['exploration_candidates'] != 0 or config['subgoal_radius'] is not None:
+            raise ValueError('Velocity v3 uses no candidates or intermediate subgoals')
+        if any(d > config['max_task_distance'] for d in config['task_distances']):
+            raise ValueError('Velocity task distance exceeds max_task_distance')
     if config['environment_version'] != ENVIRONMENT_VERSION:
         raise ValueError('Environment version differs; start a separate corrected training run')
     if config['reward_schedule'] != 'fixed':
@@ -109,7 +172,7 @@ def validate_config(config):
         raise ValueError('Current training requires chain communication and CBF safety')
     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
         raise ValueError('Safety penalty weights must be nonnegative')
-    if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route'):
+    if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
         raise ValueError('Invalid ground mode or reward mode')
     if config['reward_mode']=='cadmm_exploration' and not config['moving_ground']:
         raise ValueError('CADMM reward requires the ground map receiver/controller')
@@ -117,7 +180,19 @@ def validate_config(config):
         raise ValueError('Invalid ground speed or path reward scale')
     if config['world_size'] not in (120.,1000.):
         raise ValueError('Supported training worlds are 120m and 1000m')
-    if config['world_size']==1000. and (not config['task_distances'] or any(
+    distance_range = config['task_distance_range']
+    if distance_range is not None:
+        if (config['world_size'] != 1000. or not isinstance(distance_range, (list, tuple))
+                or len(distance_range) != 2 or config['task_distances']
+                or any(isinstance(d, bool) or not isinstance(d, (int,float)) or
+                       not np.isfinite(d) for d in distance_range)
+                or not 0 < distance_range[0] < distance_range[1] < config['world_size']-70):
+            raise ValueError('Use task_distances=[] and a finite increasing task_distance_range')
+        if config['action_mode']=='velocity' and distance_range[1] > config['max_task_distance']:
+            raise ValueError('Velocity random task distance exceeds max_task_distance')
+    if config['distance_sampling']=='annulus_area' and distance_range is None:
+        raise ValueError('Annular sampling requires task_distance_range')
+    if config['world_size']==1000. and distance_range is None and (not config['task_distances'] or any(
         type(d) is not int or not 0<d<config['world_size']-70 for d in config['task_distances'])):
         raise ValueError('Invalid large-world task distances')
     for name in ('budget_multiplier','discount','gae_lambda','safety_failure_penalty'):
@@ -144,7 +219,8 @@ def validate_config(config):
         raise ValueError('arrival_reward must be finite and nonnegative')
     if config['init_checkpoint'] is not None and not isinstance(config['init_checkpoint'],str):
         raise ValueError('init_checkpoint must be null or a checkpoint path')
-    for name in ('route_reward_weight','time_penalty','map_success_reward'):
+    for name in ('route_reward_weight','time_penalty','map_success_reward',
+                 'path_quality_weight','map_quality_reward'):
         if not np.isfinite(config[name]) or config[name]<0:
             raise ValueError(f'{name} must be finite and nonnegative')
     if type(config['ground_stationary']) is not bool:
@@ -158,7 +234,60 @@ def validate_config(config):
         if value is not None and (isinstance(value,bool) or not isinstance(value,(int,float))
                                   or not low<value<=95.):
             raise ValueError(f'{name} must be null or in ({low:g}, 95] m')
+    if not np.isfinite(config['chain_soft_ratio']) or not 0<config['chain_soft_ratio']<1:
+        raise ValueError('chain_soft_ratio must be strictly between zero and one')
+    for name in ('chain_risk_weight','chain_outward_weight','chain_missing_weight'):
+        if not np.isfinite(config[name]) or config[name]<0:
+            raise ValueError(f'{name} must be finite and nonnegative')
+    if config['reward_mode']=='velocity_mapping':
+        if (config['action_mode']!='velocity' or config['world_size']!=1000.
+                or config['termination']!='map' or config['arrival_reward']!=0.
+                or config['subgoal_radius'] is not None):
+            raise ValueError('Velocity mapping trains only map completion, with no arrival reward or subgoals')
+    elif config['path_quality_weight'] or config['map_quality_reward']:
+        raise ValueError('Physical route quality rewards require velocity_mapping')
+    if type(config['mapping_reward_until_connected']) is not bool:
+        raise ValueError('mapping_reward_until_connected must be bool')
+    if config['mapping_reward_until_connected'] and (config['reward_mode']!='velocity_mapping'
+                                                     or not config['path_quality_weight']):
+        raise ValueError('Map-term hand-over requires the velocity_mapping route quality reward')
+    if (not np.isfinite(config['cbf_margin_weight']) or config['cbf_margin_weight']<0
+            or not np.isfinite(config['cbf_margin_scale']) or config['cbf_margin_scale']<=0):
+        raise ValueError('cbf_margin_weight must be nonnegative and cbf_margin_scale positive')
+    if type(config['map_improvement_steps']) is not int or config['map_improvement_steps']<0:
+        raise ValueError('map_improvement_steps must be a nonnegative integer')
+    if not 0<config['map_target_quality']<=1:
+        raise ValueError('map_target_quality must be in (0, 1]')
+    if (config['cbf_margin_weight'] or config['map_improvement_steps']) and config['reward_mode']!='velocity_mapping':
+        raise ValueError('CBF margin and map improvement are velocity_mapping terms')
+    if config['cbf_margin_weight']:
+        # A permanent worst case of every per-step penalty (intervention <= 4)
+        # must stay cheaper than a CBF failure, so failing is never attractive.
+        worst=config['cbf_margin_weight']+config['time_penalty']+4*config['intervention_weight']
+        if worst>=config['safety_failure_penalty']*(1-config['discount']):
+            raise ValueError('Discounted worst-case step penalties must stay below the CBF failure penalty')
+    if config['map_improvement_steps'] and (not config['path_quality_weight'] or config['map_quality_reward']):
+        # Improvement is paid by route-quality gains; a final quality bonus would pay it twice.
+        raise ValueError('Map improvement requires path_quality_weight and no map_quality_reward')
     return config
+
+
+def optimizer_contract(config):
+    if config['rollout_mode']!='synchronous':
+        return 'legacy_async_v2'
+    # v3: minibatch critic outside the actor's KL guard (optionally PopArt).
+    return 'synchronous_kl_guard_v3' if config['critic_epochs'] else 'synchronous_kl_guard_v2'
+
+
+def reward_contract(config):
+    if config['reward_mode']!='velocity_mapping':
+        return config['reward_mode']
+    if config['cbf_margin_weight'] or config['map_improvement_steps']:
+        # v4: CBF feasibility margin penalty and/or post-map improvement phase.
+        return 'uav_mapping_route_quality_and_communication_v4'
+    # v3: route quality alone pays for the route after its first connection.
+    return ('uav_mapping_route_quality_and_communication_v3' if config['mapping_reward_until_connected']
+            else 'uav_mapping_route_quality_and_communication_v2')
 
 
 def atomic_json(path, value):
@@ -181,9 +310,14 @@ def append_json(path, value):
 
 def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, stop=None):
     large=config['world_size']==1000.
-    scene=generate_training_scene(scene_seed,config['task_distances']) if large else None
+    scene=(generate_training_scene(scene_seed,config['task_distances'],
+                                  distance_range=config['task_distance_range'],
+                                  distance_sampling=config['distance_sampling']) if large else None)
     options={} if scene is None else dict(world_size=1000.,start=scene['start'],
         scene=(scene['goal'],scene['circles'],scene['attempts']),stop_on_ground_arrival=False)
+    reference_length=(scene.get('reference_polyline_length',scene['reference_length']) if scene else None)
+    if config['reward_mode']=='velocity_mapping':
+        options['route_reference_length']=reference_length
     requested_budget=config['steps'] if scene is None else max(config['min_episode_steps'],
         math.ceil(config['budget_multiplier']*scene['reference_length']+config['budget_extra']))
     budget=min(config['steps'],requested_budget)
@@ -198,14 +332,26 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             subgoal_radius=config['subgoal_radius'],subgoal_arrival=config['subgoal_arrival'],
             route_reward_weight=config['route_reward_weight'],time_penalty=config['time_penalty'],
             ground_stationary=config['ground_stationary'],
+            chain_soft_ratio=config['chain_soft_ratio'],chain_risk_weight=config['chain_risk_weight'],
+            chain_outward_weight=config['chain_outward_weight'],chain_missing_weight=config['chain_missing_weight'],
+            path_quality_weight=config['path_quality_weight'],
+            mapping_until_connected=config['mapping_reward_until_connected'],
+            cbf_margin_weight=config['cbf_margin_weight'],cbf_margin_scale=config['cbf_margin_scale'],
             chain_ground_range=config['chain_ground_range'],
-            chain_link_range=config['chain_link_range'],**options)
-        rollout=[];reason='budget';stable=0;max_link=0.
+            chain_link_range=config['chain_link_range'],
+            num_drones=config['fleet_sizes'][scene_seed % len(config['fleet_sizes'])],**options)
+        rollout=[];reason='budget';stable=0;max_link=0.;bonus=0.;quality_bonus=0.
+        improve=large and termination=='map' and config['map_improvement_steps']>0
+        milestone=last_gain=-1  # frames of the first stable map and the latest best-route gain
         try:
             for frame in range(budget):
                 if stop is not None and stop() and rollout:
                     reason='user_stop';break
-                state=env.critic_state(frame,budget,min(stable/config['map_stability_steps'],1.))
+                phase=min(stable/config['map_stability_steps'],1.)
+                if milestone>=0:
+                    # After the map: 1 + plateau clock, so the critic sees the time to termination.
+                    phase=1.+min((frame-1-max(last_gain,milestone))/config['map_improvement_steps'],1.)
+                state=env.critic_state(frame,budget,phase)
                 try:
                     samples,reward,_=env.step(frame)
                 except SafetyTermination as exc:
@@ -221,21 +367,43 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                 ground=np.r_[ground[:2],ground[2] if len(ground)>2 else 0.]
                 max_link=max(max_link,float(np.linalg.norm(points[0]-ground)),
                     float(np.linalg.norm(points[1:]-points[:-1],axis=1).max()))
-                stable=stable+1 if env.trace[-1]['graph_task_connected'] else 0
+                mapped=bool(env.trace[-1]['graph_task_connected'])
+                if config['reward_mode']=='velocity_mapping':
+                    mapped=mapped and bool(env.trace[-1]['chain_links_available']) and env.trace[-1]['chain_max_distance_ratio']<=1.
+                stable=stable+1 if mapped else 0
                 if progress is not None and (frame%25==0 or frame+1==budget):
                     progress(dict(step=frame+1,budget=budget,scene_seed=scene_seed,
                         world_size=config['world_size'],task_distance_m=env.initial_goal_distance,
                         graph_connected=bool(stable),ground_remaining_m=env.trace[-1]['ground_goal_distance'],
                         delivered_area_m2=float(env.ledger.seen.sum()*4),max_link_distance_m=max_link))
-                if large and termination=='map' and stable>=config['map_stability_steps']:
-                    reason='map_connected'
-                    if config['map_success_reward']:
-                        # Reference route: training reward only, never an input.
-                        length=env.trace[-1]['graph_task_path_length']
-                        efficiency=min(1.,scene['reference_length']/max(length,1e-8))
-                        bonus=config['map_success_reward']*efficiency
+                if improve:
+                    if env.trace[-1].get('route_quality_gain',0.)>0:last_gain=frame
+                    if milestone<0 and stable>=config['map_stability_steps']:
+                        # The stable map earns +100 now; the episode goes on to shorten the route.
+                        milestone=frame;bonus=config['map_success_reward']
                         *head,reward,state=rollout[-1]
                         rollout[-1]=(*head,reward+bonus,state)
+                    if milestone>=0:
+                        if (stable>=config['map_stability_steps']
+                                and env.trace[-1]['route_quality']>=config['map_target_quality']):
+                            reason='map_optimal';break
+                        if frame-max(last_gain,milestone)>=config['map_improvement_steps']:
+                            reason='map_plateau';break
+                elif large and termination=='map' and stable>=config['map_stability_steps']:
+                    reason='map_connected'
+                    # Fixed +100 completion and route quality are separate terms.
+                    # Current quality matters even if an earlier route was better.
+                    length=env.trace[-1]['graph_task_path_length']
+                    if config['reward_mode']=='velocity_mapping':
+                        efficiency=min(1.,reference_length/length) if length>0 else 0.
+                        bonus=config['map_success_reward']
+                        quality_bonus=config['map_quality_reward']*efficiency
+                    else:
+                        efficiency=min(1.,scene['reference_length']/max(length,1e-8))
+                        bonus=config['map_success_reward']*efficiency
+                    if bonus or quality_bonus:
+                        *head,reward,state=rollout[-1]
+                        rollout[-1]=(*head,reward+bonus+quality_bonus,state)
                     break
                 if (env.done if not large else termination=='arrival' and env.goal_reached):
                     reason='vehicle_arrival'
@@ -247,13 +415,25 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             summary=env.summary()
             if reason=='cbf_infeasible':summary['reward']-=config['safety_failure_penalty']
             if reason=='vehicle_arrival' and large:summary['reward']+=config['arrival_reward']
-            if reason=='map_connected' and config['map_success_reward']:summary['reward']+=bonus
+            if reason=='map_connected' or milestone>=0:summary['reward']+=bonus+quality_bonus
+            if config['reward_mode']=='velocity_mapping':
+                summary.update(uav_reward=summary['reward'],
+                    map_completion_bonus=bonus,map_quality_bonus=quality_bonus,
+                    route_reference_length_m=reference_length,
+                    safety_failure_cost=config['safety_failure_penalty'] if reason=='cbf_infeasible' else 0.)
             if large:
                 length=summary['graph_task_path_length']
-                summary['route_efficiency']=(min(1.,scene['reference_length']/length)
+                efficiency_reference=reference_length if config['reward_mode']=='velocity_mapping' else scene['reference_length']
+                summary['route_efficiency']=(min(1.,efficiency_reference/length)
                                              if summary['graph_task_connected'] and length>0 else 0.)
+            if improve:
+                summary.update(map_completion_step=float(milestone+1 if milestone>=0 else -1),
+                    map_optimal=float(reason=='map_optimal'),map_plateau=float(reason=='map_plateau'),
+                    improvement_steps=float(len(rollout)-milestone-1 if milestone>=0 else 0))
+            # A CBF failure after the map keeps map_completed; budget_exhausted means no map.
             summary.update(safety_terminated=float(reason=='cbf_infeasible'),
-                map_completed=float(reason=='map_connected'),budget_exhausted=float(reason=='budget'),
+                map_completed=float(reason=='map_connected' or milestone>=0),
+                budget_exhausted=float(reason=='budget' and milestone<0),
                 user_stopped=float(reason=='user_stop'),episode_budget_steps=budget,
                 task_distance_m=env.initial_goal_distance,max_link_distance_m=max_link,
                 reference_length_m=scene['reference_length'] if scene else env.initial_goal_distance,
@@ -288,7 +468,11 @@ def score_validation(records, config):
               for key in records[0] if key not in ('seed','sample')}
     # Select navigation graphs by connectivity, time, efficiency and safety;
     # with arrival termination, by vehicle arrival and its time instead.
-    if config['termination']=='arrival':
+    if config['reward_mode']=='velocity_mapping':
+        success=averages['map_completed']
+        delays=[r.get('map_completion_step',r['episode_steps']) if r['map_completed'] else config['steps']
+                for r in records]
+    elif config['termination']=='arrival':
         success=averages['goal_reached']
         delays=[r['episode_steps'] if r['goal_reached'] else config['steps'] for r in records]
     else:
@@ -297,11 +481,17 @@ def score_validation(records, config):
                 else config['steps'] for r in records]
     score=1000*success-float(np.mean(delays))/config['steps'] \
         -.1*averages['graph_task_path_ratio']+.001*averages['reward'] \
-        -10000*averages['ground_collisions']-10000*averages['collisions'] \
+        -10000*averages['collisions'] \
         -10*averages['chain_link_violation']
+    if config['reward_mode']!='velocity_mapping':
+        score-=10000*averages['ground_collisions']
+    else:
+        score+=20.*averages.get('route_efficiency',0.)
     if config['world_size']==1000.:
         score-=1000*averages['safety_terminated']
-    return dict(score=score,means=averages,scenes=records)
+    return dict(score=score,means=averages,scenes=records,
+        success_metric='map_completed' if config['reward_mode']=='velocity_mapping' else
+                       ('goal_reached' if config['termination']=='arrival' else 'graph_task_connected'))
 
 
 def _worker_init():
@@ -341,14 +531,20 @@ def episode_line(completed, config, summary, loss, ppo):
         f'beta={summary["reward_beta"]:.3f} eta={summary["reward_eta"]:.3f} '
         f'confidence={summary["confidence_area"]:.1f} '
         f'task_share={summary["task_share"]:.3f} '
+        f'map_done={summary.get("map_completed",0.):.0f} '
+        f'route_quality={summary.get("route_efficiency",0.):.3f} '
+        f'route_saved_m={summary.get("route_new_best_saving_m",0.):.1f} '
+        f'chain_cost={sum(summary.get(k,0.) for k in ("chain_risk_cost","chain_outward_cost","chain_missing_cost")):.3f} '
         f'ground_m={summary.get("ground_distance",0.):.1f} '
         f'goal_remaining={summary.get("ground_goal_distance",0.):.1f} '
         f'cadmm_gain={summary.get("cadmm_gain",0.):.1f} loss={loss:.4f} '
         f'kl={ppo["approx_kl"]:.6f} entropy={ppo["entropy"]:.3f} '
-        f'ev={ppo["explained_variance"]:.3f}')
+        f'ev={ppo["explained_variance"]:.3f} ev_pre={ppo.get("explained_variance_pre",0.):.3f}')
 
 
-def train(config, output, resume=False, workers=1, mp_context='spawn'):
+def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_optimizer=False):
+    if upgrade_optimizer and not resume:
+        raise ValueError('Optimizer upgrade requires resume')
     if type(workers) is not int or workers<1:
         raise ValueError('workers must be a positive integer')
     config=validate_config(config)
@@ -362,32 +558,49 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
     torch.set_num_threads(1)
     torch.manual_seed(config['seed'])
     rng=np.random.default_rng(config['seed'])
-    model=ActorCritic(GLOBAL_FEATURES)
+    model=(VelocityActorCritic(GLOBAL_FEATURES) if config['action_mode']=='velocity'
+           else ActorCritic(GLOBAL_FEATURES))
     initial_weights=None
+    initial_optimizer=None
     if config['init_checkpoint'] is not None and not resume:
-        # Fine-tuning: network weights only; optimizer, counters and RNG start fresh.
+        # A new phase resets counters/RNG; curricula may retain Adam state.
         path=Path(config['init_checkpoint']).resolve()
         initial=torch.load(path,map_location='cpu',weights_only=True)
-        if initial.get('critic_global_features',0)!=GLOBAL_FEATURES or initial.get('feature_version')!=1:
+        expected_features = 2 if config['action_mode']=='velocity' else 1
+        if (initial.get('critic_global_features',0)!=GLOBAL_FEATURES or
+                initial.get('feature_version')!=expected_features or
+                initial.get('action_mode','candidate')!=config['action_mode']):
             raise ValueError('init_checkpoint must use the current actor features and global-state critic')
         model.load_state_dict(initial['model'])
+        if config['init_optimizer']:
+            initial_optimizer=initial['optimizer']
         initial_weights=dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-                             training_episodes=initial.get('training_episodes'))
+                             training_episodes=initial.get('training_episodes'),
+                             optimizer_restored=config['init_optimizer'])
     optimizer=torch.optim.Adam(model.parameters(),lr=config['learning_rate'])
+    if initial_optimizer is not None:
+        optimizer.load_state_dict(initial_optimizer)
+        for group in optimizer.param_groups:
+            group['lr']=config['learning_rate']
     start,best_score,best_episode=0,None,None
-    joint_steps=0
+    joint_steps=0;optimizer_batches=0;upgrade_changes={}
     if resume:
         saved=torch.load(latest,map_location='cpu',weights_only=True)
         if saved.get('critic_global_features',0)!=GLOBAL_FEATURES or saved.get('policy_mode')!='sample':
             raise ValueError('Checkpoint predates the global-state critic and sampled validation; '
                              'start a separate training run')
-        if validate_config(saved['config'])!=config:
-            raise ValueError('Resume configuration differs from saved training configuration')
+        upgrade_changes=optimizer_config_changes(saved['config'],config,upgrade_optimizer)
+        if upgrade_changes:
+            backup=output/f"before_optimizer_upgrade_episode_{saved['training_episodes']:05d}.pt"
+            if backup.exists() and backup.read_bytes()!=latest.read_bytes():
+                raise ValueError('Optimizer-upgrade backup already differs')
+            if not backup.exists():shutil.copy2(latest,backup)
         model.load_state_dict(saved['model'])
         optimizer.load_state_dict(saved['optimizer'])
         rng.bit_generator.state=saved['scene_rng']
         torch.set_rng_state(saved['torch_rng'])
         start=saved['training_episodes']
+        optimizer_batches=saved.get('optimizer_batches',start)
         joint_steps=saved.get('joint_steps',start*config['steps'])
         best_score,best_episode=saved['best_score'],saved['best_episode']
         # Remove uncommitted log rows left by interruption between append and save.
@@ -409,29 +622,39 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
                         for path in scripts.rglob('*.py'))
     source_hashes={name:hashlib.sha256((scripts/name).read_bytes()).hexdigest() for name in source_files}
     provenance=dict(python=sys.version,torch=str(torch.__version__),numpy=np.__version__,
-                    workers=workers,source_sha256=source_hashes,init_checkpoint=initial_weights)
+                    workers=workers,source_sha256=source_hashes,init_checkpoint=initial_weights,
+                    optimizer_contract=optimizer_contract(config),
+                    optimizer_upgrade=upgrade_changes,starting_episode=start,
+                    reward_contract=reward_contract(config),
+                    boundary_metric_version=2,boundary_roundoff_tolerance_m=BOUNDARY_ROUNDOFF_TOLERANCE_M)
     atomic_json(output/('resume_provenance.json' if resume else 'provenance.json'),provenance)
-    if not resume:
+    if not resume or upgrade_changes:
+        source_folder=f'sources_optimizer_upgrade_{start:05d}' if upgrade_changes else 'sources'
         for name in source_files:
-            target=output/'sources'/name
+            target=output/source_folder/name
             target.parent.mkdir(parents=True,exist_ok=True)
             shutil.copy2(scripts/name,target)
     started=time.monotonic()
     def status(state, completed, **extra):
         atomic_json(output/'progress.json',dict(status=state,pid=os.getpid(),completed_episodes=completed,
             total_episodes=config['episodes'],joint_steps=joint_steps,
+            optimizer_batches=optimizer_batches,rollout_mode=config['rollout_mode'],
             updated_utc=datetime.now(timezone.utc).isoformat(),
             session_elapsed_seconds=round(time.monotonic()-started,2),
             best_validation_score=best_score,best_episode=best_episode,**extra))
     def checkpoint(completed):
         return dict(model=model.state_dict(),optimizer=optimizer.state_dict(),
             scene_rng=rng.bit_generator.state,torch_rng=torch.get_rng_state(),
-            training_episodes=completed,joint_steps=joint_steps,config=config,feature_version=1,fov_radius=12.,
+            training_episodes=completed,joint_steps=joint_steps,optimizer_batches=optimizer_batches,config=config,
+            optimizer_contract=optimizer_contract(config),
+            feature_version=2 if config['action_mode']=='velocity' else 1,fov_radius=12.,
+            action_mode=config['action_mode'],
             critic_global_features=GLOBAL_FEATURES,policy_mode='sample',
             exploration_candidates=config['exploration_candidates'],world_bounds=[0.,0.,config['world_size'],config['world_size']],
             communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
             environment_version=ENVIRONMENT_VERSION,
+            reward_contract=reward_contract(config),
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
             exploration_weight=fixed_schedule(config,completed)['eta'],
             chain_ground_range=config['chain_ground_range'],chain_link_range=config['chain_link_range'],
@@ -486,7 +709,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
                 schedule=schedule,policy_episodes=completed,started_utc=started_utc)
             return True
         def finish(future):
-            nonlocal completed,joint_steps,best_score,best_episode
+            nonlocal completed,joint_steps,best_score,best_episode,optimizer_batches
             task=tasks.pop(future)
             (running/f'{task["tag"]}.json').unlink(missing_ok=True)
             rollout,summary,elapsed=future.result()
@@ -519,6 +742,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
                 entropy_coef=task['schedule']['entropy'],return_metrics=True,
                 discount=config['discount'],gae_lambda=config['gae_lambda'])
             completed+=1
+            optimizer_batches+=1
             joint_steps+=len(rollout)
             # policy_lag counts updates applied after this episode's weights were copied.
             record=dict(episode=completed,scene_seed=task['scene_seed'],loss=loss,ppo=ppo,
@@ -560,11 +784,138 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
             status('stopped',completed,reason='STOP file found; resume with --resume')
         else:
             status('completed',completed)
+    def synchronous():
+        """Frozen-policy batches; no update while any training rollout is running."""
+        nonlocal completed,joint_steps,best_score,best_episode,optimizer_batches
+        running,pending=output/'running',output/'pending_validation'
+        running.mkdir(exist_ok=True);pending.mkdir(exist_ok=True)
+        for path in running.glob('*.json'):path.unlink()
+        pool=ProcessPoolExecutor(workers,mp_context=multiprocessing.get_context(mp_context),
+                                 initializer=_worker_init)
+
+        def collect(kind,state,jobs,schedule):
+            queue=list(jobs);tasks={};results=[]
+            while queue or tasks:
+                while queue and len(tasks)<workers and not (output/'STOP').exists():
+                    task=queue.pop(0)
+                    future=pool.submit(_rollout_task,kind,state,config,task['scene_seed'],
+                        task['sample_seed'],schedule,str(output),task['tag'])
+                    tasks[future]=task
+                status('running',completed,workers=workers,phase=kind,
+                    in_flight=[dict(task=t['tag'],policy_version=optimizer_batches) for t in tasks.values()])
+                if not tasks:break
+                done,_=wait(list(tasks),timeout=5,return_when=FIRST_COMPLETED)
+                for future in done:
+                    task=tasks.pop(future)
+                    running.joinpath(task['tag']+'.json').unlink(missing_ok=True)
+                    rollout,summary,elapsed=future.result()
+                    results.append((task,rollout,summary,elapsed))
+            return results, bool(queue) or (output/'STOP').exists() or any(r[2].get('user_stopped') for r in results)
+
+        def evaluate(path):
+            nonlocal best_score,best_episode
+            snapshot=torch.load(path,map_location='cpu',weights_only=True)
+            episode=snapshot['training_episodes']
+            jobs=[dict(scene_seed=seed,sample=k,sample_seed=sample_seed,
+                       tag=f'validation_{episode:05d}_{seed}_{k}') for seed,k,sample_seed in validation_runs(config)]
+            results,aborted=collect('validation',snapshot['model'],jobs,fixed_schedule(config,config['episodes']-1))
+            if aborted:return False
+            scenes={(task['scene_seed'],task['sample']):summary for task,_,summary,_ in results}
+            report=score_validation([dict(seed=seed,sample=k,**scenes[seed,k])
+                                    for seed,k,_ in validation_runs(config)],config)
+            if episode==0:atomic_json(output/'initial_validation.json',report)
+            else:
+                append_json(output/'validation.jsonl',dict(episode=episode,**report))
+                if best_score is None or report['score']>best_score:
+                    best_score,best_episode=report['score'],episode
+                    atomic_checkpoint(output/'best.pt',dict(snapshot,best_score=best_score,best_episode=best_episode))
+                    atomic_checkpoint(latest,checkpoint(completed))
+            path.unlink()
+            status('running',completed,workers=workers,last_validation=dict(episode=episode,**report))
+            return True
+
+        try:
+            if not resume and config['initial_validation']:
+                atomic_checkpoint(pending/'episode_00000.pt',checkpoint(0))
+            for path in sorted(pending.glob('episode_*.pt')):
+                if not evaluate(path):
+                    status('stopped',completed,reason='STOP during validation; saved snapshot retained')
+                    return
+            while completed<config['episodes']:
+                if (output/'STOP').exists():
+                    status('stopped',completed,reason='STOP before next synchronous batch')
+                    return
+                # End batches at existing save/validation milestones, including
+                # nonmultiples of workers, so 25/50/... snapshots keep their meaning.
+                count=min(workers,config['episodes']-completed,
+                    config['snapshot_interval']-completed%config['snapshot_interval'],
+                    config['validation_interval']-completed%config['validation_interval'])
+                policy_version=optimizer_batches
+                state={key:value.detach().clone() for key,value in model.state_dict().items()}
+                schedule=fixed_schedule(config,completed)
+                jobs=[]
+                for i in range(count):
+                    scene_seed=int(rng.integers(config['train_seed_start'],config['train_seed_start']+config['train_seed_count']))
+                    sample_seed=int(np.random.SeedSequence([config['seed'],completed+i]).generate_state(1)[0])
+                    jobs.append(dict(scene_seed=scene_seed,sample_seed=sample_seed,
+                        episode=completed+i+1,tag=f'train_{completed+i+1:05d}'))
+                results,aborted=collect('train',state,jobs,schedule)
+                results.sort(key=lambda r:r[0]['episode'])
+                if aborted:
+                    # Administrative cuts are not task terminals. Do not train
+                    # on the whole interrupted batch or preferentially keep its
+                    # short failures; save diagnostics separately from training.
+                    for task,_,summary,elapsed in results:
+                        append_json(output/'discarded_rollouts.jsonl',dict(reason='user_stop_batch',
+                            task=task['tag'],policy_version=policy_version,elapsed_seconds=elapsed,**summary))
+                    atomic_checkpoint(latest,checkpoint(completed))
+                    status('stopped',completed,reason='Interrupted batch discarded; completed weights saved')
+                    return
+                if len(results)!=count:raise RuntimeError('Incomplete synchronous batch')
+                loss,ppo=update_batch(model,optimizer,[r[1] for r in results],epochs=config['ppo_epochs'],
+                    entropy_coef=schedule['entropy'],discount=config['discount'],gae_lambda=config['gae_lambda'],
+                    target_kl=config['ppo_target_kl'],max_kl=config['ppo_max_kl'],
+                    max_backtracks=config['ppo_max_backtracks'],critic_epochs=config['critic_epochs'],
+                    critic_minibatch_size=config['critic_minibatch_size'],
+                    value_normalization=config['value_normalization'],
+                    critic_seed=int(np.random.SeedSequence([config['seed'],optimizer_batches]).generate_state(1)[0]))
+                optimizer_batches+=1
+                for task,rollout,summary,elapsed in results:
+                    completed+=1;joint_steps+=len(rollout)
+                    record=dict(episode=completed,scene_seed=task['scene_seed'],loss=loss,ppo=ppo,
+                        schedule=schedule,elapsed_seconds=round(elapsed,3),dispatch=task['episode'],
+                        policy_lag=0,behavior_policy_version=policy_version,optimizer_batch=optimizer_batches,
+                        batch_size=count,optimizer_contract=optimizer_contract(config),**summary)
+                    append_json(output/'training.jsonl',record)
+                atomic_checkpoint(latest,checkpoint(completed))
+                if completed%config['snapshot_interval']==0:
+                    atomic_checkpoint(output/f'episode_{completed:05d}.pt',checkpoint(completed))
+                status('running',completed,workers=workers,last_training=record)
+                print(episode_line(completed,config,record,loss,ppo)+
+                    f' batch={optimizer_batches} n={count} lag=0 exact_kl={ppo["exact_kl"]:.6f}'
+                    f' epochs={ppo["epochs_completed"]} rejected={ppo["kl_rejected_attempts"]}',flush=True)
+                if completed%config['validation_interval']==0 or completed==config['episodes']:
+                    path=pending/f'episode_{completed:05d}.pt'
+                    atomic_checkpoint(path,checkpoint(completed))
+                    if not evaluate(path):
+                        status('stopped',completed,reason='STOP during validation; saved snapshot retained')
+                        return
+            status('completed',completed)
+        except BaseException:
+            _terminate(pool)
+            pool.shutdown(wait=False,cancel_futures=True)
+            raise
+        finally:
+            pool.shutdown()
+
     status('running',start)
     if not resume:
         atomic_checkpoint(latest,checkpoint(0))
     completed=start
     try:
+        if config['rollout_mode']=='synchronous':
+            synchronous()
+            return
         if workers>1:
             parallel()
             return
@@ -593,6 +944,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn'):
                 entropy_coef=schedule['entropy'],return_metrics=True,
                 discount=config['discount'],gae_lambda=config['gae_lambda'])
             completed=episode+1
+            optimizer_batches+=1
             joint_steps+=len(rollout)
             record=dict(episode=completed,scene_seed=scene_seed,loss=loss,ppo=ppo,schedule=schedule,
                 elapsed_seconds=round(time.monotonic()-tic,3),**summary)
@@ -623,6 +975,8 @@ def main():
     parser.add_argument('--config',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--upgrade-optimizer',action='store_true',
+                        help='explicit resume-only migration of whitelisted PPO settings; keep a backup')
     parser.add_argument('--workers',type=int,default=1,
                         help='parallel rollout processes; 1 keeps the serial trainer')
     args=parser.parse_args()
@@ -630,7 +984,7 @@ def main():
     if args.workers>1:
         # Record the failure status and stop rollout processes on termination.
         signal.signal(signal.SIGTERM,lambda *_:sys.exit(143))
-    train(config,args.output,args.resume,workers=args.workers)
+    train(config,args.output,args.resume,workers=args.workers,upgrade_optimizer=args.upgrade_optimizer)
 
 
 if __name__=='__main__':

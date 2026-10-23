@@ -5,6 +5,53 @@ import networkx as nx
 import numpy as np
 
 
+def route_quality(length, reference_length):
+    """Bounded efficiency against a feasible approximate reference, not an oracle."""
+    return min(1., reference_length/length) if np.isfinite(length) and length>0 else 0.
+
+
+class RouteQualityTracker:
+    """Credit improvements to the best delivered fixed-endpoint physical route.
+
+    A disconnected map has no measurable route length. Its first connection
+    gets quality credit, but never an invented infinity-to-finite meter saving.
+    Keeping the best quality prevents repeated detour/reconnection rewards.
+    """
+    def __init__(self, reference_length):
+        if not np.isfinite(reference_length) or reference_length<=0:
+            raise ValueError('Reference route length must be finite and positive')
+        self.reference_length=float(reference_length)
+        self.previous_length=None
+        self.best_length=None
+        self.first_length=None
+
+    def update(self, metrics):
+        length=float(metrics['graph_task_path_length'])
+        connected=bool(metrics['graph_task_connected']) and np.isfinite(length) and length>0
+        before=self.previous_length
+        comparable=connected and before is not None
+        old_quality=route_quality(self.best_length or 0.,self.reference_length)
+        first=connected and self.first_length is None
+        saving=0.
+        if connected:
+            if first:self.first_length=length
+            if self.best_length is not None:saving=max(self.best_length-length,0.)
+            self.best_length=length if self.best_length is None else min(self.best_length,length)
+        quality=route_quality(length,self.reference_length) if connected else 0.
+        best_quality=route_quality(self.best_length or 0.,self.reference_length)
+        gain=max(best_quality-old_quality,0.)
+        self.previous_length=length if connected else None
+        return dict(route_length_before_m=before or 0.,route_length_after_m=length if connected else 0.,
+            route_lengths_comparable=float(comparable),
+            route_length_delta_m=float(before-length) if comparable else 0.,
+            route_new_best_saving_m=saving,route_best_length_m=self.best_length or 0.,
+            route_first_length_m=self.first_length or 0.,route_quality=quality,
+            route_best_quality=best_quality,route_quality_gain=gain,
+            route_first_quality_gain=gain if first else 0.,
+            route_shortening_quality_gain=0. if first else gain,
+            route_excess_m=max(length-self.reference_length,0.) if connected else 0.)
+
+
 def task_graph_metrics(graph, start, goal, connector_clear, endpoint_radius=10.):
     result = dict(graph_task_connected=0., graph_task_path_length=0.,
         graph_task_path_ratio=0., graph_nodes=0., graph_edges=0., graph_components=0.)

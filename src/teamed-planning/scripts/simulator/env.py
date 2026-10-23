@@ -11,6 +11,10 @@ from .obstacles import CircleObstacle, RectObstacle
 from .utils import check_collision_circle_circle, check_collision_circle_rect
 
 
+# Metres: only numerical boundary noise, not a physical safety margin.
+BOUNDARY_ROUNDOFF_TOLERANCE_M = 1e-8
+
+
 @dataclass
 class EnvConfig:
     """Environment configuration"""
@@ -121,7 +125,8 @@ class MultiRobotEnv:
                 - np.ndarray: motion command only (backward compatible)
                 - dict: {'motion': np.ndarray, 'broadcast': np.ndarray or None}
         """
-        info = {'collisions': [], 'out_of_bounds': [], 'time': self.time}
+        info = {'collisions': [], 'out_of_bounds': [], 'boundary_roundoff': [],
+                'boundary_violations': [], 'time': self.time}
         
         # Process actions
         for robot in self.ground_robots + self.drones:
@@ -404,16 +409,30 @@ class MultiRobotEnv:
                     })
     
     def _check_boundaries(self, info: Dict):
-        """Check if out of bounds"""
+        """Clamp every overshoot, separating numerical noise from violations.
+
+        Both branches retain the historical clamp and velocity reset. Only
+        diagnostics change; roundoff cannot masquerade as a boundary failure.
+        """
         world_w, world_h = self.config.world_size
+        roundoff = info.setdefault('boundary_roundoff', [])
+        violations = info.setdefault('boundary_violations', [])
         for robot in self.ground_robots + self.drones:
+            if not np.isfinite(robot.position).all():
+                raise FloatingPointError(f'Non-finite position for robot {robot.robot_id}')
             # Use x, y from 3D position
             x, y = robot.position[0], robot.position[1]
             if x < 0 or x > world_w or y < 0 or y > world_h:
+                overshoot = float(max(-x, x-world_w, -y, y-world_h))
                 robot.position[0] = np.clip(x, 0, world_w)
                 robot.position[1] = np.clip(y, 0, world_h)
                 robot.velocity = np.zeros(3)  # 3D velocity
-                info['out_of_bounds'].append(robot.robot_id)
+                event = dict(robot_id=robot.robot_id, overshoot_m=overshoot)
+                if overshoot <= BOUNDARY_ROUNDOFF_TOLERANCE_M:
+                    roundoff.append(event)
+                else:
+                    info['out_of_bounds'].append(robot.robot_id)
+                    violations.append(event)
     
     def render(self, mode='human', auto_flip=True):
         """

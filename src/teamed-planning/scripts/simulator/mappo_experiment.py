@@ -2,6 +2,8 @@
 
 Training entry point: simulator/train_mappo.py; validation: validate_mappo_2d.py
 No simulator full_state, velocity or obstacle list enters the learner/reward.
+A scalar feasible reference length may normalize training-only route quality;
+the reference path and map truth never enter Actor/Critic observations.
 """
 import sys
 import time
@@ -13,10 +15,16 @@ import torch
 from drone.drone_main import DroneController
 from drone.drone_navigator import DroneNavigator
 from drone.mappo import ActorCritic, CandidateNavigator
+from drone.velocity_mappo import VelocityNavigator
 from simulator.env import EnvConfig, MultiRobotEnv
 from ground.ground_main import GroundRobotController
 from simulator.scenarios import generate_scene, ENVIRONMENT_VERSION
-from simulator.navigation_metrics import task_graph_metrics
+from simulator.navigation_metrics import task_graph_metrics, RouteQualityTracker
+from simulator.ppo_batch import clip_gradients
+
+
+COMMUNICATION_RANGE_M = 95.
+FLIGHT_HEIGHT_M = 15.
 
 
 def navigation_cost(graph, start, goal):
@@ -51,6 +59,67 @@ def route_graph_reward(cost_before, cost_after, initial_cost, weight, time_penal
     """
     route=weight*float(cost_before-cost_after)/max(float(initial_cost),1e-8)
     return route-time_penalty, dict(route_reward=route, route_cost=float(cost_after))
+
+
+def velocity_task_reward(cost_before, cost_after, old_seen, seen, task_region,
+                         weight=.2, path_scale=100., time_penalty=.01):
+    """V3 dense map improvement plus newly delivered evidence in the task corridor.
+
+    The corridor is fixed from the episode start to the assigned goal. Revisits
+    and delivery outside that corridor earn no exploration reward. Safety and
+    terminal arrival terms are added by the existing shared execution path.
+    """
+    area = float(np.count_nonzero(seen & ~old_seen & task_region)*4.)
+    path = float(cost_before-cost_after)/path_scale
+    exploration = weight*area/400.
+    return path+exploration-time_penalty, dict(task_exploration_area=area,
+        task_exploration_reward=exploration, time_cost=float(time_penalty))
+
+
+def velocity_mapping_reward(cost_before, cost_after, initial_cost, old_seen, seen,
+                            task_region, route_weight=10., exploration_weight=.2,
+                            time_penalty=.01):
+    """Fixed surveyed start->goal map potential; no vehicle performance input."""
+    area=float(np.count_nonzero(seen & ~old_seen & task_region)*4.)
+    mapping=route_weight*float(cost_before-cost_after)/max(initial_cost,1e-8)
+    exploration=exploration_weight*area/400.
+    return mapping+exploration-time_penalty, dict(mapping_reward=mapping,
+        task_exploration_area=area,task_exploration_reward=exploration,
+        time_cost=float(time_penalty))
+
+
+def communication_chain_terms(stats, soft_ratio=.85, comm_range=95., max_speed=6.):
+    """Local received geometry only; average over this agent's required links.
+
+    Distance includes altitude on the vehicle link. Missing neighbors are
+    penalized explicitly, never replaced with simulator fleet positions.
+    Outward speed is this agent's nominal contribution, not a guessed peer
+    velocity. The CBF's physical constraints remain unchanged.
+    """
+    distances=stats.get('required_link_distances_m',{})
+    outward=stats.get('required_link_nominal_outward_m_s',{})
+    missing=stats.get('missing_links',())
+    count=len(distances)+len(missing)
+    risks=[];stretch=[]
+    for did,distance in distances.items():
+        risk=float(np.clip((distance/comm_range-soft_ratio)/(1.-soft_ratio),0.,1.))
+        risks.append(risk**2)
+        stretch.append(risk*float(np.clip(outward.get(did,0.)/max_speed,0.,1.))**2)
+    return dict(chain_risk=sum(risks)/max(count,1),
+        chain_outward_risk=sum(stretch)/max(count,1),
+        chain_missing_fraction=len(missing)/max(count,1),
+        chain_links_available=float(count>0 and not missing),
+        chain_max_distance_ratio=max(distances.values(),default=0.)/comm_range)
+
+
+def cbf_margin_terms(margins, scale=8.):
+    """Joint-action risk from the least CBF feasibility margin (m/s) among
+    agents; any agent's infeasibility ends the episode. A missing required
+    link counts as no margin, since its constraint is unknown to the filter."""
+    least=min((m for m in margins if m is not None),default=np.inf)
+    return dict(cbf_margin_risk=float(np.clip((scale-least)/scale,0.,1.))**2,
+        # Finite for logs: -100 marks a missing link, +100 no constraint at all.
+        cbf_margin_min_m_s=float(np.clip(least,-100.,100.)))
 
 
 class DeliveredEvidence:
@@ -139,9 +208,15 @@ class Experiment:
                  reward_mode='cadmm_exploration', ground_speed=1., path_reward_scale=100.,exploration_weight=None,
                  world_size=120., start=(15.,60.), scene=None, stop_on_ground_arrival=True,
                  subgoal_radius=None, subgoal_arrival=25., chain_ground_range=None, chain_link_range=None,
-                 route_reward_weight=10., time_penalty=0., ground_stationary=False):
-        if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route'):
-            raise ValueError('reward_mode must be cadmm_exploration, route_graph or vehicle_route')
+                 route_reward_weight=10., time_penalty=0., ground_stationary=False,
+                 num_drones=3,chain_soft_ratio=.85,chain_risk_weight=0.,
+                 chain_outward_weight=0.,chain_missing_weight=0.,
+                 path_quality_weight=0.,route_reference_length=None,mapping_until_connected=False,
+                 cbf_margin_weight=0.,cbf_margin_scale=8.):
+        if type(num_drones) is not int or num_drones < 2:
+            raise ValueError('At least two drones are required for the chain experiment')
+        if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
+            raise ValueError('Unsupported reward_mode')
         if ground_stationary and (subgoal_radius is not None or not moving_ground):
             raise ValueError('A stationary vehicle keeps its map receiver and has no subgoals')
         if subgoal_radius is not None and not (subgoal_radius>0 and moving_ground):
@@ -157,36 +232,66 @@ class Experiment:
         self.intervention_weight=intervention_weight
         self.moving_ground=moving_ground
         self.reward_mode=reward_mode
+        self.chain_soft_ratio=chain_soft_ratio
+        self.chain_risk_weight=chain_risk_weight
+        self.chain_outward_weight=chain_outward_weight
+        self.chain_missing_weight=chain_missing_weight
+        self.cbf_margin_weight=float(cbf_margin_weight)
+        self.cbf_margin_scale=float(cbf_margin_scale)
+        if self.cbf_margin_weight<0 or not self.cbf_margin_scale>0:
+            raise ValueError('CBF margin penalty needs a nonnegative weight and a positive scale')
         self.route_reward_weight=float(route_reward_weight)
+        self.path_quality_weight=float(path_quality_weight)
+        if self.path_quality_weight and route_reference_length is None:
+            raise ValueError('Path quality reward requires a physical reference length')
+        self.route_quality_tracker=(RouteQualityTracker(route_reference_length)
+            if reward_mode=='velocity_mapping' and route_reference_length is not None else None)
+        self.mapping_until_connected=bool(mapping_until_connected)
+        if self.mapping_until_connected and (self.route_quality_tracker is None or not self.path_quality_weight):
+            raise ValueError('Map-term hand-over requires the route quality reward')
         self.time_penalty=float(time_penalty)
         # The vehicle still receives and fuses maps but does not drive.
         self.ground_stationary=bool(ground_stationary)
         self.path_reward_scale=path_reward_scale
         self.exploration_weight=float(exploration_weight) if exploration_weight is not None else .6
-        self.audit_buffers=[{} for _ in range(3)]
+        self.audit_buffers=[{} for _ in range(num_drones)]
         self.latest_delivered_frames={}
         self.env = MultiRobotEnv(EnvConfig(world_size=(self.world_size,self.world_size), dt=1.,
-            perception_radius=24., communication_radius=95., occupancy_map_resolution=2.,
+            perception_radius=24., communication_radius=COMMUNICATION_RANGE_M, occupancy_map_resolution=2.,
             occupancy_map_size=12, ground_occupancy_map_size=16 if moving_ground else 4,
             ground_occupancy_map_resolution=.5 if moving_ground else None))
         self.ground = self.env.add_ground_robot(*self.start,max_speed=ground_speed)
         self.goal, circles, self.scene_attempts = generate_scene(seed) if scene is None else scene
         self.goal=np.asarray(self.goal,dtype=float)
         # Rejection/feasibility checks are environment setup only. No grid or
-        # reference route enters controllers, rewards, Actor or Critic.
+        # reference route enters controllers or Actor/Critic observations.
         for position, radius in circles:
             self.env.add_circle_obstacle(*position, radius)
         self.ids, self.controllers = [], []
         bounds=(0.,0.,self.world_size,self.world_size)
-        for i, (dx,dy) in enumerate(((9.,-18.),(9.,0.),(9.,18.))):
+        # A serpentine chain of 18m-spaced initial positions; N=3 retains the
+        # historical layout. Reflect extra columns away from the world edge.
+        offsets = [(9., -18.), (9., 0.), (9., 18.)]
+        if num_drones != 3:
+            sign = 1. if self.start[0] < self.world_size/2 else -1.
+            offsets = [(sign*(9.+18.*(i//3)),
+                        (-18.+18.*(i%3))*(1. if (i//3)%2==0 else -1.))
+                       for i in range(num_drones)]
+        for i, (dx,dy) in enumerate(offsets):
             x,y=self.start+np.asarray([dx,dy])
-            self.ids.append(self.env.add_drone(x,y,15.,max_speed=6.))
-            c = DroneController(f'drone_{i}', resolution=2., total_drones=3,
-                communication_range=95., max_speed=6., broadcast_interval=1., fusion_interval=5.,
+            if not (0. <= x <= self.world_size and 0. <= y <= self.world_size):
+                raise ValueError('Initial fleet does not fit inside the world bounds')
+            self.ids.append(self.env.add_drone(x,y,FLIGHT_HEIGHT_M,max_speed=6.))
+            c = DroneController(f'drone_{i}', resolution=2., total_drones=num_drones,
+                communication_range=COMMUNICATION_RANGE_M, max_speed=6., broadcast_interval=1., fusion_interval=5.,
                 communication_mode=communication_mode,safety_filter=safety_filter,
                 graph_min_clearance=1.5)
-            if algorithm != 'cadmm_original':
-                c.navigator = CandidateNavigator(f'drone_{i}', total_drones=3, comm_range=95.,
+            if getattr(model, 'action_mode', None) == 'velocity':
+                c.navigator = VelocityNavigator(f'drone_{i}', total_drones=num_drones, comm_range=COMMUNICATION_RANGE_M,
+                    min_separation=15., model=model, deterministic=not stochastic,
+                    max_speed=6., world_bounds=bounds)
+            elif algorithm != 'cadmm_original':
+                c.navigator = CandidateNavigator(f'drone_{i}', total_drones=num_drones, comm_range=95.,
                     min_separation=15., fov_radius=12., max_speed=6., model=model,
                     exploration_candidates=exploration_candidates, world_bounds=bounds,
                     communication_mode=communication_mode,
@@ -212,6 +317,7 @@ class Experiment:
         self.initial_goal_distance=float(np.linalg.norm(self.goal-self.start))
         self._initial_route_cost=self._route_cost=navigation_cost(None,self.start,self.goal)
         self.ledger = DeliveredEvidence(world=self.world_size)
+        self.reward_task_region = self.ledger.task_mask(self.start, self.goal)
         self.algorithm = algorithm
         self.trace = []
         self.first_graph_connection_step = -1
@@ -272,7 +378,7 @@ class Experiment:
         samples, decision_ms = [], []
         valid_counts, selected_distances, holds = [], [], []
         old = []
-        interventions=[];observed_violations=[];infeasible=0
+        interventions=[];observed_violations=[];infeasible=0;chain_terms=[];margins=[]
         for index,(rid,c) in enumerate(zip(self.ids,self.controllers)):
             received = dict(self.obs[rid])
             # Packet loss applies equally to all algorithms; no actor truth fields.
@@ -291,6 +397,10 @@ class Experiment:
             # Never mutate a command after the CBF. Fail explicitly on an
             # infeasible filter rather than silently proceeding as if safe.
             stats=c.safety_stats
+            chain_terms.append(communication_chain_terms(stats,self.chain_soft_ratio,
+                c.communication_range,c.max_speed))
+            # No packet has arrived before the first step; later gaps are real losses.
+            margins.append(float('-inf') if frame and stats.get('missing_links') else stats.get('feasibility_margin'))
             if stats.get('infeasible',False):
                 infeasible+=1
             interventions.append(float(stats.get('intervention',0.))**2/36.)
@@ -318,9 +428,12 @@ class Experiment:
             if getattr(c.navigator, 'last_sample', None) is not None:
                 samples.append(c.navigator.last_sample)
                 features, mask, selected, _ = c.navigator.last_sample
-                valid_counts.append(int(mask.sum()))
-                selected_distances.append(float(features[selected,2]*100.))
-                holds.append(float(selected == 0))
+                if getattr(c.navigator, 'uses_velocity', False):
+                    holds.append(float(np.linalg.norm(c.navigator.nominal_velocity) < .1))
+                else:
+                    valid_counts.append(int(mask.sum()))
+                    selected_distances.append(float(features[selected,2]*100.))
+                    holds.append(float(selected == 0))
         if infeasible:
             raise SafetyTermination(infeasible,samples)
         self.obs, info = self.env.step(actions)
@@ -353,7 +466,8 @@ class Experiment:
                         self.latest_delivered_frames.get(source,-1))
         current = np.array([self.obs[r]['self']['position'] for r in self.ids])
         graph=self.ground_controller.unified_graph
-        if self._graph_metrics is None or graph is not self._graph_metric_source or frame % 5 == 0:
+        if (self.reward_mode=='velocity_mapping' or self._graph_metrics is None
+                or graph is not self._graph_metric_source or frame % 5 == 0):
             self._graph_metrics=task_graph_metrics(graph,self.start,self.goal,
                                                   self.ledger.connector_clear)
             self._graph_metric_source=graph
@@ -378,14 +492,46 @@ class Experiment:
             # after this update; no exploration term) with route_graph scaling
             # and time penalty.
             reward=self.route_reward_weight*terms['cadmm_gain']/self._initial_route_cost-self.time_penalty
+        elif self.reward_mode=='velocity_task':
+            reward, focused_terms = velocity_task_reward(cost_before, cost_after, old_seen,
+                self.ledger.seen, self.reward_task_region, self.exploration_weight,
+                self.path_reward_scale, self.time_penalty)
+            metrics.update(focused_terms)
+        elif self.reward_mode=='velocity_mapping':
+            if self.route_quality_tracker is not None:
+                metrics.update(self.route_quality_tracker.update(self._graph_metrics))
+            # From the first connected route (this step included) route quality
+            # alone pays; the map cost would pay connection and shortening twice.
+            handed_over=self.mapping_until_connected and self.route_quality_tracker.first_length is not None
+            reward,focused_terms=velocity_mapping_reward(route_before,self._route_cost,
+                self._initial_route_cost,old_seen,self.ledger.seen,self.reward_task_region,
+                0. if handed_over else self.route_reward_weight,self.exploration_weight,self.time_penalty)
+            metrics.update(focused_terms)
+            metrics['path_quality_reward']=self.path_quality_weight*metrics.get('route_quality_gain',0.)
+            metrics['first_path_quality_reward']=self.path_quality_weight*metrics.get('route_first_quality_gain',0.)
+            metrics['path_shortening_reward']=self.path_quality_weight*metrics.get('route_shortening_quality_gain',0.)
+            reward+=metrics['path_quality_reward']
         metrics.update(reward_beta=1.,reward_eta=self.exploration_weight)
         # Penalties use local received safety telemetry, not evaluator truth.
         spacing_cost=self.spacing_penalty_weight*max(observed_violations,default=0.)
         intervention_cost=self.intervention_weight*float(np.mean(interventions))
         reward-=spacing_cost+intervention_cost
+        # A mean over local per-agent means keeps reward scale independent of
+        # fleet size; actors still use only their own received observations.
+        for key in ('chain_risk','chain_outward_risk','chain_missing_fraction'):
+            metrics[key]=float(np.mean([t[key] for t in chain_terms]))
+        metrics['chain_links_available']=float(all(t['chain_links_available'] for t in chain_terms))
+        metrics['chain_max_distance_ratio']=max(t['chain_max_distance_ratio'] for t in chain_terms)
+        metrics['chain_risk_cost']=self.chain_risk_weight*metrics['chain_risk']
+        metrics['chain_outward_cost']=self.chain_outward_weight*metrics['chain_outward_risk']
+        metrics['chain_missing_cost']=self.chain_missing_weight*metrics['chain_missing_fraction']
+        metrics.update(cbf_margin_terms(margins,self.cbf_margin_scale))
+        metrics['cbf_margin_cost']=self.cbf_margin_weight*metrics['cbf_margin_risk']
+        reward-=sum(metrics[k] for k in ('chain_risk_cost','chain_outward_cost','chain_missing_cost',
+                                         'cbf_margin_cost'))
         # Swept distances are independent evaluation, never learner inputs.
         sep = []
-        for i in range(3):
+        for i in range(len(self.ids)):
             for j in range(i):
                 r = old[i]-old[j]
                 v = (current[i]-old[i])-(current[j]-old[j])
@@ -394,9 +540,9 @@ class Experiment:
         # Independent evaluator checks configured chain edges and swept maxima.
         chain_distances=[max(np.linalg.norm(np.asarray(old[0])-old_ground),np.linalg.norm(current[0]-ground_position))]+[
             max(np.linalg.norm(np.asarray(old[i])-old[i-1]),np.linalg.norm(current[i]-current[i-1]))
-            for i in range(1,3)]
+            for i in range(1,len(self.ids))]
         ages=[frame-self.latest_delivered_frames.get(rid,-1) for rid in self.ids]
-        packet_age_limit=3 if self.communication_mode=='chain' else 1
+        packet_age_limit=len(self.ids) if self.communication_mode=='chain' else 1
         metrics.update(reward=float(reward), distance=float(distance.sum()),
             spacing_cost=spacing_cost,intervention_cost=intervention_cost,
             cbf_intervention=float(np.mean(interventions)),
@@ -412,7 +558,10 @@ class Experiment:
             received_ground_packets=len(delivered_ids & set(self.ids)),
             fallback=sum(getattr(c.navigator,'fallbacks',0) for c in self.controllers),
             decision_ms=float(np.mean(decision_ms)),
-            out_of_bounds=len(info['out_of_bounds']))
+            out_of_bounds=len(info['out_of_bounds']),
+            boundary_roundoff_count=len(info.get('boundary_roundoff', [])),
+            boundary_roundoff_max_m=max((e['overshoot_m'] for e in info.get('boundary_roundoff', [])), default=0.),
+            boundary_violation_max_m=max((e['overshoot_m'] for e in info.get('boundary_violations', [])), default=0.))
         metrics.update(ground_distance=float(np.linalg.norm(ground_position-old_ground)),
             ground_goal_distance=float(np.linalg.norm(ground_position[:2]-self.goal)),
             ground_collisions=float(len(info['collisions'])),goal_reached=float(self.goal_reached),
@@ -423,6 +572,11 @@ class Experiment:
             hold_fraction=float(np.mean(holds)) if holds else 0.,
             selected_waypoint_distance=float(np.mean(selected_distances)) if selected_distances else 0.,
             zero_reward=float(abs(reward)<1e-8))
+        if getattr(self.controllers[0].navigator, 'uses_velocity', False):
+            metrics['nominal_speed_mean'] = float(np.mean([
+                np.linalg.norm(c.navigator.nominal_velocity) for c in self.controllers]))
+            metrics['executed_speed_mean'] = float(np.mean([
+                np.linalg.norm(actions[rid]['motion']) for rid in self.ids]))
         self.trace.append(dict(positions=current.tolist(),ground_position=ground_position.tolist(), **metrics))
         return samples, reward, metrics
 
@@ -437,6 +591,28 @@ class Experiment:
         total['ground_progress']=self.initial_goal_distance-total['ground_goal_distance']
         total['episode_steps']=len(self.trace)
         total['scene_attempts']=self.scene_attempts
+        total['num_drones']=len(self.ids)
+        total['boundary_roundoff_count']=float(sum(t['boundary_roundoff_count'] for t in self.trace))
+        for key in ('boundary_roundoff_max_m', 'boundary_violation_max_m'):
+            total[key]=float(max((t[key] for t in self.trace), default=0.))
+        if self.reward_mode in ('velocity_task','velocity_mapping'):
+            for k in ('task_exploration_area', 'task_exploration_reward', 'time_cost'):
+                total[k] = float(sum(t[k] for t in self.trace))
+        if self.reward_mode=='velocity_mapping':
+            total['mapping_reward']=float(sum(t['mapping_reward'] for t in self.trace))
+            for key in ('path_quality_reward','first_path_quality_reward','path_shortening_reward',
+                        'route_new_best_saving_m'):
+                total[key]=float(sum(t.get(key,0.) for t in self.trace))
+            for key in ('route_first_length_m','route_best_length_m','route_quality',
+                        'route_best_quality','route_excess_m'):
+                total[key]=float(self.trace[-1].get(key,0.))
+        for key in ('chain_risk_cost','chain_outward_cost','chain_missing_cost','cbf_margin_cost'):
+            total[key]=float(sum(t[key] for t in self.trace))
+        for key in ('chain_risk','chain_outward_risk','chain_missing_fraction','chain_links_available',
+                    'cbf_margin_risk'):
+            total[key]=float(np.mean([t[key] for t in self.trace]))
+        total['cbf_margin_min_m_s']=float(min(t['cbf_margin_min_m_s'] for t in self.trace))
+        total['chain_max_distance_ratio']=float(max(t['chain_max_distance_ratio'] for t in self.trace))
         for key in self._graph_metrics:
             total[key]=self.trace[-1][key]
         total['graph_first_connection_step']=float(self.first_graph_connection_step)
@@ -457,6 +633,9 @@ class Experiment:
             total[key]=float(sum(t[key] for t in self.trace))
         total['min_separation']=float(min(t['min_separation'] for t in self.trace))
         total['cbf_intervention']=float(np.mean([t['cbf_intervention'] for t in self.trace]))
+        if getattr(self.controllers[0].navigator, 'uses_velocity', False):
+            total['nominal_speed_mean'] = float(np.mean([t['nominal_speed_mean'] for t in self.trace]))
+            total['executed_speed_mean'] = float(np.mean([t['executed_speed_mean'] for t in self.trace]))
         # Independent evaluator only: truth never enters rewards or network.
         seen = self.ledger.seen
         seen_positions = self.ledger.xy[seen]
@@ -513,7 +692,7 @@ def update(model, optimizer, rollout, epochs=4, entropy_coef=.01, return_metrics
             raise FloatingPointError('Non-finite PPO loss; training halted before optimizer update')
         optimizer.zero_grad()
         loss.backward()
-        gradient_norms.append(float(torch.nn.utils.clip_grad_norm_(model.parameters(), .5)))
+        gradient_norms.append(float(np.hypot(*clip_gradients(model))))
         optimizer.step()
     with torch.no_grad():
         final_dist=model.distribution(x,mask)
@@ -523,12 +702,11 @@ def update(model, optimizer, rollout, epochs=4, entropy_coef=.01, return_metrics
         final_policy=-torch.minimum(final_ratio*adv[:,None],
             final_ratio.clamp(.8,1.2)*adv[:,None]).mean()
         counts=mask.sum(-1)
-        active=counts>1
+        continuous = getattr(model, 'action_mode', None) == 'velocity'
+        active=torch.ones_like(counts, dtype=torch.bool) if continuous else counts>1
         metrics=dict(policy_loss=float(final_policy),
             value_loss=float((final_values-returns).square().mean()),
             entropy=float(final_dist.entropy().mean()),
-            normalized_entropy=float((final_dist.entropy()/counts.float().log().clamp_min(1e-8))[active].mean())
-                if active.any() else 0.,
             approx_kl=float(((final_ratio-1)-log_ratio).mean()),
             clip_fraction=float(((final_ratio-1).abs()>.2).float().mean()),
             explained_variance=float(1.-(returns-final_values).var(unbiased=False)/
@@ -537,6 +715,10 @@ def update(model, optimizer, rollout, epochs=4, entropy_coef=.01, return_metrics
             return_mean=float(returns.mean()),return_std=float(returns.std(unbiased=False)),
             return_min=float(returns.min()),return_max=float(returns.max()),
             active_decision_fraction=float(active.float().mean()))
+        if continuous:
+            metrics['action_std'] = float(model.log_std.clamp(-5., 1.).exp().mean())
+        else:
+            metrics['normalized_entropy'] = float((final_dist.entropy()/counts.float().log().clamp_min(1e-8))[active].mean()) if active.any() else 0.
     if not all(np.isfinite(value) for value in metrics.values()):
         raise FloatingPointError('Non-finite PPO diagnostic; halt before checkpointing')
     result=float(loss.detach())

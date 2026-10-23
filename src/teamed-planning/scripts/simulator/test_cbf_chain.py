@@ -55,6 +55,22 @@ class SafetyTests(unittest.TestCase):
         _,s=filt.filter([0,0,0],[30,30,15],{'a':[29,30,15],'b':[31,30,15]},1.)
         self.assertTrue(s['infeasible'])
 
+    def test_feasibility_margin_is_negative_exactly_when_the_filter_fails(self):
+        filt=CBFSafetyFilter();checked=set()
+        for length in np.arange(88.,95.,.5):
+            for bend in (0.,5.,10.,20.,40.):
+                p=np.array([length,0.,15.]);angle=np.radians(bend)
+                peer=p+length*np.array([np.cos(angle),np.sin(angle),0.])
+                _,stats=filt.filter([3.,0.,0.],p,{'d2':peer},1.,required_links=('__ground__','d2'),
+                    ground=np.zeros(3),drone_id='d1',ground_max_speed=1.)
+                margin=stats['feasibility_margin'];checked.add(stats['infeasible'])
+                # The inscribed speed polygon may only understate the margin.
+                if stats['infeasible']:self.assertLess(margin,0.)
+                else:self.assertGreater(margin,-.02)
+        self.assertEqual(checked,{True,False})
+        _,stats=filt.filter([3.,0.,0.],[500.,500.,15.],{},1.)
+        self.assertIsNone(stats['feasibility_margin'])
+
     def test_vertical_motion_is_not_silently_accepted(self):
         with self.assertRaises(ValueError):
             CBFSafetyFilter().filter([0,0,1],[20,20,15],{},1.)
