@@ -53,8 +53,12 @@ class RouteQualityTracker:
 
 
 def task_graph_metrics(graph, start, goal, connector_clear, endpoint_radius=10.):
+    """graph_frontier_goal_distance_m: least straight-line goal distance of a node
+    reachable from the start (start-goal distance before any start node, 0 once
+    connected). Only physical reachability counts, not edge confidence."""
     result = dict(graph_task_connected=0., graph_task_path_length=0.,
-        graph_task_path_ratio=0., graph_nodes=0., graph_edges=0., graph_components=0.)
+        graph_task_path_ratio=0., graph_nodes=0., graph_edges=0., graph_components=0.,
+        graph_frontier_goal_distance_m=float(np.linalg.norm(np.asarray(goal)-start)))
     if graph is None or not len(graph):
         return result
     g = graph.graph
@@ -67,7 +71,7 @@ def task_graph_metrics(graph, start, goal, connector_clear, endpoint_radius=10.)
             distance = float(np.linalg.norm(position-endpoint))
             if distance <= endpoint_radius and connector_clear(endpoint, position):
                 candidates[n] = distance
-    if not starts or not goals:
+    if not starts:
         return result
     distances = dict(starts)
     counter = 0
@@ -91,5 +95,10 @@ def task_graph_metrics(graph, start, goal, connector_clear, endpoint_radius=10.)
                 heapq.heappush(queue, (next_cost, counter, other)); counter += 1
     if math.isfinite(best):
         result.update(graph_task_connected=1., graph_task_path_length=best,
-            graph_task_path_ratio=best/max(float(np.linalg.norm(np.asarray(goal)-start)), 1e-8))
+            graph_task_path_ratio=best/max(float(np.linalg.norm(np.asarray(goal)-start)), 1e-8),
+            graph_frontier_goal_distance_m=0.)
+    else:
+        # Without a route the search above has visited the whole start component.
+        result['graph_frontier_goal_distance_m'] = min(float(np.linalg.norm(
+            np.asarray(g.nodes[n]['position'])[:2]-goal)) for n in distances)
     return result

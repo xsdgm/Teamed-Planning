@@ -45,6 +45,9 @@ class ActorCritic(nn.Module):
     @classmethod
     def from_state_dict(cls, state):
         """Rebuild with the critic width stored in the weights (older checkpoints: 0)."""
+        if 'gat_actor.1.weight' in state:
+            from drone.graph_attention_mappo import GraphAttentionActorCritic
+            return GraphAttentionActorCritic.from_state_dict(state)
         if 'velocity_actor.0.weight' in state:
             from drone.velocity_mappo import VelocityActorCritic
             return VelocityActorCritic.from_state_dict(state)

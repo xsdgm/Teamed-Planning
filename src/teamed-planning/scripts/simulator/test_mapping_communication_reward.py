@@ -229,6 +229,60 @@ class MappingCommunicationTests(unittest.TestCase):
         late=dict(row,map_completion_step=90.)
         self.assertGreater(score_validation([row],self.config(**v4))['score'],score_validation([late],self.config(**v4))['score'])
 
+    def frontier_steps(self,weight,remaining):
+        # Frontier goal distance per frame as a fraction of the task distance; None: connected.
+        torch.manual_seed(19);model=VelocityActorCritic();steps=[]
+        with contextlib.redirect_stdout(io.StringIO()):
+            env=Experiment(10021,model,stochastic=False,reward_mode='velocity_mapping',
+                exploration_weight=0.,time_penalty=.01,frontier_progress_weight=weight)
+            try:
+                distance=env.initial_goal_distance
+                for frame,fraction in enumerate(remaining):
+                    metrics=dict(graph_task_connected=float(fraction is None),graph_task_path_length=0.,
+                        graph_task_path_ratio=0.,graph_nodes=10.,graph_edges=9.,graph_components=1.,
+                        graph_frontier_goal_distance_m=0. if fraction is None else fraction*distance)
+                    with patch('simulator.mappo_experiment.task_graph_metrics',return_value=metrics):
+                        _,reward,step=env.step(frame)
+                    steps.append((reward,step))
+                summary=env.summary()
+            finally:env.env.close()
+        return steps,summary
+
+    def test_frontier_progress_pays_only_best_so_far_gains(self):
+        # Progress 0 (start node behind the start), .4, a rebuild back to .2, .5, then connected.
+        remaining=[1.2,.6,.8,.5,None]
+        paid,summary=self.frontier_steps(50.,remaining)
+        unpaid,plain=self.frontier_steps(0.,remaining)
+        np.testing.assert_allclose([s[1]['frontier_progress'] for s in paid],[0.,.4,.2,.5,1.],atol=1e-12)
+        np.testing.assert_allclose([s[1]['frontier_best_progress'] for s in paid],[0.,.4,.4,.5,1.],atol=1e-12)
+        np.testing.assert_allclose([p[0]-u[0] for p,u in zip(paid,unpaid)],[0.,20.,0.,5.,25.],atol=1e-9)
+        self.assertAlmostEqual(summary['frontier_progress_reward'],50.)
+        self.assertEqual(summary['frontier_best_progress'],1.)
+        self.assertEqual(plain['frontier_progress_reward'],0.)
+        self.assertEqual(plain['frontier_best_progress'],1.)  # logged even when unpaid
+        for options in (dict(frontier_progress_weight=-1.),dict(reward_mode='velocity_task',frontier_progress_weight=1.)):
+            with self.assertRaises(ValueError),contextlib.redirect_stdout(io.StringIO()):
+                Experiment(10021,VelocityActorCritic(),**dict(dict(reward_mode='velocity_mapping'),**options))
+
+    def test_v5_frontier_entropy_decay_config_and_contract(self):
+        v5=dict(map_quality_reward=0.,map_improvement_steps=150,map_target_quality=.95,cbf_margin_weight=.1,
+                mapping_reward_until_connected=True,frontier_progress_weight=50.,
+                entropy_coefficient=.003,entropy_coefficient_final=.001,episodes=101)
+        config=self.config(**v5)
+        self.assertEqual(reward_contract(config),'uav_mapping_route_quality_and_communication_v5')
+        self.assertEqual(reward_contract(self.config(**dict(v5,frontier_progress_weight=0.))),
+                         'uav_mapping_route_quality_and_communication_v4')
+        np.testing.assert_allclose([fixed_schedule(config,k)['entropy'] for k in (0,50,100,500)],
+                                   [.003,.002,.001,.001])
+        self.assertEqual(fixed_schedule(self.config(episodes=101),100)['entropy'],.01)  # no final value: constant
+        for fields in (dict(frontier_progress_weight=-1.),dict(frontier_progress_weight=float('nan')),
+                       dict(frontier_progress_weight=100.),dict(entropy_coefficient_final=-.001),
+                       dict(entropy_coefficient_final=True),dict(entropy_coefficient_final=float('inf'))):
+            with self.assertRaises(ValueError):self.config(**dict(v5,**fields))
+        route=dict(reward_mode='route_graph',path_quality_weight=0.,map_quality_reward=0.)
+        self.config(**route)
+        with self.assertRaises(ValueError):self.config(**dict(route,frontier_progress_weight=50.))
+
     def test_vehicle_arrival_changes_neither_uav_reward_nor_map_termination(self):
         first,a,rewards=self.execute(False)
         second,b,_=self.execute(True)
@@ -361,6 +415,22 @@ class PhysicalRouteQualityTests(unittest.TestCase):
         self.assertEqual(shortcut['route_length_after_m'],30.)
         self.assertEqual(shortcut['route_new_best_saving_m'],20.)
         self.assertAlmostEqual(shortcut['route_quality_gain'],.4)
+
+    def test_frontier_distance_follows_only_the_start_connected_graph(self):
+        graph=TopologicalGraph('frontier')
+        start,goal=np.array([0.,0.]),np.array([100.,0.])
+        def metrics():
+            return task_graph_metrics(graph,start,goal,lambda a,b:True,6.)
+        self.assertEqual(metrics()['graph_frontier_goal_distance_m'],100.)  # empty graph
+        graph.add_node('far',(95.,0.))  # a goal node, but nothing reaches it from the start
+        self.assertEqual(metrics()['graph_frontier_goal_distance_m'],100.)
+        graph.add_node('a',(5.,0.))
+        self.assertEqual(metrics()['graph_frontier_goal_distance_m'],95.)
+        graph.add_node('b',(40.,30.));graph.add_edge('a','b')
+        self.assertAlmostEqual(metrics()['graph_frontier_goal_distance_m'],np.hypot(60.,30.))
+        graph.add_edge('b','far')
+        connected=metrics()
+        self.assertEqual((connected['graph_task_connected'],connected['graph_frontier_goal_distance_m']),(1.,0.))
 
     def test_reference_length_includes_both_endpoint_connectors(self):
         length=reference_polyline_length([0.,0.],[4.,0.],[[.5,.5],[3.5,.5]])

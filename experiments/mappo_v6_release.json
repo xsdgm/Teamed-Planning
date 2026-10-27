@@ -1,0 +1,28 @@
+{
+  "official_version": "v6",
+  "confirmed_date": "2026-10-27",
+  "historical_experiment_version": "v6.2-2",
+  "policy_architecture": "gat_map_v1",
+  "actor_input_version": 2,
+  "checkpoint_feature_version": 6,
+  "training_config": "src/teamed-planning/config/algorithm/mappo_training_v6.json",
+  "curriculum_config": "src/teamed-planning/config/algorithm/mappo_v6_official_distance_curriculum.json",
+  "experiment_directory": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400",
+  "stage": 1,
+  "completed_episodes": 800,
+  "selected_continuation_checkpoint": null,
+  "selection_status": "paired independent evaluation pending",
+  "evaluation_directory": "artifacts/v6-best-final-paired-20261027",
+  "checkpoints": {
+    "best": {
+      "episode": 288,
+      "path": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_best.pt",
+      "sha256": "59fbb30470b7c8e175d5b22919b24e83eb244dd842476ca9697df4741f3ad690"
+    },
+    "final": {
+      "episode": 800,
+      "path": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_final.pt",
+      "sha256": "3d546f955f8b2971181806b186bbcb9ea797a69faad27b53ae6d878ffc49a1b3"
+    }
+  }
+}

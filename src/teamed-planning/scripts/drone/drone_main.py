@@ -271,6 +271,45 @@ class DroneController:
         
         return (vx, vy, vz)
 
+    def _cbf_filter(self, velocity, observation, dt):
+        """The onboard CBF on received geometry: (filtered velocity, stats)."""
+        from drone.cbf_safety import CBFSafetyFilter
+        peers={}
+        for neighbor in observation.get('neighbors',[]):
+            if neighbor['type']=='drone':
+                did=(neighbor.get('broadcast') or {}).get('drone_id',f"robot_{neighbor['id']}")
+                peers[did]=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
+        chain=getattr(self.navigator,'chain',self._chain_state)
+        if self.communication_mode=='chain' and chain is not None:
+            required=chain.required
+            task=chain.task()
+            ground=task['position'] if task is not None and '__ground__' in chain.visible else None
+        else:
+            required=('__ground__',)
+            ground=self.navigator.ground_robot_position
+        # Broadcast positions precede the last physical step. Direct
+        # received relative geometry is the fresh CBF endpoint sample.
+        for neighbor in observation.get('neighbors',[]):
+            if neighbor['type'] in ('diff_drive','holonomic') and ground is not None:
+                ground=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
+                break
+        return CBFSafetyFilter(self.navigator.min_separation,
+            self.communication_range,self.max_speed).filter(velocity,self.position,peers,dt,
+            required_links=required,ground=ground,
+            ground_max_speed=getattr(self,'ground_max_speed',0.),
+            world_bounds=getattr(self.navigator,'world_bounds',None),drone_id=self.drone_id)
+
+    def _current_cbf_margin(self, observation):
+        """Feasibility margin (m/s) of this step's CBF constraints, before acting.
+
+        The constraints do not depend on the nominal command, so this equals the
+        margin the filter reports for the command chosen next. Onboard data only.
+        """
+        dt=observation.get('time_step')
+        if dt is None or dt<=0:
+            raise ValueError('CBF margin requires time_step')
+        return self._cbf_filter((0.,0.,0.),observation,dt)[1]['feasibility_margin']
+
     def _safe_simulation_velocity(self, velocity, observation):
         """Apply reciprocal separation bounds to the next simulator step.
 
@@ -283,32 +322,8 @@ class DroneController:
                 raise ValueError('CBF simulator control requires time_step')
             return velocity
         if self.safety_filter=='cbf':
-            from drone.cbf_safety import CBFSafetyFilter
-            peers={}
-            for neighbor in observation.get('neighbors',[]):
-                if neighbor['type']=='drone':
-                    did=(neighbor.get('broadcast') or {}).get('drone_id',f"robot_{neighbor['id']}")
-                    peers[did]=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
-            chain=getattr(self.navigator,'chain',self._chain_state)
-            if self.communication_mode=='chain' and chain is not None:
-                required=chain.required
-                task=chain.task()
-                ground=task['position'] if task is not None and '__ground__' in chain.visible else None
-            else:
-                required=('__ground__',)
-                ground=self.navigator.ground_robot_position
             self._nominal_velocity=np.asarray(velocity,float).copy()
-            # Broadcast positions precede the last physical step. Direct
-            # received relative geometry is the fresh CBF endpoint sample.
-            for neighbor in observation.get('neighbors',[]):
-                if neighbor['type'] in ('diff_drive','holonomic') and ground is not None:
-                    ground=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
-                    break
-            filtered,self.safety_stats=CBFSafetyFilter(self.navigator.min_separation,
-                self.communication_range,self.max_speed).filter(velocity,self.position,peers,dt,
-                required_links=required,ground=ground,
-                ground_max_speed=getattr(self,'ground_max_speed',0.),
-                world_bounds=getattr(self.navigator,'world_bounds',None),drone_id=self.drone_id)
+            filtered,self.safety_stats=self._cbf_filter(velocity,observation,dt)
             return tuple(filtered)
         v = np.asarray(velocity, dtype=float).copy()
         constraints = []
@@ -420,6 +435,10 @@ class DroneController:
         with self.timer.measure("navigation"):
             if current_time - self._last_dispatch_time >= self.dispatch_interval:
                 if getattr(self.navigator, 'uses_velocity', False):
+                    # Evaluated lazily inside encode, after the navigator's chain
+                    # state has received this step's observation.
+                    self.navigator.cbf_margin_source = ((lambda: self._current_cbf_margin(simulator_obs))
+                                                        if self.safety_filter=='cbf' else None)
                     self.navigator.compute_velocity(self.position, nav_obs)
                     target = None
                 else:

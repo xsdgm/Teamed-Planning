@@ -33,13 +33,16 @@ class VelocityTests(unittest.TestCase):
         self.assertEqual((c['time_penalty'], c['intervention_weight']), (.01, .05))
         # Reward v4: no corridor exploration, CBF margin instead of the chain terms,
         # route quality paid only by best-route gains during the improvement phase.
+        # v5: goal-directed frontier progress, lighter margin penalty, decaying entropy.
         self.assertEqual(c['exploration_weight'], 0.)
+        self.assertEqual(c['frontier_progress_weight'], 50.)
+        self.assertEqual((c['entropy_coefficient'], c['entropy_coefficient_final']), (.003, .001))
         self.assertEqual((c['arrival_reward'], c['safety_failure_penalty']), (0., 100.))
         self.assertEqual(c['termination'], 'map')
         self.assertEqual(c['map_success_reward'],100.)
         self.assertEqual((c['path_quality_weight'],c['map_quality_reward']),(20.,0.))
         self.assertEqual((c['chain_risk_weight'],c['chain_outward_weight'],c['chain_missing_weight']),(0.,0.,0.))
-        self.assertEqual((c['cbf_margin_weight'],c['cbf_margin_scale']),(.25,8.))
+        self.assertEqual((c['cbf_margin_weight'],c['cbf_margin_scale']),(.1,8.))
         self.assertEqual((c['map_improvement_steps'],c['map_target_quality']),(150,.95))
         self.assertTrue(c['mapping_reward_until_connected'])
         self.assertEqual((c['critic_epochs'],c['critic_minibatch_size'],c['value_normalization']),(8,512,True))

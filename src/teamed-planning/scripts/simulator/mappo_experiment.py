@@ -212,7 +212,7 @@ class Experiment:
                  num_drones=3,chain_soft_ratio=.85,chain_risk_weight=0.,
                  chain_outward_weight=0.,chain_missing_weight=0.,
                  path_quality_weight=0.,route_reference_length=None,mapping_until_connected=False,
-                 cbf_margin_weight=0.,cbf_margin_scale=8.):
+                 cbf_margin_weight=0.,cbf_margin_scale=8.,frontier_progress_weight=0.):
         if type(num_drones) is not int or num_drones < 2:
             raise ValueError('At least two drones are required for the chain experiment')
         if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
@@ -240,6 +240,12 @@ class Experiment:
         self.cbf_margin_scale=float(cbf_margin_scale)
         if self.cbf_margin_weight<0 or not self.cbf_margin_scale>0:
             raise ValueError('CBF margin penalty needs a nonnegative weight and a positive scale')
+        self.frontier_progress_weight=float(frontier_progress_weight)
+        if not np.isfinite(self.frontier_progress_weight) or self.frontier_progress_weight<0:
+            raise ValueError('frontier_progress_weight must be finite and nonnegative')
+        if self.frontier_progress_weight and reward_mode!='velocity_mapping':
+            raise ValueError('Frontier progress is a velocity_mapping term')
+        self._frontier_best=0.
         self.route_reward_weight=float(route_reward_weight)
         self.path_quality_weight=float(path_quality_weight)
         if self.path_quality_weight and route_reference_length is None:
@@ -437,6 +443,7 @@ class Experiment:
         if infeasible:
             raise SafetyTermination(infeasible,samples)
         self.obs, info = self.env.step(actions)
+        self.last_executed_velocities=np.asarray([actions[rid]["motion"] for rid in self.ids]).copy()
         ground_received=[n for n in self.obs[self.ground]['neighbors']
                          if self.rng.random()>=self.drop]
         ground_position=np.asarray(self.obs[self.ground]['self']['position']).copy()
@@ -511,6 +518,17 @@ class Experiment:
             metrics['first_path_quality_reward']=self.path_quality_weight*metrics.get('route_first_quality_gain',0.)
             metrics['path_shortening_reward']=self.path_quality_weight*metrics.get('route_shortening_quality_gain',0.)
             reward+=metrics['path_quality_reward']
+            # v5: how far the delivered start-connected graph reaches toward the
+            # goal (1 once connected). Only best-so-far gains pay, so the episode
+            # sum is weight*best progress; graph rebuilds cannot farm it.
+            remaining=self._graph_metrics.get('graph_frontier_goal_distance_m',self.initial_goal_distance)
+            progress=1. if self._graph_metrics['graph_task_connected'] else float(
+                np.clip(1.-remaining/max(self.initial_goal_distance,1e-8),0.,1.))
+            gain=max(progress-self._frontier_best,0.)
+            self._frontier_best=max(self._frontier_best,progress)
+            metrics.update(frontier_progress=progress,frontier_best_progress=self._frontier_best,
+                frontier_progress_reward=self.frontier_progress_weight*gain)
+            reward+=metrics['frontier_progress_reward']
         metrics.update(reward_beta=1.,reward_eta=self.exploration_weight)
         # Penalties use local received safety telemetry, not evaluator truth.
         spacing_cost=self.spacing_penalty_weight*max(observed_violations,default=0.)
@@ -601,8 +619,9 @@ class Experiment:
         if self.reward_mode=='velocity_mapping':
             total['mapping_reward']=float(sum(t['mapping_reward'] for t in self.trace))
             for key in ('path_quality_reward','first_path_quality_reward','path_shortening_reward',
-                        'route_new_best_saving_m'):
+                        'route_new_best_saving_m','frontier_progress_reward'):
                 total[key]=float(sum(t.get(key,0.) for t in self.trace))
+            total['frontier_best_progress']=float(self.trace[-1].get('frontier_best_progress',0.))
             for key in ('route_first_length_m','route_best_length_m','route_quality',
                         'route_best_quality','route_excess_m'):
                 total[key]=float(self.trace[-1].get(key,0.))

@@ -17,6 +17,23 @@ def episode_advantages(rewards, values, discount, gae_lambda):
     return advantages,advantages+values
 
 
+def policy_drift(model, distributions):
+    """State-independent part of the behaviour policy's mean velocity.
+
+    Over every (state, agent) of the batch: the mean of the deterministic
+    velocities and its coherence |mean|/mean speed. Goals point in uniformly
+    random directions, so a coherent world-frame drift is never task-driven;
+    near 1 it drags the chain taut against the ground vehicle (v4-v6 failure).
+    """
+    means=torch.cat([d.mean.reshape(-1,2) for d in distributions]).double().numpy()
+    velocities=np.asarray(model.velocity(means))
+    average=velocities.mean(0);speed=float(np.linalg.norm(velocities,axis=1).mean())
+    drift=float(np.linalg.norm(average))
+    return dict(policy_mean_speed=speed,policy_drift_speed=drift,
+                policy_drift_coherence=drift/max(speed,1e-8),
+                policy_drift_vx=float(average[0]),policy_drift_vy=float(average[1]))
+
+
 def clip_gradients(model, max_norm=.5):
     """Clip actor and critic gradients separately; returns pre-clip norms.
 
@@ -216,7 +233,9 @@ def update_batch(model, optimizer, rollouts, epochs=4, entropy_coef=.01,
             value_std=float(getattr(model,'value_std',1.)),
             return_mean=float(returns.mean()),return_std=float(returns.std(unbiased=False)),
             return_min=float(returns.min()),return_max=float(returns.max()),batch_episodes=len(batches),batch_steps=steps)
-        if continuous:metrics['action_std']=float(model.log_std.clamp(-5.,1.).exp().mean())
+        if continuous:
+            metrics['action_std']=float(model.log_std.clamp(-5.,1.).exp().mean())
+            metrics.update(policy_drift(model,[b['reference'] for b in batches]))
         else:metrics['normalized_entropy']=normalized_entropy
     if not all(np.isfinite(v) for v in metrics.values()):
         raise FloatingPointError('Non-finite PPO batch diagnostics')

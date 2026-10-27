@@ -34,6 +34,7 @@ from drone.mappo import ActorCritic, GLOBAL_FEATURES
 from drone.velocity_mappo import VelocityActorCritic
 from simulator.mappo_experiment import Experiment, SafetyTermination, update
 from simulator.ppo_batch import update_batch
+from simulator.surprise_reward import TaskMapEncoder, transition, SurpriseReward
 from simulator.large_world_scenarios import generate_training_scene
 from simulator.env import BOUNDARY_ROUNDOFF_TOLERANCE_M
 from simulator.scenarios import ENVIRONMENT_VERSION
@@ -78,10 +79,23 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     # map_target_quality or after map_improvement_steps without a better route
     # (0: legacy end at the stable map).
     cbf_margin_weight=0.,cbf_margin_scale=8.,map_improvement_steps=0,map_target_quality=1.,
+    # velocity_mapping v5: best-so-far progress of the start-connected delivered
+    # graph toward the goal, paid up to this total per episode (0: none).
+    frontier_progress_weight=0.,
+    # Linear entropy decay from entropy_coefficient to this value (None: constant).
+    entropy_coefficient_final=None,
     rollout_mode='asynchronous',ppo_target_kl=.01,ppo_max_kl=.02,ppo_max_backtracks=4,
     # Synchronous velocity critic trained apart from the KL-guarded actor step
     # (0: legacy shared loss), optionally on PopArt-normalized returns.
-    critic_epochs=0,critic_minibatch_size=512,value_normalization=False)
+    critic_epochs=0,critic_minibatch_size=512,value_normalization=False,
+    # v6: training-only task-map surprise; zero keeps the v5 rollout unchanged.
+    policy_architecture='mlp',
+    # v6.2: actor input version (1: v3-v6 features; 2: invalidity sensor plane,
+    # centred altitude, own CBF margin and chain bend) and synchronous episodes
+    # per PPO batch (None: one per worker, cut at snapshot/validation episodes).
+    actor_input_version=1,episodes_per_batch=None,
+    surprise_weight=0.,surprise_weight_final=0.,surprise_clip=3.,
+    surprise_episode_budget=5.,surprise_learning_rate=3e-4,surprise_epochs=1)
 
 OPTIMIZER_CONFIG_FIELDS={'rollout_mode','ppo_target_kl','ppo_max_kl','ppo_max_backtracks',
                          'critic_epochs','critic_minibatch_size','value_normalization'}
@@ -99,8 +113,11 @@ def fixed_schedule(config, completed):
     if config.get('reward_schedule', 'fixed') != 'fixed':
         raise ValueError('Historical curriculum rewards have been removed')
     progress = min(1., max(0., completed/max(config['episodes']-1,1)))
+    entropy=config['entropy_coefficient']
+    if config.get('entropy_coefficient_final') is not None:
+        entropy+=(config['entropy_coefficient_final']-entropy)*progress
     return dict(progress=progress,focus=0.,beta=1.,eta=config['exploration_weight'],
-                entropy=config['entropy_coefficient'])
+                entropy=entropy)
 
 
 def validate_config(config):
@@ -108,6 +125,27 @@ def validate_config(config):
     if unknown:
         raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
     config = dict(DEFAULTS, **config)
+    if config['policy_architecture'] not in ('mlp','gat_map_v1'):
+        raise ValueError('Unknown policy_architecture')
+    if config['policy_architecture']=='gat_map_v1' and (config['action_mode']!='velocity'
+            or config['rollout_mode']!='synchronous' or not config['critic_epochs']
+            or not config['value_normalization']):
+        raise ValueError('Map GAT requires synchronous velocity policy and separate PopArt critic')
+    if config['policy_architecture']=='gat_map_v1' and any(n>16 for n in config['fleet_sizes']):
+        raise ValueError('Graph critic batches support at most 16 agents')
+    if config['actor_input_version'] not in (1,2) or isinstance(config['actor_input_version'],bool):
+        raise ValueError('actor_input_version must be 1 or 2')
+    if config['actor_input_version']==2 and (config['action_mode']!='velocity' or config['safety_filter']!='cbf'):
+        raise ValueError('Actor input version 2 requires the velocity policy with the CBF filter')
+    batch=config['episodes_per_batch']
+    if batch is not None:
+        if type(batch) is not int or batch<1:
+            raise ValueError('episodes_per_batch must be a positive integer or null')
+        if config['rollout_mode']!='synchronous':
+            raise ValueError('episodes_per_batch requires synchronous rollouts')
+        if config['snapshot_interval']%batch or config['validation_interval']%batch:
+            # Milestones must never cut a batch, or a short remainder batch returns.
+            raise ValueError('snapshot_interval and validation_interval must be multiples of episodes_per_batch')
     if config['rollout_mode'] not in ('asynchronous','synchronous'):
         raise ValueError('Unknown rollout mode')
     if not (np.isfinite(config['ppo_target_kl']) and np.isfinite(config['ppo_max_kl'])
@@ -149,6 +187,10 @@ def validate_config(config):
     for name in ('exploration_weight','entropy_coefficient'):
         if not np.isfinite(config[name]) or config[name]<0:
             raise ValueError(f'{name} must be finite and nonnegative')
+    final=config['entropy_coefficient_final']
+    if final is not None and (isinstance(final,bool) or not isinstance(final,(int,float))
+                              or not np.isfinite(final) or final<0):
+        raise ValueError('entropy_coefficient_final must be null or finite and nonnegative')
     for field in ('episodes','steps','ppo_epochs','validation_interval','snapshot_interval','train_seed_count',
                   'validation_samples'):
         if not isinstance(config[field],int) or config[field] < 1:
@@ -269,7 +311,53 @@ def validate_config(config):
     if config['map_improvement_steps'] and (not config['path_quality_weight'] or config['map_quality_reward']):
         # Improvement is paid by route-quality gains; a final quality bonus would pay it twice.
         raise ValueError('Map improvement requires path_quality_weight and no map_quality_reward')
+    if not np.isfinite(config['frontier_progress_weight']) or config['frontier_progress_weight']<0:
+        raise ValueError('frontier_progress_weight must be finite and nonnegative')
+    if config['frontier_progress_weight'] and (config['reward_mode']!='velocity_mapping'
+            or config['frontier_progress_weight']>=config['map_success_reward']):
+        # Progress pays at most its weight per episode; finishing the map must
+        # stay worth more than any partial push toward the goal.
+        raise ValueError('Frontier progress requires velocity_mapping and a weight below map_success_reward')
+    for name in ('surprise_weight','surprise_weight_final','surprise_clip',
+                 'surprise_episode_budget','surprise_learning_rate'):
+        value=config[name]
+        if isinstance(value,bool) or not isinstance(value,(int,float)) or not np.isfinite(value) or value<0:
+            raise ValueError(f'{name} must be finite and nonnegative')
+    if type(config['surprise_epochs']) is not int or not 1<=config['surprise_epochs']<=16:
+        raise ValueError('surprise_epochs must be an integer in [1, 16]')
+    if config['surprise_weight']:
+        if (config['rollout_mode']!='synchronous' or config['reward_mode']!='velocity_mapping'
+                or not config['critic_epochs'] or not config['value_normalization']):
+            raise ValueError('Surprise requires synchronous velocity_mapping with a PopArt critic')
+        if not (0<=config['surprise_weight_final']<=config['surprise_weight']
+                and config['surprise_clip']>0 and config['surprise_learning_rate']>0
+                and 0<config['surprise_episode_budget']<config['map_success_reward']
+                and config['frontier_progress_weight']+config['surprise_episode_budget']<config['map_success_reward']):
+            raise ValueError('Surprise must decay and progress plus its budget must stay below map success')
+        if config['exploration_weight']:
+            raise ValueError('v6 surprise replaces generic area exploration; exploration_weight must be zero')
+    elif config['surprise_weight_final']:
+        raise ValueError('surprise_weight_final requires surprise_weight')
     return config
+
+
+def feature_version(config):
+    """Checkpoint actor feature contract: 1 candidate, 2/5 velocity MLP, 4/6 velocity GAT."""
+    if config['action_mode']!='velocity':
+        return 1
+    gat=config['policy_architecture']=='gat_map_v1'
+    if config['actor_input_version']==2:
+        return 6 if gat else 5
+    return 4 if gat else 2
+
+
+def make_model(config):
+    if config['policy_architecture']=='gat_map_v1':
+        from drone.graph_attention_mappo import GraphAttentionActorCritic
+        return GraphAttentionActorCritic(GLOBAL_FEATURES,config['actor_input_version'])
+    if config['action_mode']=='velocity':
+        return VelocityActorCritic(GLOBAL_FEATURES,config['actor_input_version'])
+    return ActorCritic(GLOBAL_FEATURES)
 
 
 def optimizer_contract(config):
@@ -282,6 +370,11 @@ def optimizer_contract(config):
 def reward_contract(config):
     if config['reward_mode']!='velocity_mapping':
         return config['reward_mode']
+    if config['surprise_weight']:
+        return 'uav_mapping_route_quality_and_communication_v6_surprise'
+    if config['frontier_progress_weight']:
+        # v5: v4 terms plus best-so-far start-connected frontier progress toward the goal.
+        return 'uav_mapping_route_quality_and_communication_v5'
     if config['cbf_margin_weight'] or config['map_improvement_steps']:
         # v4: CBF feasibility margin penalty and/or post-map improvement phase.
         return 'uav_mapping_route_quality_and_communication_v4'
@@ -337,10 +430,13 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             path_quality_weight=config['path_quality_weight'],
             mapping_until_connected=config['mapping_reward_until_connected'],
             cbf_margin_weight=config['cbf_margin_weight'],cbf_margin_scale=config['cbf_margin_scale'],
+            frontier_progress_weight=config['frontier_progress_weight'],
             chain_ground_range=config['chain_ground_range'],
             chain_link_range=config['chain_link_range'],
             num_drones=config['fleet_sizes'][scene_seed % len(config['fleet_sizes'])],**options)
         rollout=[];reason='budget';stable=0;max_link=0.;bonus=0.;quality_bonus=0.
+        encoder=TaskMapEncoder(env) if config.get('surprise_weight',0.) else None
+        surprise_transitions=[]
         improve=large and termination=='map' and config['map_improvement_steps']>0
         milestone=last_gain=-1  # frames of the first stable map and the latest best-route gain
         try:
@@ -352,16 +448,21 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                     # After the map: 1 + plateau clock, so the critic sees the time to termination.
                     phase=1.+min((frame-1-max(last_gain,milestone))/config['map_improvement_steps'],1.)
                 state=env.critic_state(frame,budget,phase)
+                before=encoder.encode(env) if encoder is not None else None
                 try:
-                    samples,reward,_=env.step(frame)
+                    samples,reward,step_metrics=env.step(frame)
                 except SafetyTermination as exc:
                     if not large:raise
                     # The proposed joint action transitions to an absorbing failure
                     # without executing infeasible velocities or relaxing safety.
                     samples=exc.samples;reward=-config['safety_failure_penalty']
                     rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward,state))
+                    if encoder is not None:surprise_transitions.append(None)
                     reason='cbf_infeasible';break
                 rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward,state))
+                if encoder is not None:
+                    surprise_transitions.append(transition(before,encoder.encode(env),
+                        env.last_executed_velocities,step_metrics,frame))
                 points=np.asarray(env.trace[-1]['positions'])
                 ground=np.asarray(env.obs[env.ground]['self']['position'])
                 ground=np.r_[ground[:2],ground[2] if len(ground)>2 else 0.]
@@ -440,6 +541,9 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                 rollout_steps=len(rollout))
         finally:
             env.env.close()
+    if encoder is not None:
+        assert len(surprise_transitions)==len(rollout)
+        rollout=[(*row,item) for row,item in zip(rollout,surprise_transitions)]
     return rollout,summary
 
 
@@ -534,12 +638,15 @@ def episode_line(completed, config, summary, loss, ppo):
         f'map_done={summary.get("map_completed",0.):.0f} '
         f'route_quality={summary.get("route_efficiency",0.):.3f} '
         f'route_saved_m={summary.get("route_new_best_saving_m",0.):.1f} '
+        f'frontier={summary.get("frontier_best_progress",0.):.2f} '
         f'chain_cost={sum(summary.get(k,0.) for k in ("chain_risk_cost","chain_outward_cost","chain_missing_cost")):.3f} '
         f'ground_m={summary.get("ground_distance",0.):.1f} '
         f'goal_remaining={summary.get("ground_goal_distance",0.):.1f} '
         f'cadmm_gain={summary.get("cadmm_gain",0.):.1f} loss={loss:.4f} '
         f'kl={ppo["approx_kl"]:.6f} entropy={ppo["entropy"]:.3f} '
-        f'ev={ppo["explained_variance"]:.3f} ev_pre={ppo.get("explained_variance_pre",0.):.3f}')
+        f'ev={ppo["explained_variance"]:.3f} ev_pre={ppo.get("explained_variance_pre",0.):.3f}'
+        + (f' drift={ppo["policy_drift_speed"]:.2f}m/s coherence={ppo["policy_drift_coherence"]:.2f}'
+           if 'policy_drift_speed' in ppo else ''))
 
 
 def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_optimizer=False):
@@ -558,17 +665,15 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
     torch.set_num_threads(1)
     torch.manual_seed(config['seed'])
     rng=np.random.default_rng(config['seed'])
-    model=(VelocityActorCritic(GLOBAL_FEATURES) if config['action_mode']=='velocity'
-           else ActorCritic(GLOBAL_FEATURES))
+    model=make_model(config)
     initial_weights=None
     initial_optimizer=None
     if config['init_checkpoint'] is not None and not resume:
         # A new phase resets counters/RNG; curricula may retain Adam state.
         path=Path(config['init_checkpoint']).resolve()
         initial=torch.load(path,map_location='cpu',weights_only=True)
-        expected_features = 2 if config['action_mode']=='velocity' else 1
         if (initial.get('critic_global_features',0)!=GLOBAL_FEATURES or
-                initial.get('feature_version')!=expected_features or
+                initial.get('feature_version')!=feature_version(config) or
                 initial.get('action_mode','candidate')!=config['action_mode']):
             raise ValueError('init_checkpoint must use the current actor features and global-state critic')
         model.load_state_dict(initial['model'])
@@ -582,6 +687,10 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
         optimizer.load_state_dict(initial_optimizer)
         for group in optimizer.param_groups:
             group['lr']=config['learning_rate']
+    surprise=SurpriseReward(config) if config['surprise_weight'] else None
+    if surprise is not None and config['init_checkpoint'] is not None and not resume:
+        if initial.get('surprise') is not None:
+            surprise.load_state_dict(initial['surprise'])
     start,best_score,best_episode=0,None,None
     joint_steps=0;optimizer_batches=0;upgrade_changes={}
     if resume:
@@ -599,6 +708,9 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
         optimizer.load_state_dict(saved['optimizer'])
         rng.bit_generator.state=saved['scene_rng']
         torch.set_rng_state(saved['torch_rng'])
+        if surprise is not None:
+            if saved.get('surprise') is None:raise ValueError('Missing surprise state in v6 checkpoint')
+            surprise.load_state_dict(saved['surprise'])
         start=saved['training_episodes']
         optimizer_batches=saved.get('optimizer_batches',start)
         joint_steps=saved.get('joint_steps',start*config['steps'])
@@ -625,7 +737,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
                     workers=workers,source_sha256=source_hashes,init_checkpoint=initial_weights,
                     optimizer_contract=optimizer_contract(config),
                     optimizer_upgrade=upgrade_changes,starting_episode=start,
-                    reward_contract=reward_contract(config),
+                    reward_contract=reward_contract(config),policy_architecture=config['policy_architecture'],
                     boundary_metric_version=2,boundary_roundoff_tolerance_m=BOUNDARY_ROUNDOFF_TOLERANCE_M)
     atomic_json(output/('resume_provenance.json' if resume else 'provenance.json'),provenance)
     if not resume or upgrade_changes:
@@ -644,10 +756,13 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
             best_validation_score=best_score,best_episode=best_episode,**extra))
     def checkpoint(completed):
         return dict(model=model.state_dict(),optimizer=optimizer.state_dict(),
+            surprise=surprise.state_dict() if surprise is not None else None,
             scene_rng=rng.bit_generator.state,torch_rng=torch.get_rng_state(),
             training_episodes=completed,joint_steps=joint_steps,optimizer_batches=optimizer_batches,config=config,
             optimizer_contract=optimizer_contract(config),
-            feature_version=2 if config['action_mode']=='velocity' else 1,fov_radius=12.,
+            feature_version=feature_version(config),fov_radius=12.,
+            policy_architecture=config['policy_architecture'],
+            actor_input_version=config['actor_input_version'],
             action_mode=config['action_mode'],
             critic_global_features=GLOBAL_FEATURES,policy_mode='sample',
             exploration_candidates=config['exploration_candidates'],world_bounds=[0.,0.,config['world_size'],config['world_size']],
@@ -847,7 +962,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
                     return
                 # End batches at existing save/validation milestones, including
                 # nonmultiples of workers, so 25/50/... snapshots keep their meaning.
-                count=min(workers,config['episodes']-completed,
+                count=min(config['episodes_per_batch'] or workers,config['episodes']-completed,
                     config['snapshot_interval']-completed%config['snapshot_interval'],
                     config['validation_interval']-completed%config['validation_interval'])
                 policy_version=optimizer_batches
@@ -872,6 +987,10 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
                     status('stopped',completed,reason='Interrupted batch discarded; completed weights saved')
                     return
                 if len(results)!=count:raise RuntimeError('Incomplete synchronous batch')
+                surprise_data=None
+                if surprise is not None:
+                    surprise_data=[[row[6] for row in r[1]] for r in results]
+                    surprise.apply([r[1] for r in results],[r[2] for r in results],completed)
                 loss,ppo=update_batch(model,optimizer,[r[1] for r in results],epochs=config['ppo_epochs'],
                     entropy_coef=schedule['entropy'],discount=config['discount'],gae_lambda=config['gae_lambda'],
                     target_kl=config['ppo_target_kl'],max_kl=config['ppo_max_kl'],
@@ -879,6 +998,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
                     critic_minibatch_size=config['critic_minibatch_size'],
                     value_normalization=config['value_normalization'],
                     critic_seed=int(np.random.SeedSequence([config['seed'],optimizer_batches]).generate_state(1)[0]))
+                if surprise is not None:ppo.update(surprise.fit(surprise_data))
                 optimizer_batches+=1
                 for task,rollout,summary,elapsed in results:
                     completed+=1;joint_steps+=len(rollout)

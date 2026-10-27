@@ -1,5 +1,9 @@
 # Teamed Planning
 
+## Official v6 (graph-attention MAPPO)
+
+The GAT experiment historically named v6.2-2 is the official **v6** release. See [configuration, information contract and checkpoint provenance](experiments/mappo_v6_official.md).
+
 Windows + Docker Desktop Gazebo simulation with WSLg and NVIDIA rendering: see [setup and commands](docker/wslg/README.md).
 Run `powershell -NoProfile -ExecutionPolicy Bypass -File ./run-gazebo.ps1 start` from PowerShell in this directory after loading `xtdrone_ad:v4` from the image archive.
 Docker image backups and the current Windows launch scripts are in [`docker/`](docker/README.md).
