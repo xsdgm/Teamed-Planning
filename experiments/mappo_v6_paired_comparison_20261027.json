@@ -1,0 +1,187 @@
+{
+  "manifest": {
+    "official_version": "v6",
+    "source_run": "/home/bdi/team-planning-zql/Teamed-Planning/artifacts/mappo-v6.2-2-gat-stage1-20261026-150400",
+    "seeds": [
+      72000,
+      72001,
+      72002,
+      72003,
+      72004,
+      72005,
+      72006,
+      72007,
+      72008,
+      72009,
+      72010,
+      72011
+    ],
+    "samples_per_seed": 2,
+    "bands": [
+      {
+        "stage": 1,
+        "lower_m": 100.0,
+        "upper_m": 283.8083151964686,
+        "episodes": 800
+      },
+      {
+        "stage": 2,
+        "lower_m": 283.8083151964686,
+        "upper_m": 400.0,
+        "episodes": 800
+      }
+    ],
+    "workers": 24,
+    "initial_workers": 8,
+    "policy_mode": "sample",
+    "source_tree": "/home/bdi/team-planning-zql/Teamed-Planning/artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01/sources",
+    "primary_metric": "stage 1 map_completed; safety_terminated as guardrail",
+    "secondary_metric": "stage 2 transfer and route quality",
+    "checkpoints": {
+      "best": {
+        "path": "/home/bdi/team-planning-zql/Teamed-Planning/artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_best.pt",
+        "sha256": "59fbb30470b7c8e175d5b22919b24e83eb244dd842476ca9697df4741f3ad690"
+      },
+      "final": {
+        "path": "/home/bdi/team-planning-zql/Teamed-Planning/artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_final.pt",
+        "sha256": "3d546f955f8b2971181806b186bbcb9ea797a69faad27b53ae6d878ffc49a1b3"
+      }
+    }
+  },
+  "summaries": {
+    "best": [
+      {
+        "stage": 1,
+        "lower_m": 100.0,
+        "upper_m": 283.8083151964686,
+        "episodes": 800,
+        "n": 24,
+        "success_metric": "map_completed",
+        "success_rate": 0.5833333333333334,
+        "vehicle_arrival_rate": 0.6666666666666666,
+        "map_completion_rate": 0.5833333333333334,
+        "safety_termination_rate": 0.0,
+        "timeout_rate": 0.4166666666666667,
+        "mean_remaining_m": 42.93325241061641,
+        "mean_episode_steps": 894.625,
+        "boundary_violations": 0.0,
+        "boundary_roundoff_count": 0.0,
+        "connected_route_count": 14,
+        "mean_route_efficiency_connected": 0.9240633426411138,
+        "mean_route_excess_m_connected": 22.80688969909418,
+        "mean_route_new_best_saving_m": 1.5781423120361981,
+        "map_optimal_rate": 0.20833333333333334,
+        "map_plateau_rate": 0.2916666666666667,
+        "mean_improvement_steps_completed": 110.14285714285714
+      },
+      {
+        "stage": 2,
+        "lower_m": 283.8083151964686,
+        "upper_m": 400.0,
+        "episodes": 800,
+        "n": 24,
+        "success_metric": "map_completed",
+        "success_rate": 0.4583333333333333,
+        "vehicle_arrival_rate": 0.5,
+        "map_completion_rate": 0.4583333333333333,
+        "safety_termination_rate": 0.125,
+        "timeout_rate": 0.4166666666666667,
+        "mean_remaining_m": 115.49772184990447,
+        "mean_episode_steps": 1126.0416666666667,
+        "boundary_violations": 0.0,
+        "boundary_roundoff_count": 0.0,
+        "connected_route_count": 11,
+        "mean_route_efficiency_connected": 0.9541699683599664,
+        "mean_route_excess_m_connected": 19.4911858034534,
+        "mean_route_new_best_saving_m": 6.371128603876019,
+        "map_optimal_rate": 0.2916666666666667,
+        "map_plateau_rate": 0.08333333333333333,
+        "mean_improvement_steps_completed": 42.27272727272727
+      }
+    ],
+    "final": [
+      {
+        "stage": 1,
+        "lower_m": 100.0,
+        "upper_m": 283.8083151964686,
+        "episodes": 800,
+        "n": 24,
+        "success_metric": "map_completed",
+        "success_rate": 0.7083333333333334,
+        "vehicle_arrival_rate": 0.2916666666666667,
+        "map_completion_rate": 0.7083333333333334,
+        "safety_termination_rate": 0.08333333333333333,
+        "timeout_rate": 0.20833333333333334,
+        "mean_remaining_m": 95.42491393757315,
+        "mean_episode_steps": 617.2916666666666,
+        "boundary_violations": 0.0,
+        "boundary_roundoff_count": 0.0,
+        "connected_route_count": 17,
+        "mean_route_efficiency_connected": 0.9361307670956223,
+        "mean_route_excess_m_connected": 17.663018221893203,
+        "mean_route_new_best_saving_m": 3.833957093292392,
+        "map_optimal_rate": 0.20833333333333334,
+        "map_plateau_rate": 0.5,
+        "mean_improvement_steps_completed": 134.7058823529412
+      },
+      {
+        "stage": 2,
+        "lower_m": 283.8083151964686,
+        "upper_m": 400.0,
+        "episodes": 800,
+        "n": 24,
+        "success_metric": "map_completed",
+        "success_rate": 0.5416666666666666,
+        "vehicle_arrival_rate": 0.3333333333333333,
+        "map_completion_rate": 0.5416666666666666,
+        "safety_termination_rate": 0.3333333333333333,
+        "timeout_rate": 0.125,
+        "mean_remaining_m": 134.3746388042547,
+        "mean_episode_steps": 662.2083333333334,
+        "boundary_violations": 0.0,
+        "boundary_roundoff_count": 0.0,
+        "connected_route_count": 13,
+        "mean_route_efficiency_connected": 0.9275077347190831,
+        "mean_route_excess_m_connected": 31.90418613071182,
+        "mean_route_new_best_saving_m": 4.407440650671551,
+        "map_optimal_rate": 0.25,
+        "map_plateau_rate": 0.2916666666666667,
+        "mean_improvement_steps_completed": 102.15384615384616
+      }
+    ]
+  },
+  "paired": [
+    {
+      "band": 1,
+      "best_only": 4,
+      "final_only": 7,
+      "both": 10,
+      "neither": 3,
+      "final_minus_best_map_completion": 0.125,
+      "scene_cluster_bootstrap_ci95": [
+        -0.125,
+        0.375
+      ]
+    },
+    {
+      "band": 2,
+      "best_only": 3,
+      "final_only": 5,
+      "both": 8,
+      "neither": 8,
+      "final_minus_best_map_completion": 0.08333333333333333,
+      "scene_cluster_bootstrap_ci95": [
+        -0.20833333333333334,
+        0.375
+      ]
+    }
+  ],
+  "decision": {
+    "selected_checkpoint_label": "best",
+    "recommendation": "建议从 stage_01_best.pt（第 288 回合）续训。final 的成图率高 8.3–12.5 个百分点，但两档按场景聚类的 95% 区间均包含零，尚不足以确认稳定优势；下一阶段距离上，best 的 CBF 无可行动作终止为 3/24，final 为 8/24。考虑下一阶段的链路可行性与训练稳定性，优先选择 best；final 保留为成图率对照。该选择是基于有限样本的稳妥建议，不代表 best 在所有指标上更优。",
+    "safety_tradeoff": true,
+    "training_started": false,
+    "selection_review": "Conservative checkpoint recommendation after reviewing both distance bands and uncertainty; final retains higher observed completion."
+  },
+  "records_sha256": "68cbf199b87ed2227a18c110d842fa36ed9e7ab18595bae38f28c1dc40fdf4fe"
+}

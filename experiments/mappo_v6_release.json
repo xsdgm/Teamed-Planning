@@ -10,8 +10,8 @@
   "experiment_directory": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400",
   "stage": 1,
   "completed_episodes": 800,
-  "selected_continuation_checkpoint": null,
-  "selection_status": "paired independent evaluation pending",
+  "selected_continuation_checkpoint": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_best.pt",
+  "selection_status": "paired evaluation completed; best recommended as conservative continuation checkpoint",
   "evaluation_directory": "artifacts/v6-best-final-paired-20261027",
   "checkpoints": {
     "best": {
@@ -24,5 +24,7 @@
       "path": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_final.pt",
       "sha256": "3d546f955f8b2971181806b186bbcb9ea797a69faad27b53ae6d878ffc49a1b3"
     }
-  }
+  },
+  "selection_report": "experiments/mappo_v6_paired_comparison_20261027.md",
+  "continuation_training_started": false
 }
