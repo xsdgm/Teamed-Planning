@@ -23,12 +23,6 @@
         "lower_m": 100.0,
         "upper_m": 283.8083151964686,
         "episodes": 800
-      },
-      {
-        "stage": 2,
-        "lower_m": 283.8083151964686,
-        "upper_m": 400.0,
-        "episodes": 800
       }
     ],
     "workers": 24,
@@ -46,7 +40,15 @@
         "path": "/home/bdi/team-planning-zql/Teamed-Planning/artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_final.pt",
         "sha256": "3d546f955f8b2971181806b186bbcb9ea797a69faad27b53ae6d878ffc49a1b3"
       }
-    }
+    },
+    "decision_distance_range_m": [
+      100.0,
+      283.8083151964686
+    ],
+    "included_episodes": 48,
+    "excluded_out_of_scope_episodes": 48,
+    "executed_episodes": 96,
+    "scope_note": "Distances above the first band are historical only and excluded from checkpoint selection and future training scope."
   },
   "summaries": {
     "best": [
@@ -73,30 +75,6 @@
         "map_optimal_rate": 0.20833333333333334,
         "map_plateau_rate": 0.2916666666666667,
         "mean_improvement_steps_completed": 110.14285714285714
-      },
-      {
-        "stage": 2,
-        "lower_m": 283.8083151964686,
-        "upper_m": 400.0,
-        "episodes": 800,
-        "n": 24,
-        "success_metric": "map_completed",
-        "success_rate": 0.4583333333333333,
-        "vehicle_arrival_rate": 0.5,
-        "map_completion_rate": 0.4583333333333333,
-        "safety_termination_rate": 0.125,
-        "timeout_rate": 0.4166666666666667,
-        "mean_remaining_m": 115.49772184990447,
-        "mean_episode_steps": 1126.0416666666667,
-        "boundary_violations": 0.0,
-        "boundary_roundoff_count": 0.0,
-        "connected_route_count": 11,
-        "mean_route_efficiency_connected": 0.9541699683599664,
-        "mean_route_excess_m_connected": 19.4911858034534,
-        "mean_route_new_best_saving_m": 6.371128603876019,
-        "map_optimal_rate": 0.2916666666666667,
-        "map_plateau_rate": 0.08333333333333333,
-        "mean_improvement_steps_completed": 42.27272727272727
       }
     ],
     "final": [
@@ -123,30 +101,6 @@
         "map_optimal_rate": 0.20833333333333334,
         "map_plateau_rate": 0.5,
         "mean_improvement_steps_completed": 134.7058823529412
-      },
-      {
-        "stage": 2,
-        "lower_m": 283.8083151964686,
-        "upper_m": 400.0,
-        "episodes": 800,
-        "n": 24,
-        "success_metric": "map_completed",
-        "success_rate": 0.5416666666666666,
-        "vehicle_arrival_rate": 0.3333333333333333,
-        "map_completion_rate": 0.5416666666666666,
-        "safety_termination_rate": 0.3333333333333333,
-        "timeout_rate": 0.125,
-        "mean_remaining_m": 134.3746388042547,
-        "mean_episode_steps": 662.2083333333334,
-        "boundary_violations": 0.0,
-        "boundary_roundoff_count": 0.0,
-        "connected_route_count": 13,
-        "mean_route_efficiency_connected": 0.9275077347190831,
-        "mean_route_excess_m_connected": 31.90418613071182,
-        "mean_route_new_best_saving_m": 4.407440650671551,
-        "map_optimal_rate": 0.25,
-        "map_plateau_rate": 0.2916666666666667,
-        "mean_improvement_steps_completed": 102.15384615384616
       }
     ]
   },
@@ -162,26 +116,22 @@
         -0.125,
         0.375
       ]
-    },
-    {
-      "band": 2,
-      "best_only": 3,
-      "final_only": 5,
-      "both": 8,
-      "neither": 8,
-      "final_minus_best_map_completion": 0.08333333333333333,
-      "scene_cluster_bootstrap_ci95": [
-        -0.20833333333333334,
-        0.375
-      ]
     }
   ],
   "decision": {
-    "selected_checkpoint_label": "best",
-    "recommendation": "建议从 stage_01_best.pt（第 288 回合）续训。final 的成图率高 8.3–12.5 个百分点，但两档按场景聚类的 95% 区间均包含零，尚不足以确认稳定优势；下一阶段距离上，best 的 CBF 无可行动作终止为 3/24，final 为 8/24。考虑下一阶段的链路可行性与训练稳定性，优先选择 best；final 保留为成图率对照。该选择是基于有限样本的稳妥建议，不代表 best 在所有指标上更优。",
-    "safety_tradeoff": true,
+    "selected_checkpoint_label": "final",
+    "recommendation": "仅考虑 100–283.808 米（约 100–284 米），按既定成图成功指标，暂推荐 stage_01_final.pt（第 800 回合）作为同范围续训候选：成图 17/24，高于 best 的 14/24。代价是 CBF 无解终止 2/24，而 best 为 0/24；双方均无实际碰撞或边界违规日志。成图率差的按场景聚类 95% 区间为 [-12.5, +37.5] 个百分点，因此这是成图率优先的暂定建议，不能宣称 final 已被证明更优。此前依赖较远距离作出的 best 建议撤回。",
+    "status": "provisional recommendation; completion priority; safety tradeoff disclosed",
     "training_started": false,
-    "selection_review": "Conservative checkpoint recommendation after reviewing both distance bands and uncertainty; final retains higher observed completion."
+    "continuation_distance_range_m": [
+      100.0,
+      283.8083151964686
+    ],
+    "excluded_bands": [
+      2
+    ]
   },
-  "records_sha256": "68cbf199b87ed2227a18c110d842fa36ed9e7ab18595bae38f28c1dc40fdf4fe"
+  "records_sha256": "5e4afda18513416da935585f1ac073a63943f5a2d4473ff1a11e95fa9b4b8895",
+  "original_records_sha256": "68cbf199b87ed2227a18c110d842fa36ed9e7ab18595bae38f28c1dc40fdf4fe",
+  "records_file": "records_100_284.jsonl"
 }

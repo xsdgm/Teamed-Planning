@@ -10,8 +10,8 @@
   "experiment_directory": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400",
   "stage": 1,
   "completed_episodes": 800,
-  "selected_continuation_checkpoint": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_best.pt",
-  "selection_status": "paired evaluation completed; best recommended as conservative continuation checkpoint",
+  "selected_continuation_checkpoint": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_final.pt",
+  "selection_status": "100-284m only; final provisionally recommended for map completion; safety tradeoff disclosed",
   "evaluation_directory": "artifacts/v6-best-final-paired-20261027",
   "checkpoints": {
     "best": {
@@ -26,5 +26,16 @@
     }
   },
   "selection_report": "experiments/mappo_v6_paired_comparison_20261027.md",
-  "continuation_training_started": false
+  "continuation_training_started": false,
+  "active_distance_range_m": [
+    100.0,
+    283.8083151964686
+  ],
+  "continuation_through_stage": 1,
+  "excluded_from_selection_distance_bands": [
+    2,
+    3,
+    4,
+    5
+  ]
 }
