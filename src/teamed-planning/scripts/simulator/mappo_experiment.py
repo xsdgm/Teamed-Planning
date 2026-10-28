@@ -226,6 +226,11 @@ class Experiment:
         self.stop_on_ground_arrival=bool(stop_on_ground_arrival)
         self.rng = np.random.default_rng(seed)
         self.drop = drop
+        cooperative = getattr(model, 'policy_architecture', None)=='gat_cooperative_v7'
+        if cooperative != (communication_mode=='backbone'):
+            raise ValueError('v7 cooperative model requires backbone communication and vice versa')
+        if cooperative and (drop!=0. or safety_filter!='cbf'):
+            raise ValueError('v7 backbone requires synchronous complete geometry and CBF')
         self.communication_mode=communication_mode
         self.safety_filter=safety_filter
         self.spacing_penalty_weight=spacing_penalty_weight
@@ -293,7 +298,11 @@ class Experiment:
                 communication_mode=communication_mode,safety_filter=safety_filter,
                 graph_min_clearance=1.5)
             if getattr(model, 'action_mode', None) == 'velocity':
-                c.navigator = VelocityNavigator(f'drone_{i}', total_drones=num_drones, comm_range=COMMUNICATION_RANGE_M,
+                navigator_type = VelocityNavigator
+                if cooperative:
+                    from drone.cooperative_mappo import CooperativeNavigator
+                    navigator_type = CooperativeNavigator
+                c.navigator = navigator_type(f'drone_{i}', total_drones=num_drones, comm_range=COMMUNICATION_RANGE_M,
                     min_separation=15., model=model, deterministic=not stochastic,
                     max_speed=6., world_bounds=bounds)
             elif algorithm != 'cadmm_original':
@@ -366,6 +375,11 @@ class Experiment:
         drones=np.asarray([self.obs[r]['self']['position'] for r in self.ids],float)[:,:2]
         links=[np.linalg.norm(drones[0]-ground)]+[np.linalg.norm(drones[i]-drones[i-1])
                                                   for i in range(1,len(drones))]
+        if self.communication_mode=='backbone':
+            from drone.local_backbone import backbone_metrics
+            _, longest = backbone_metrics({str(i): np.r_[p, FLIGHT_HEIGHT_M] for i,p in enumerate(drones)},
+                                          np.r_[ground, 0.], COMMUNICATION_RANGE_M)
+            links = [longest]
         separation=min(np.linalg.norm(drones[i]-drones[j]) for i in range(len(drones)) for j in range(i))
         scale=max(self.initial_goal_distance,1.)
         # Path cost after the previous step's map update; empty map before the first step.
@@ -419,7 +433,7 @@ class Experiment:
                 action['broadcast']['evidence_audit'] = dict(source=rid, frame=frame,
                     position=old[-1].copy(), occupancy=received.get('occupancy_map'),
                     resolution=received['map_resolution'], valid=received.get('sensor_valid',True))
-                if self.communication_mode=='chain':
+                if self.communication_mode in ('chain','backbone'):
                     # Audit transport follows actual received packets, one hop
                     # per simulation step. Reward ledger de-duplicates origins.
                     buffer=self.audit_buffers[index]
@@ -461,7 +475,7 @@ class Experiment:
         delivered_ids = {n['id'] for n in delivered}
         for neighbor in delivered:
             message=neighbor.get('broadcast') or {}
-            packets=message.get('evidence_audits',[]) if self.communication_mode=='chain' else [message.get('evidence_audit')]
+            packets=message.get('evidence_audits',[]) if self.communication_mode in ('chain','backbone') else [message.get('evidence_audit')]
             for packet in packets:
                 if not packet:
                     continue
@@ -559,12 +573,28 @@ class Experiment:
         chain_distances=[max(np.linalg.norm(np.asarray(old[0])-old_ground),np.linalg.norm(current[0]-ground_position))]+[
             max(np.linalg.norm(np.asarray(old[i])-old[i-1]),np.linalg.norm(current[i]-current[i-1]))
             for i in range(1,len(self.ids))]
+        if self.communication_mode=='backbone':
+            from drone.local_backbone import backbone_metrics
+            connected, _ = backbone_metrics({str(i): p for i,p in enumerate(current)}, ground_position,
+                                             COMMUNICATION_RANGE_M)
+            lookup = {c.drone_id:i for i,c in enumerate(self.controllers)}
+            lookup.update({f'robot_{rid}':i for i,rid in enumerate(self.ids)})
+            chain_distances = []
+            for i,c in enumerate(self.controllers):
+                for key in c.navigator.required_links:
+                    before_q, after_q = ((old_ground,ground_position) if key=='__ground__'
+                                          else (old[lookup[key]],current[lookup[key]]))
+                    chain_distances.append(max(np.linalg.norm(old[i]-before_q),np.linalg.norm(current[i]-after_q)))
+            metrics['backbone_connected'] = float(connected)
+            metrics['backbone_required_links'] = [list(c.navigator.required_links) for c in self.controllers]
+            metrics['chain_links_available'] *= float(connected)
+            metrics['chain_max_distance_ratio'] = max(chain_distances,default=0.)/COMMUNICATION_RANGE_M
         ages=[frame-self.latest_delivered_frames.get(rid,-1) for rid in self.ids]
-        packet_age_limit=len(self.ids) if self.communication_mode=='chain' else 1
+        packet_age_limit=len(self.ids) if self.communication_mode in ('chain','backbone') else 1
         metrics.update(reward=float(reward), distance=float(distance.sum()),
             spacing_cost=spacing_cost,intervention_cost=intervention_cost,
             cbf_intervention=float(np.mean(interventions)),
-            chain_link_violation=float(max(chain_distances)>95.+1e-5),
+            chain_link_violation=float(max(chain_distances,default=0.)>95.+1e-5),
             min_separation=float(min(sep)),
             simultaneous_moving=float(np.all(distance > .1)),
             moving_fraction=float(np.mean(distance > .1)),

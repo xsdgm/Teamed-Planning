@@ -280,7 +280,14 @@ class DroneController:
                 did=(neighbor.get('broadcast') or {}).get('drone_id',f"robot_{neighbor['id']}")
                 peers[did]=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
         chain=getattr(self.navigator,'chain',self._chain_state)
-        if self.communication_mode=='chain' and chain is not None:
+        if self.communication_mode=='backbone':
+            from drone.local_backbone import received_geometry, relative_neighborhood
+            peers, _, ground = received_geometry(self.position, observation)
+            visible = dict(peers)
+            if ground is not None:
+                visible['__ground__'] = ground
+            required = relative_neighborhood(self.position, visible, self.communication_range)
+        elif self.communication_mode=='chain' and chain is not None:
             required=chain.required
             task=chain.task()
             ground=task['position'] if task is not None and '__ground__' in chain.visible else None
@@ -430,6 +437,15 @@ class DroneController:
             nav_obs['occupancy_map'] = parsed_obs['occupancy_map']
             nav_obs['sensor_valid'] = simulator_obs.get('sensor_valid', True)
         self._chain_state.update(nav_obs)
+        if self.communication_mode=='backbone':
+            from drone.local_backbone import received_geometry, relative_neighborhood
+            peers, velocities, ground = received_geometry(self.position, simulator_obs)
+            visible = dict(peers)
+            if ground is not None:
+                visible['__ground__'] = ground
+            required = relative_neighborhood(self.position, visible, self.communication_range)
+            self.navigator.required_links = required
+            nav_obs['cooperation'] = dict(peers=peers, velocities=velocities, ground=ground, required=required)
         
         # Step 6: Compute navigation target
         with self.timer.measure("navigation"):

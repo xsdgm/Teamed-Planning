@@ -107,7 +107,7 @@ class VelocityNavigator(DroneNavigator):
         super().__init__(*args, **kwargs)
         self.model, self.deterministic = model, deterministic
         self.max_speed, self.world_bounds = max_speed, world_bounds
-        self.chain = ChainState(self.drone_id, self._fleet_total)
+        self.chain = self.make_chain_state()
         self.last_sample = None
         self.fallbacks = 0
         self.nominal_velocity = np.zeros(3)
@@ -117,8 +117,13 @@ class VelocityNavigator(DroneNavigator):
         # CBF feasibility margin (m/s) for the CURRENT received geometry.
         self.cbf_margin_source = None
 
+    def make_chain_state(self):
+        return ChainState(self.drone_id, self._fleet_total)
+
     def encode(self, position, observation):
         obs = legal_observation(observation)
+        if hasattr(self, 'cooperation_features'):
+            obs['cooperation'] = observation['cooperation']
         self.chain.update(obs)
         p = np.asarray(position, float)
         version = getattr(self.model, 'input_version', 1)
@@ -171,6 +176,9 @@ class VelocityNavigator(DroneNavigator):
                 norm = np.linalg.norm(u)*np.linalg.norm(v)
                 state[33] = float(u@v/norm) if norm > 1e-9 else 0.
 
+        if hasattr(self, 'cooperation_features'):
+            self.cooperation_features(state, p, obs)
+
         # Only actual local sensor pixels and the controller's received/fused
         # graph enter the actor. Unknown pixels have a separate validity plane
         # (version 1) or invalidity plane (version 2, zero when all are valid).
@@ -218,7 +226,7 @@ class VelocityNavigator(DroneNavigator):
 
     def reset(self):
         super().reset()
-        self.chain = ChainState(self.drone_id, self._fleet_total)
+        self.chain = self.make_chain_state()
         self.last_sample = None
         self.fallbacks = 0
         self.nominal_velocity = np.zeros(3)

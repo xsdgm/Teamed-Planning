@@ -125,13 +125,13 @@ def validate_config(config):
     if unknown:
         raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
     config = dict(DEFAULTS, **config)
-    if config['policy_architecture'] not in ('mlp','gat_map_v1'):
+    if config['policy_architecture'] not in ('mlp','gat_map_v1','gat_cooperative_v7'):
         raise ValueError('Unknown policy_architecture')
-    if config['policy_architecture']=='gat_map_v1' and (config['action_mode']!='velocity'
+    if config['policy_architecture'] in ('gat_map_v1','gat_cooperative_v7') and (config['action_mode']!='velocity'
             or config['rollout_mode']!='synchronous' or not config['critic_epochs']
             or not config['value_normalization']):
         raise ValueError('Map GAT requires synchronous velocity policy and separate PopArt critic')
-    if config['policy_architecture']=='gat_map_v1' and any(n>16 for n in config['fleet_sizes']):
+    if config['policy_architecture'] in ('gat_map_v1','gat_cooperative_v7') and any(n>16 for n in config['fleet_sizes']):
         raise ValueError('Graph critic batches support at most 16 agents')
     if config['actor_input_version'] not in (1,2) or isinstance(config['actor_input_version'],bool):
         raise ValueError('actor_input_version must be 1 or 2')
@@ -210,8 +210,11 @@ def validate_config(config):
             raise ValueError('Reward and entropy coefficients must be nonnegative')
     if config['learning_rate'] <= 0:
         raise ValueError('learning_rate must be positive')
-    if config['communication_mode'] != 'chain' or config['safety_filter'] != 'cbf':
-        raise ValueError('Current training requires chain communication and CBF safety')
+    cooperative = config['policy_architecture']=='gat_cooperative_v7'
+    if config['communication_mode'] != ('backbone' if cooperative else 'chain') or config['safety_filter'] != 'cbf':
+        raise ValueError('Training requires CBF and matching chain/v7 backbone communication')
+    if cooperative and (config['actor_input_version']!=2 or config['drop']!=0.):
+        raise ValueError('v7 requires input 2 and complete synchronous neighbor geometry (drop=0)')
     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
         raise ValueError('Safety penalty weights must be nonnegative')
     if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
@@ -342,7 +345,9 @@ def validate_config(config):
 
 
 def feature_version(config):
-    """Checkpoint actor feature contract: 1 candidate, 2/5 velocity MLP, 4/6 velocity GAT."""
+    """Feature contract: 1 candidate, 2/5 velocity MLP, 4/6 map GAT, 7 cooperative GAT."""
+    if config['policy_architecture']=='gat_cooperative_v7':
+        return 7
     if config['action_mode']!='velocity':
         return 1
     gat=config['policy_architecture']=='gat_map_v1'
@@ -352,6 +357,9 @@ def feature_version(config):
 
 
 def make_model(config):
+    if config['policy_architecture']=='gat_cooperative_v7':
+        from drone.cooperative_mappo import CooperativeActorCritic
+        return CooperativeActorCritic(GLOBAL_FEATURES,config['actor_input_version'])
     if config['policy_architecture']=='gat_map_v1':
         from drone.graph_attention_mappo import GraphAttentionActorCritic
         return GraphAttentionActorCritic(GLOBAL_FEATURES,config['actor_input_version'])
@@ -368,6 +376,8 @@ def optimizer_contract(config):
 
 
 def reward_contract(config):
+    if config['policy_architecture']=='gat_cooperative_v7':
+        return 'uav_mapping_route_quality_and_backbone_v7'+('_surprise' if config['surprise_weight'] else '')
     if config['reward_mode']!='velocity_mapping':
         return config['reward_mode']
     if config['surprise_weight']:
@@ -466,8 +476,11 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                 points=np.asarray(env.trace[-1]['positions'])
                 ground=np.asarray(env.obs[env.ground]['self']['position'])
                 ground=np.r_[ground[:2],ground[2] if len(ground)>2 else 0.]
-                max_link=max(max_link,float(np.linalg.norm(points[0]-ground)),
-                    float(np.linalg.norm(points[1:]-points[:-1],axis=1).max()))
+                if config['communication_mode']=='backbone':
+                    max_link=max(max_link,env.trace[-1]['chain_max_distance_ratio']*95.)
+                else:
+                    max_link=max(max_link,float(np.linalg.norm(points[0]-ground)),
+                        float(np.linalg.norm(points[1:]-points[:-1],axis=1).max()))
                 mapped=bool(env.trace[-1]['graph_task_connected'])
                 if config['reward_mode']=='velocity_mapping':
                     mapped=mapped and bool(env.trace[-1]['chain_links_available']) and env.trace[-1]['chain_max_distance_ratio']<=1.
