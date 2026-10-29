@@ -1,0 +1,1131 @@
+diff -ruN a/src/teamed-planning/config/algorithm/mappo_training_v8.json b/src/teamed-planning/config/algorithm/mappo_training_v8.json
+--- a/src/teamed-planning/config/algorithm/mappo_training_v8.json	1970-01-01 08:00:00.000000000 +0800
++++ b/src/teamed-planning/config/algorithm/mappo_training_v8.json	2026-10-28 12:56:23.363218557 +0800
+@@ -0,0 +1,43 @@
++{
++  "episodes": 800, "steps": 4000, "seed": 53,
++  "learning_rate": 0.0003, "ppo_epochs": 4,
++  "validation_interval": 48, "snapshot_interval": 32,
++  "train_seed_start": 50000, "train_seed_count": 8000,
++  "validation_seeds": [60000, 60004, 60001, 60002, 60003, 60005],
++  "validation_samples": 4,
++  "test_seeds": [70000, 70001, 70002, 70003, 70004, 70005, 70006, 70007, 70008, 70009],
++  "exploration_candidates": 0, "drop": 0.0,
++  "communication_mode": "backbone", "safety_filter": "cbf",
++  "spacing_penalty_weight": 0.0, "intervention_weight": 0.05,
++  "moving_ground": true, "reward_mode": "velocity_mapping",
++  "ground_speed": 1.0, "path_reward_scale": 100.0,
++  "reward_schedule": "fixed", "exploration_weight": 0.0,
++  "entropy_coefficient": 0.003, "entropy_coefficient_final": 0.001,
++  "world_size": 1000.0, "task_distances": [],
++  "budget_multiplier": 3.0, "budget_extra": 240, "min_episode_steps": 600,
++  "map_stability_steps": 30, "safety_failure_penalty": 100.0,
++  "discount": 0.995, "gae_lambda": 0.97,
++  "initial_validation": false, "subgoal_radius": null, "termination": "map",
++  "arrival_reward": 0.0, "init_checkpoint": null,
++  "chain_ground_range": null, "chain_link_range": null,
++  "environment_version": 4, "action_mode": "velocity", "time_penalty": 0.01,
++  "fleet_sizes": [3], "task_distance_range": [100.0, 283.8],
++  "map_success_reward": 100.0, "route_reward_weight": 10.0,
++  "chain_soft_ratio": 0.85, "chain_risk_weight": 0.0,
++  "chain_outward_weight": 0.0, "chain_missing_weight": 0.0,
++  "path_quality_weight": 20.0, "map_quality_reward": 0.0,
++  "mapping_reward_until_connected": true,
++  "cbf_margin_weight": 0.1, "cbf_margin_scale": 8.0,
++  "frontier_progress_weight": 45.0,
++  "map_improvement_steps": 150, "map_target_quality": 0.95,
++  "rollout_mode": "synchronous", "ppo_target_kl": 0.01,
++  "ppo_max_kl": 0.02, "ppo_max_backtracks": 4,
++  "critic_epochs": 8, "critic_minibatch_size": 512, "value_normalization": true,
++  "surprise_weight": 0.05, "surprise_weight_final": 0.005,
++  "surprise_clip": 3.0, "surprise_episode_budget": 5.0,
++  "surprise_learning_rate": 0.0003, "surprise_epochs": 1,
++  "policy_architecture": "gat_relay_attention_v8", "actor_input_version": 2,
++  "episodes_per_batch": 16,
++  "relay_loss": 0.1, "relay_delay_jitter": 2, "relay_period": 1,
++  "relay_capacity": 16, "relay_attention": "full"
++}
+diff -ruN a/src/teamed-planning/scripts/drone/cooperative_mappo.py b/src/teamed-planning/scripts/drone/cooperative_mappo.py
+--- a/src/teamed-planning/scripts/drone/cooperative_mappo.py	2026-10-28 12:56:23.338218392 +0800
++++ b/src/teamed-planning/scripts/drone/cooperative_mappo.py	2026-10-28 12:56:23.351218477 +0800
+@@ -37,20 +37,22 @@
+ 
+ 
+ class CooperativeCriticEncoder(nn.Module):
+-    def __init__(self, global_features):
++    def __init__(self, global_features, encoder=None, raw_width=RAW_WIDTH, encoded_width=ENCODED_WIDTH):
+         super().__init__()
+-        self.encoder = CooperativeEncoder()
++        self.encoder = CooperativeEncoder() if encoder is None else encoder
+         self.global_features = global_features
++        self.raw_width, self.encoded_width = raw_width, encoded_width
+ 
+     def forward(self, x):
++        raw, width = self.raw_width, self.encoded_width
+         valid = x[..., -1] > 0
+-        flat = x[..., :RAW_WIDTH].reshape(-1, RAW_WIDTH)
++        flat = x[..., :raw].reshape(-1, raw)
+         ids = valid.reshape(-1).nonzero().squeeze(-1)
+         values = self.encoder(flat[ids])
+-        encoded = values.new_zeros((len(flat), ENCODED_WIDTH)).index_copy(0, ids, values)
+-        pooled = encoded.reshape(*valid.shape, ENCODED_WIDTH).sum(-2)/valid.sum(-1, keepdim=True).clamp_min(1)
++        encoded = values.new_zeros((len(flat), width)).index_copy(0, ids, values)
++        pooled = encoded.reshape(*valid.shape, width).sum(-2)/valid.sum(-1, keepdim=True).clamp_min(1)
+         if self.global_features:
+-            pooled = torch.cat((pooled, x[..., 0, RAW_WIDTH:RAW_WIDTH+self.global_features]), -1)
++            pooled = torch.cat((pooled, x[..., 0, raw:raw+self.global_features]), -1)
+         return pooled
+ 
+ 
+diff -ruN a/src/teamed-planning/scripts/drone/drone_main.py b/src/teamed-planning/scripts/drone/drone_main.py
+--- a/src/teamed-planning/scripts/drone/drone_main.py	2026-10-28 12:56:23.338218392 +0800
++++ b/src/teamed-planning/scripts/drone/drone_main.py	2026-10-28 12:56:23.349218464 +0800
+@@ -76,6 +76,9 @@
+         self.safety_filter=safety_filter or 'legacy'
+         self.safety_stats={}
+         self.communication_mode=communication_mode or 'direct'
++        # v8 relay cache (drone/relay_cache.py); the transport layer supplies
++        # delivered envelopes as observation['relay_envelopes'].
++        self.relay=None
+         from drone.chain_state import ChainState
+         self._chain_state=ChainState(drone_id,total_drones if self.communication_mode=='chain' else 1)
+ 
+@@ -446,6 +449,13 @@
+             required = relative_neighborhood(self.position, visible, self.communication_range)
+             self.navigator.required_links = required
+             nav_obs['cooperation'] = dict(peers=peers, velocities=velocities, ground=ground, required=required)
++        if self.relay is not None:
++            # Only envelopes that actually arrived by now; never neighbor broadcasts.
++            for envelope in simulator_obs.get('relay_envelopes', ()):
++                self.relay.receive(envelope, current_time)
++            self.relay.originate(current_time, 'drone_state', self.position,
++                                 simulator_obs['self'].get('velocity'))
++            nav_obs['relay'] = self.relay.tokens(current_time)
+         
+         # Step 6: Compute navigation target
+         with self.timer.measure("navigation"):
+diff -ruN a/src/teamed-planning/scripts/drone/mappo.py b/src/teamed-planning/scripts/drone/mappo.py
+--- a/src/teamed-planning/scripts/drone/mappo.py	2026-10-28 12:56:23.338218392 +0800
++++ b/src/teamed-planning/scripts/drone/mappo.py	2026-10-28 12:56:23.351218477 +0800
+@@ -45,6 +45,9 @@
+     @classmethod
+     def from_state_dict(cls, state):
+         """Rebuild with the critic width stored in the weights (older checkpoints: 0)."""
++        if 'gat_actor.0.relay.mode' in state:
++            from drone.relay_attention_mappo import RelayActorCritic
++            return RelayActorCritic.from_state_dict(state)
+         if 'gat_actor.0.peer_key.weight' in state:
+             from drone.cooperative_mappo import CooperativeActorCritic
+             return CooperativeActorCritic.from_state_dict(state)
+diff -ruN a/src/teamed-planning/scripts/drone/relay_attention_mappo.py b/src/teamed-planning/scripts/drone/relay_attention_mappo.py
+--- a/src/teamed-planning/scripts/drone/relay_attention_mappo.py	1970-01-01 08:00:00.000000000 +0800
++++ b/src/teamed-planning/scripts/drone/relay_attention_mappo.py	2026-10-28 12:56:23.351218477 +0800
+@@ -0,0 +1,174 @@
++"""v8: v7 cooperative policy plus age/hop-aware attention over relayed state evidence.
++
++Tokens are this device's own relay cache (drone/relay_cache.py): teammates and
++the vehicle, directly sensed or not, with the ORIGINAL measurement age and the
++hop count of the path that delivered them. Relative relevance is a masked
++softmax whose logits subtract learned, type-specific age and hop penalties.
++An absolute reliability gate rho = exp(-age/tau - lambda_h (h-1) - lambda_s sigma^2)
++then scales the weights WITHOUT renormalising, so "everything is stale" shrinks
++the context instead of remaining a convex combination. Count/reliability
++summaries are exposed explicitly; an empty cache gives a zero context.
++
++One-hop geometry, the RNG backbone and the CBF are exactly v7's. Device IDs
++only match tokens to currently sensed peers; they are never embedded.
++"""
++import numpy as np
++import torch
++from torch import nn
++from drone.cooperative_mappo import (CooperativeActorCritic, CooperativeCriticEncoder, CooperativeEncoder,
++    RAW_WIDTH as COOPERATIVE_WIDTH, ENCODED_WIDTH as COOPERATIVE_ENCODED)
++from drone.graph_attention_mappo import GraphAttentionActorCritic, MAX_FLEET, prefix_width
++
++RELAY_TOKENS = MAX_FLEET
++# Token layout: 0-2 relative source position, 3-5 source velocity and known flag,
++# 6 age (s), 7 hop count, 8-9 type (drone/vehicle), 10 sigma/95 m, 11 source time
++# unknown, 12 origin currently sensed one hop, 13-15 relative task goal and flag.
++RELAY_FEATURES = 16
++AGE, HOP, VEHICLE, SIGMA = 6, 7, 9, 10
++CONTENT = [i for i in range(RELAY_FEATURES) if i not in (AGE, HOP)]
++RAW_WIDTH = COOPERATIVE_WIDTH+RELAY_TOKENS*(RELAY_FEATURES+1)
++TIME_FEATURES = 8
++HEADS, HEAD_WIDTH = 2, 16
++RELAY_STATS = 4
++ENCODED_WIDTH = COOPERATIVE_ENCODED+HEADS*HEAD_WIDTH+RELAY_STATS
++# Ablations of the v8 validation matrix: full = v8-D, age = v8-A, hop = v8-B,
++# softmax = v8-C (age+hop in the logits, no absolute gate).
++MODES = ('full', 'age', 'hop', 'softmax')
++# Fixed gate parameters (design values, not validated on aircraft).
++TAU_S = (10., 30.)  # drone_state, vehicle_state
++HOP_DECAY = .1
++SIGMA_DECAY = 1.    # per (sigma/95 m)^2
++
++
++class TimeEncoding(nn.Module):
++    """TGAT-style functional time encoding cos(w*dt + b), learnable w and b."""
++    def __init__(self, width=TIME_FEATURES):
++        super().__init__()
++        self.frequency = nn.Parameter(torch.from_numpy(1./np.geomspace(1., 100., width)).float())
++        self.phase = nn.Parameter(torch.zeros(width))
++
++    def forward(self, age):
++        return torch.cos(age.unsqueeze(-1)*self.frequency+self.phase)
++
++
++class RelayAttention(nn.Module):
++    def __init__(self, query_width, mode='full'):
++        super().__init__()
++        self.register_buffer('mode', torch.tensor(MODES.index(mode)))
++        self.register_buffer('tau', torch.tensor(TAU_S))
++        self.time = TimeEncoding()
++        width = len(CONTENT)+TIME_FEATURES+1
++        self.query = nn.Linear(query_width, HEADS*HEAD_WIDTH)
++        # Separate key/value projections per payload type.
++        self.key = nn.ModuleList(nn.Linear(width, HEADS*HEAD_WIDTH) for _ in range(2))
++        self.value = nn.ModuleList(nn.Linear(width, HEADS*HEAD_WIDTH) for _ in range(2))
++        start = float(np.log(np.expm1(.5)))  # softplus(start) = 0.5
++        self.age_penalty = nn.Parameter(torch.full((2, HEADS), start))
++        self.hop_penalty = nn.Parameter(torch.full((2, HEADS), start))
++
++    def forward(self, query, tokens, valid):
++        mode = MODES[int(self.mode)]
++        use_age, use_hop, gate = mode != 'hop', mode != 'age', mode != 'softmax'
++        age, hop = tokens[..., AGE], tokens[..., HOP]
++        vehicle = tokens[..., VEHICLE] > .5
++        kind = vehicle.long()
++        log_hop = torch.log1p(hop.clamp_min(0.))
++        time = self.time(age)
++        z = torch.cat((tokens[..., CONTENT], time if use_age else torch.zeros_like(time),
++                       (log_hop if use_hop else torch.zeros_like(log_hop)).unsqueeze(-1)), -1)
++        shape = (*tokens.shape[:-1], HEADS, HEAD_WIDTH)
++        key = torch.where(vehicle[..., None], self.key[1](z), self.key[0](z)).reshape(shape)
++        value = torch.where(vehicle[..., None], self.value[1](z), self.value[0](z)).reshape(shape)
++        q = self.query(query).reshape(*query.shape[:-1], 1, HEADS, HEAD_WIDTH)
++        logits = (q*key).sum(-1)/np.sqrt(HEAD_WIDTH)
++        tau = torch.where(vehicle, self.tau[1], self.tau[0])
++        if use_age:
++            logits = logits-nn.functional.softplus(self.age_penalty)[kind]*(age/tau)[..., None]
++        if use_hop:
++            logits = logits-nn.functional.softplus(self.hop_penalty)[kind]*log_hop[..., None]
++        # Hard mask first (absent/expired entries never reach the cache encoding).
++        weights = logits.masked_fill(~valid[..., None], -1e9).softmax(-2)*valid[..., None]
++        rho = valid.float()
++        if gate:
++            exponent = SIGMA_DECAY*tokens[..., SIGMA].square()
++            if use_age:
++                exponent = exponent+age/tau
++            if use_hop:
++                exponent = exponent+HOP_DECAY*(hop-1.).clamp_min(0.)
++            rho = rho*torch.exp(-exponent)
++        context = ((weights*rho[..., None]).unsqueeze(-1)*value).sum(-3).reshape(*query.shape[:-1], -1)
++        count = valid.float().sum(-1, keepdim=True)
++        stats = torch.cat((torch.log1p(count)/np.log(RELAY_TOKENS+1.),
++                           rho.sum(-1, keepdim=True)/count.clamp_min(1.),
++                           rho.amax(-1, keepdim=True), (count == 0).float()), -1)
++        return context, stats
++
++
++class RelayEncoder(CooperativeEncoder):
++    def __init__(self, mode='full'):
++        super().__init__()
++        self.relay = RelayAttention(prefix_width(2)+64, mode)
++
++    def forward(self, x):
++        cooperative = super().forward(x[..., :COOPERATIVE_WIDTH])
++        tokens = x[..., COOPERATIVE_WIDTH:COOPERATIVE_WIDTH+RELAY_TOKENS*RELAY_FEATURES].reshape(
++            *x.shape[:-1], RELAY_TOKENS, RELAY_FEATURES)
++        valid = x[..., -RELAY_TOKENS:] > 0
++        # Same query as the v7 peer branch: own state/sensor/map encoding.
++        context, stats = self.relay(cooperative[..., :prefix_width(2)+64], tokens, valid)
++        return torch.cat((cooperative, context, stats), -1)
++
++
++class RelayActorCritic(CooperativeActorCritic):
++    policy_architecture = 'gat_relay_attention_v8'
++
++    def __init__(self, global_features=10, input_version=2, relay_attention='full'):
++        if input_version != 2:
++            raise ValueError('v8 requires actor_input_version=2')
++        if relay_attention not in MODES:
++            raise ValueError(f'relay_attention must be one of {MODES}')
++        GraphAttentionActorCritic.__init__(self, global_features, input_version)
++        self.feature_version = 8
++        self.relay_attention = relay_attention
++        self.gat_actor = nn.Sequential(RelayEncoder(relay_attention), nn.Linear(ENCODED_WIDTH, 128), nn.Tanh(),
++            nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, 2))
++        self.critic = nn.Sequential(
++            CooperativeCriticEncoder(global_features, RelayEncoder(relay_attention), RAW_WIDTH, ENCODED_WIDTH),
++            nn.Linear(ENCODED_WIDTH+global_features, 128), nn.Tanh(),
++            nn.Linear(128, 64), nn.Tanh(), nn.Linear(64, 1))
++        nn.init.orthogonal_(self.gat_actor[-1].weight, gain=.01)
++        nn.init.zeros_(self.gat_actor[-1].bias)
++
++    @classmethod
++    def from_state_dict(cls, state):
++        mode = MODES[int(state['gat_actor.0.relay.mode'])]
++        model = cls(state['critic.1.weight'].shape[1]-ENCODED_WIDTH, 2, mode)
++        model.load_state_dict(state)
++        return model
++
++    def encode_graph(self, base, position, observation):
++        cooperative = super().encode_graph(base, position, observation)
++        tokens = np.zeros((RELAY_TOKENS, RELAY_FEATURES), np.float32)
++        valid = np.zeros(RELAY_TOKENS, np.float32)
++        p = np.zeros(3)
++        p[:len(position)] = position
++        data = observation.get('cooperation', {})
++        sensed = set(data.get('peers', {}))
++        # KeyError on purpose: v8 never silently acts without its relay cache.
++        # The cache lists vehicle/task records first, then fresher and shorter
++        # paths, so truncation never drops the only task record for distance.
++        for i, row in enumerate(observation['relay'][:RELAY_TOKENS]):
++            vehicle = row['payload_type'] == 'vehicle_state'
++            q = np.zeros(3)
++            q[:len(row['position'])] = row['position']
++            delta = q-p
++            velocity, goal = row['velocity'], row['goal']
++            tokens[i] = [delta[0]/350., delta[1]/350., delta[2]/15.,
++                         *((velocity[0]/6., velocity[1]/6.) if velocity is not None else (0., 0.)),
++                         float(velocity is not None), row['age'], row['hop'],
++                         float(not vehicle), float(vehicle), row['sigma']/95., float(row['time_unknown']),
++                         float(data.get('ground') is not None) if vehicle else float(row['origin_id'] in sensed),
++                         *(((goal[0]-p[0])/350., (goal[1]-p[1])/350.) if goal is not None else (0., 0.)),
++                         float(goal is not None)]
++            valid[i] = 1.
++        return np.r_[cooperative, tokens.ravel(), valid].astype(np.float32)
+diff -ruN a/src/teamed-planning/scripts/drone/relay_cache.py b/src/teamed-planning/scripts/drone/relay_cache.py
+--- a/src/teamed-planning/scripts/drone/relay_cache.py	1970-01-01 08:00:00.000000000 +0800
++++ b/src/teamed-planning/scripts/drone/relay_cache.py	2026-10-28 12:56:23.351218477 +0800
+@@ -0,0 +1,201 @@
++"""v8 per-device relay cache for state evidence (deployable logic, no transport).
++
++Every entry keeps its ORIGINAL measurement time and sequence number across
++hops; forwarding only increments hop_count and replaces sender_id. Each
++(origin, boot, seq) counts once, an older sequence never replaces a newer one,
++and a restarted origin (new boot_id) is accepted only with a newer source time.
++expires_at is set once by the origin and never refreshed by a relay.
++
++The receiver decides what is usable at decision time: an entry exists only
++after an actual envelope delivered it; unknown remote devices have no entry.
++Transport (radio, ROS topics, simulator links) is the caller's job.
++"""
++import numpy as np
++
++FRAME_ID = 'world'
++TYPES = ('drone_state', 'vehicle_state')
++# Design parameters (not validated on hardware): validity window per payload
++# type, origin measurement sigma (m), and the default hop limit.
++TTL_S = {'drone_state': 30., 'vehicle_state': 60.}
++SIGMA_M = .5
++HOP_LIMIT = 16
++
++
++def make_entry(origin_id, boot_id, seq, source_stamp, payload_type, position, velocity=None,
++               goal=None, sigma=SIGMA_M, mission_id=None, goal_epoch=0, hop_limit=HOP_LIMIT,
++               ttl=None):
++    """Origin-side record; hop_count 0 means 'still at its origin'."""
++    if payload_type not in TYPES:
++        raise ValueError(f'Unknown relay payload type {payload_type}')
++    ttl = TTL_S[payload_type] if ttl is None else ttl
++    return dict(origin_id=str(origin_id), boot_id=int(boot_id), seq=int(seq),
++                source_stamp=None if source_stamp is None else float(source_stamp),
++                sender_id=str(origin_id), receive_stamp=None, hop_count=0,
++                payload_type=payload_type, frame_id=FRAME_ID,
++                state=dict(position=tuple(float(v) for v in position),
++                           velocity=None if velocity is None else tuple(float(v) for v in velocity),
++                           goal=None if goal is None else tuple(float(v) for v in goal)),
++                sigma=float(sigma), mission_id=mission_id, goal_epoch=int(goal_epoch),
++                hop_limit=int(hop_limit),
++                expires_at=None if source_stamp is None or ttl is None else float(source_stamp)+ttl)
++
++
++def _copy(entry):
++    return dict(entry, state=dict(entry['state']))
++
++
++class RelayManager:
++    """Knowledge cache G_info,i of one device: dedupe, ordering, TTL, forwarding."""
++
++    def __init__(self, device_id, boot_id=0, capacity=16, max_entries=64, mission_id=None,
++                 future_tolerance=.5, clock_offset=None, clock_bound=0., per_hop_delay_bound=2.,
++                 speed_bound=6., ttl=None):
++        self.device_id = str(device_id)
++        self.boot_id = int(boot_id)
++        self.capacity = int(capacity)
++        self.max_entries = int(max_entries)
++        self.mission_id = mission_id
++        self.future_tolerance = float(future_tolerance)
++        # Estimated clock offset per origin (s, origin clock minus local clock) and its bound.
++        self.clock_offset = dict(clock_offset or {})
++        self.clock_bound = float(clock_bound)
++        self.per_hop_delay_bound = float(per_hop_delay_bound)
++        self.speed_bound = float(speed_bound)
++        self.ttl = dict(TTL_S, **(ttl or {}))
++        self.seq = -1
++        self.own = None
++        self.cache = {}
++        self.goal_epochs = {}
++        self._sent = set()
++        self.stats = dict.fromkeys(('received', 'accepted', 'duplicate', 'better_path', 'stale',
++                                    'future', 'expired', 'rejected_frame', 'rejected_mission',
++                                    'rejected_epoch', 'hop_limit', 'evicted'), 0)
++
++    # ----- origin side -------------------------------------------------
++    def originate(self, now, payload_type, position, velocity=None, goal=None, sigma=SIGMA_M,
++                  goal_epoch=0):
++        self.seq += 1
++        self.own = make_entry(self.device_id, self.boot_id, self.seq, now, payload_type,
++                              position, velocity, goal, sigma, self.mission_id, goal_epoch,
++                              ttl=self.ttl[payload_type])
++        return self.own
++
++    # ----- receiver side -----------------------------------------------
++    def age(self, entry, now):
++        """Conservative age (s) and whether the source time was unknown."""
++        if entry['source_stamp'] is None:
++            return max(now-entry['receive_stamp'], 0.)+entry['hop_count']*self.per_hop_delay_bound, True
++        offset = self.clock_offset.get(entry['origin_id'], 0.)
++        return max(now-(entry['source_stamp']-offset), 0.), False
++
++    def expired(self, entry, now):
++        if entry['expires_at'] is not None:
++            # expires_at is on the origin clock (offset = origin minus local).
++            return now+self.clock_offset.get(entry['origin_id'], 0.) > entry['expires_at']+1e-9
++        return self.age(entry, now)[0] > self.ttl[entry['payload_type']]
++
++    def _newer(self, incoming, stored):
++        if incoming['boot_id'] == stored['boot_id']:
++            return incoming['seq'] > stored['seq']
++        # A restart resets seq; only a provably newer measurement replaces it.
++        if incoming['source_stamp'] is None or stored['source_stamp'] is None:
++            return False
++        return incoming['source_stamp'] > stored['source_stamp']
++
++    def receive(self, envelope, now):
++        """Accept one delivered envelope (a list of wire entries) at local time now."""
++        for wire in envelope or ():
++            self.stats['received'] += 1
++            entry = _copy(wire)
++            entry['hop_count'] = int(wire['hop_count'])+1
++            entry['receive_stamp'] = float(now)
++            origin = entry['origin_id']
++            if origin == self.device_id:
++                continue  # Own state is authoritative; echoes are ignored.
++            if entry['frame_id'] != FRAME_ID or entry['payload_type'] not in TYPES:
++                self.stats['rejected_frame'] += 1
++                continue
++            if self.mission_id is not None and entry['mission_id'] not in (None, self.mission_id):
++                self.stats['rejected_mission'] += 1
++                continue
++            if entry['hop_count'] > entry['hop_limit']:
++                self.stats['hop_limit'] += 1
++                continue
++            if entry['source_stamp'] is not None:
++                skew = entry['source_stamp']-self.clock_offset.get(origin, 0.)-now
++                if skew > self.future_tolerance:
++                    # Quarantined, never truncated into the freshest message.
++                    self.stats['future'] += 1
++                    continue
++            if self.expired(entry, now):
++                self.stats['expired'] += 1
++                continue
++            if entry['payload_type'] == 'vehicle_state':
++                if entry['goal_epoch'] < self.goal_epochs.get(origin, -1):
++                    self.stats['rejected_epoch'] += 1
++                    continue
++                self.goal_epochs[origin] = entry['goal_epoch']
++            stored = self.cache.get(origin)
++            if stored is not None and (stored['boot_id'], stored['seq']) == (entry['boot_id'], entry['seq']):
++                # Same measurement via another path: one piece of evidence. Keep
++                # the shorter path's transport metadata, never a new source time.
++                self.stats['duplicate'] += 1
++                if entry['hop_count'] < stored['hop_count']:
++                    stored.update(hop_count=entry['hop_count'], sender_id=entry['sender_id'])
++                    self.stats['better_path'] += 1
++                continue
++            if stored is not None and not self._newer(entry, stored):
++                self.stats['stale'] += 1
++                continue
++            self.cache[origin] = entry
++            self.stats['accepted'] += 1
++        self.prune(now)
++
++    def prune(self, now):
++        for origin in [o for o, e in self.cache.items() if self.expired(e, now)]:
++            del self.cache[origin]
++        if len(self.cache) > self.max_entries:
++            # Oldest first; one vehicle (task) record per origin is kept longest.
++            order = sorted(self.cache, key=lambda o: (self.cache[o]['payload_type'] == 'vehicle_state',
++                                                       -self.age(self.cache[o], now)[0], o))
++            for origin in order[:len(self.cache)-self.max_entries]:
++                del self.cache[origin]
++                self.stats['evicted'] += 1
++
++    # ----- forwarding --------------------------------------------------
++    def outgoing(self, now):
++        """Envelope for one actual transmission; call only when it is sent."""
++        self.prune(now)
++        candidates = [e for e in self.cache.values() if e['hop_count'] < e['hop_limit']]
++        # Within the budget: vehicle/task first, then entries not yet forwarded,
++        # then the freshest. Own state always goes first.
++        candidates.sort(key=lambda e: (e['payload_type'] != 'vehicle_state',
++                                       (e['origin_id'], e['boot_id'], e['seq']) in self._sent,
++                                       self.age(e, now)[0], e['hop_count'], e['origin_id']))
++        chosen = ([self.own] if self.own is not None else [])+candidates
++        chosen = chosen[:self.capacity]
++        self._sent = {(e['origin_id'], e['boot_id'], e['seq']) for e in chosen}
++        envelope = []
++        for entry in chosen:
++            wire = _copy(entry)
++            wire.update(sender_id=self.device_id, receive_stamp=None)
++            envelope.append(wire)
++        return envelope
++
++    def tokens(self, now):
++        """Decision-time view of the cache; never contains this device itself."""
++        self.prune(now)
++        rows = []
++        for entry in self.cache.values():
++            age, unknown = self.age(entry, now)
++            state = entry['state']
++            rows.append(dict(origin_id=entry['origin_id'], payload_type=entry['payload_type'],
++                             position=np.asarray(state['position'], float),
++                             velocity=None if state['velocity'] is None else np.asarray(state['velocity'], float),
++                             goal=None if state['goal'] is None else np.asarray(state['goal'], float),
++                             age=float(age), hop=int(entry['hop_count']), time_unknown=unknown,
++                             # Clock error turns into position uncertainty at bounded speed.
++                             sigma=float(entry['sigma'])+self.speed_bound*self.clock_bound))
++        rows.sort(key=lambda row: (row['payload_type'] != 'vehicle_state', row['age'], row['hop'],
++                                   row['origin_id']))
++        return rows
+diff -ruN a/src/teamed-planning/scripts/drone/velocity_mappo.py b/src/teamed-planning/scripts/drone/velocity_mappo.py
+--- a/src/teamed-planning/scripts/drone/velocity_mappo.py	2026-10-28 12:56:23.338218392 +0800
++++ b/src/teamed-planning/scripts/drone/velocity_mappo.py	2026-10-28 12:56:23.351218477 +0800
+@@ -124,6 +124,9 @@
+         obs = legal_observation(observation)
+         if hasattr(self, 'cooperation_features'):
+             obs['cooperation'] = observation['cooperation']
++            if 'relay' in observation:
++                # v8: decision-time snapshot of this device's own relay cache.
++                obs['relay'] = observation['relay']
+         self.chain.update(obs)
+         p = np.asarray(position, float)
+         version = getattr(self.model, 'input_version', 1)
+diff -ruN a/src/teamed-planning/scripts/simulator/mappo_experiment.py b/src/teamed-planning/scripts/simulator/mappo_experiment.py
+--- a/src/teamed-planning/scripts/simulator/mappo_experiment.py	2026-10-28 12:56:23.340218405 +0800
++++ b/src/teamed-planning/scripts/simulator/mappo_experiment.py	2026-10-28 12:56:23.357218517 +0800
+@@ -21,10 +21,17 @@
+ from simulator.scenarios import generate_scene, ENVIRONMENT_VERSION
+ from simulator.navigation_metrics import task_graph_metrics, RouteQualityTracker
+ from simulator.ppo_batch import clip_gradients
++from simulator.relay_channel import RelayChannel
++from drone.relay_cache import RelayManager
+ 
+ 
+ COMMUNICATION_RANGE_M = 95.
+ FLIGHT_HEIGHT_M = 15.
++COOPERATIVE_ARCHITECTURES = ('gat_cooperative_v7', 'gat_relay_attention_v8')
++RELAY_DEFAULTS = dict(relay_loss=0., relay_delay_jitter=0, relay_period=1, relay_capacity=16)
++# Per-step relay diagnostics (v8); evaluator truth is used only for the error.
++RELAY_STEP_METRICS = ('relay_token_count', 'relay_vehicle_known', 'relay_remote_fraction',
++                      'relay_age_s', 'relay_max_hop', 'relay_position_error_m')
+ 
+ 
+ def navigation_cost(graph, start, goal):
+@@ -212,7 +219,8 @@
+                  num_drones=3,chain_soft_ratio=.85,chain_risk_weight=0.,
+                  chain_outward_weight=0.,chain_missing_weight=0.,
+                  path_quality_weight=0.,route_reference_length=None,mapping_until_connected=False,
+-                 cbf_margin_weight=0.,cbf_margin_scale=8.,frontier_progress_weight=0.):
++                 cbf_margin_weight=0.,cbf_margin_scale=8.,frontier_progress_weight=0.,
++                 relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16):
+         if type(num_drones) is not int or num_drones < 2:
+             raise ValueError('At least two drones are required for the chain experiment')
+         if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
+@@ -226,11 +234,22 @@
+         self.stop_on_ground_arrival=bool(stop_on_ground_arrival)
+         self.rng = np.random.default_rng(seed)
+         self.drop = drop
+-        cooperative = getattr(model, 'policy_architecture', None)=='gat_cooperative_v7'
++        architecture = getattr(model, 'policy_architecture', None)
++        cooperative = architecture in COOPERATIVE_ARCHITECTURES
+         if cooperative != (communication_mode=='backbone'):
+-            raise ValueError('v7 cooperative model requires backbone communication and vice versa')
++            raise ValueError('v7/v8 cooperative models require backbone communication and vice versa')
+         if cooperative and (drop!=0. or safety_filter!='cbf'):
+             raise ValueError('v7 backbone requires synchronous complete geometry and CBF')
++        relay = dict(relay_loss=relay_loss,relay_delay_jitter=relay_delay_jitter,
++                     relay_period=relay_period,relay_capacity=relay_capacity)
++        # v8 delays/drops only relayed state evidence; one-hop geometry, maps
++        # and the CBF keep the v7 synchronous contract.
++        self.relay_channel=(RelayChannel(seed,relay_loss,relay_delay_jitter,relay_period)
++                            if architecture=='gat_relay_attention_v8' else None)
++        if self.relay_channel is None and relay!=RELAY_DEFAULTS:
++            raise ValueError('relay_* settings require the v8 relay attention policy')
++        if type(relay_capacity) is not int or relay_capacity<1:
++            raise ValueError('relay_capacity must be a positive integer')
+         self.communication_mode=communication_mode
+         self.safety_filter=safety_filter
+         self.spacing_penalty_weight=spacing_penalty_weight
+@@ -314,6 +333,8 @@
+                     algorithm=algorithm, deterministic=not stochastic)
+             else:
+                 c.navigator.fov_radius = 12.  # Same actual 24m sensor footprint.
++            if self.relay_channel is not None:
++                c.relay = RelayManager(c.drone_id, capacity=relay_capacity)
+             self.controllers.append(c)
+             # Surveyed world bounds are part of the simulator task contract.
+             c.graph_builder.world_bounds = bounds
+@@ -326,6 +347,9 @@
+             subgoal_arrival=subgoal_arrival,
+             world_bounds=bounds)
+         self.ground_controller.set_goal(tuple(self.goal))
++        # The vehicle only originates its own state/task evidence; it does not forward.
++        self.ground_relay=(RelayManager(self.ground_controller.robot_id, capacity=relay_capacity)
++                           if self.relay_channel is not None else None)
+         self.subgoals=self.ground_controller.subgoals
+         self.goal_reached=False
+         self.ground_action=self._ground_action() if moving_ground else None
+@@ -399,15 +423,27 @@
+         valid_counts, selected_distances, holds = [], [], []
+         old = []
+         interventions=[];observed_violations=[];infeasible=0;chain_terms=[];margins=[]
++        relay_rows=[]
++        if self.relay_channel is not None:
++            self._relay_vehicle(frame, actions[self.ground])
+         for index,(rid,c) in enumerate(zip(self.ids,self.controllers)):
+             received = dict(self.obs[rid])
+             # Packet loss applies equally to all algorithms; no actor truth fields.
+             received['neighbors'] = [n for n in received['neighbors']
+                                      if self.rng.random() >= self.drop]
++            if self.relay_channel is not None:
++                received['relay_envelopes'] = self.relay_channel.deliver(rid, frame)
+             old.append(np.asarray(received['self']['position']).copy())
+             tic = time.perf_counter()
+             action = c.get_action(received)
+             decision_ms.append((time.perf_counter()-tic)*1000)
++            if self.relay_channel is not None:
++                now=float(received['full_state']['time'])
++                relay_rows.append((c.relay.tokens(now),{n['id'] for n in received['neighbors']}))
++                if self.relay_channel.due(rid, frame):
++                    # Sent now, readable no earlier than the next decision step.
++                    self.relay_channel.transmit(c.relay.outgoing(now),
++                        [n['id'] for n in received['neighbors'] if n['type']=='drone'], frame)
+             target = c.navigator._current_target
+             if target is not None and self.safety_filter!='cbf':
+                 distance = np.linalg.norm(np.asarray(target)-old[-1])
+@@ -620,6 +656,8 @@
+             hold_fraction=float(np.mean(holds)) if holds else 0.,
+             selected_waypoint_distance=float(np.mean(selected_distances)) if selected_distances else 0.,
+             zero_reward=float(abs(reward)<1e-8))
++        if self.relay_channel is not None:
++            metrics.update(self._relay_metrics(relay_rows, old, old_ground))
+         if getattr(self.controllers[0].navigator, 'uses_velocity', False):
+             metrics['nominal_speed_mean'] = float(np.mean([
+                 np.linalg.norm(c.navigator.nominal_velocity) for c in self.controllers]))
+@@ -628,6 +666,41 @@
+         self.trace.append(dict(positions=current.tolist(),ground_position=ground_position.tolist(), **metrics))
+         return samples, reward, metrics
+ 
++    def _relay_vehicle(self, frame, action):
++        """The vehicle wraps its own mission broadcast as vehicle_state evidence."""
++        own=self.obs[self.ground]['self']
++        message=action.get('broadcast') or {}
++        position=np.asarray(own['position'],float)
++        position=np.r_[position[:2],position[2] if len(position)>2 else 0.]
++        target=message.get('target')
++        now=float(message.get('timestamp',self.env.time))
++        self.ground_relay.originate(now,'vehicle_state',position,own.get('velocity'),
++                                    None if target is None else target[:2])
++        if self.relay_channel.due('ground',frame):
++            self.relay_channel.transmit(self.ground_relay.outgoing(now),
++                [n['id'] for n in self.obs[self.ground]['neighbors'] if n['type']=='drone'],frame)
++
++    def _relay_metrics(self, relay_rows, old, ground):
++        """Evaluator-only relay diagnostics; truth here never reaches an actor."""
++        truth={c.drone_id:np.asarray(p,float) for c,p in zip(self.controllers,old)}
++        truth[self.ground_controller.robot_id]=np.r_[np.asarray(ground,float)[:2],
++            np.asarray(ground,float)[2] if len(ground)>2 else 0.]
++        index={c.drone_id:rid for c,rid in zip(self.controllers,self.ids)}
++        rows=[row for tokens,_ in relay_rows for row in tokens]
++        drones=[(row,sensed) for tokens,sensed in relay_rows for row in tokens
++                if row['payload_type']=='drone_state']
++        errors=[np.linalg.norm(row['position'][:2]-truth[row['origin_id']][:2]) for row in rows
++                if row['origin_id'] in truth]
++        return dict(relay_token_count=float(np.mean([len(tokens) for tokens,_ in relay_rows])),
++            relay_vehicle_known=float(np.mean([any(r['payload_type']=='vehicle_state' for r in tokens)
++                                               for tokens,_ in relay_rows])),
++            # Teammate records whose origin is NOT a current one-hop neighbor.
++            relay_remote_fraction=float(np.mean([index.get(row['origin_id']) not in sensed
++                                                 for row,sensed in drones])) if drones else 0.,
++            relay_age_s=float(np.mean([row['age'] for row in rows])) if rows else 0.,
++            relay_max_hop=float(max((row['hop'] for row in rows),default=0)),
++            relay_position_error_m=float(np.mean(errors)) if errors else 0.)
++
+     def summary(self):
+         total = {k: float(sum(t[k] for t in self.trace)) for k in
+                  ('task_gain','outside_gain','outside_new','positive_task_gain',
+@@ -682,6 +755,13 @@
+             total[key]=float(sum(t[key] for t in self.trace))
+         total['min_separation']=float(min(t['min_separation'] for t in self.trace))
+         total['cbf_intervention']=float(np.mean([t['cbf_intervention'] for t in self.trace]))
++        if self.relay_channel is not None:
++            for key in RELAY_STEP_METRICS:
++                total[key]=float(np.mean([t[key] for t in self.trace]))
++            for key,value in self.relay_channel.stats.items():
++                total[f'relay_packets_{key}']=float(value)
++            for key in ('accepted','duplicate','stale','expired','future'):
++                total[f'relay_entries_{key}']=float(sum(c.relay.stats[key] for c in self.controllers))
+         if getattr(self.controllers[0].navigator, 'uses_velocity', False):
+             total['nominal_speed_mean'] = float(np.mean([t['nominal_speed_mean'] for t in self.trace]))
+             total['executed_speed_mean'] = float(np.mean([t['executed_speed_mean'] for t in self.trace]))
+diff -ruN a/src/teamed-planning/scripts/simulator/relay_channel.py b/src/teamed-planning/scripts/simulator/relay_channel.py
+--- a/src/teamed-planning/scripts/simulator/relay_channel.py	1970-01-01 08:00:00.000000000 +0800
++++ b/src/teamed-planning/scripts/simulator/relay_channel.py	2026-10-28 12:56:23.359218530 +0800
+@@ -0,0 +1,48 @@
++"""Simulated v8 relay transport: one event queue per directed physical link.
++
++A packet is transmitted only to devices within actual radio range at its send
++step, arrives no earlier than the next decision step (so nothing propagates
++recursively through the whole network within one step), and may be lost or
++delayed (jitter also reorders packets). Every hop is a new transmission.
++Receivers see packets only once arrival <= their decision step.
++"""
++import numpy as np
++
++
++class RelayChannel:
++    def __init__(self, seed, loss=0., delay_jitter=0, period=1):
++        if not 0. <= loss < 1.:
++            raise ValueError('relay loss must be in [0, 1)')
++        if type(delay_jitter) is not int or delay_jitter < 0 or type(period) is not int or period < 1:
++            raise ValueError('relay delay_jitter must be a nonnegative and period a positive integer')
++        # A private stream: the relay draws never shift other simulator randomness.
++        self.rng = np.random.default_rng([int(seed), 0x7638])
++        self.loss, self.delay_jitter, self.period = float(loss), delay_jitter, period
++        self.phase = {}
++        self.queues = {}
++        self.order = 0
++        self.stats = dict(sent=0, lost=0, delivered=0)
++
++    def due(self, sender, frame):
++        if sender not in self.phase:
++            self.phase[sender] = int(self.rng.integers(self.period))
++        return (frame+self.phase[sender]) % self.period == 0
++
++    def transmit(self, envelope, receivers, frame):
++        for receiver in receivers:
++            self.stats['sent'] += 1
++            if self.rng.random() < self.loss:
++                self.stats['lost'] += 1
++                continue
++            arrival = frame+1+int(self.rng.integers(self.delay_jitter+1))
++            self.order += 1
++            # Each receiver gets its own copy; later sender cache changes cannot leak in.
++            packet = [dict(e, state=dict(e['state'])) for e in envelope]
++            self.queues.setdefault(receiver, []).append((arrival, self.order, packet))
++
++    def deliver(self, receiver, frame):
++        queue = self.queues.get(receiver, [])
++        ready = sorted(item for item in queue if item[0] <= frame)
++        self.queues[receiver] = [item for item in queue if item[0] > frame]
++        self.stats['delivered'] += len(ready)
++        return [packet for _, _, packet in ready]
+diff -ruN a/src/teamed-planning/scripts/simulator/test_relay_attention_v8.py b/src/teamed-planning/scripts/simulator/test_relay_attention_v8.py
+--- a/src/teamed-planning/scripts/simulator/test_relay_attention_v8.py	1970-01-01 08:00:00.000000000 +0800
++++ b/src/teamed-planning/scripts/simulator/test_relay_attention_v8.py	2026-10-28 12:56:23.359218530 +0800
+@@ -0,0 +1,290 @@
++"""v8 relay protocol, age/hop attention with absolute gate, transport causality and training."""
++import contextlib
++import io
++import json
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++import numpy as np
++import torch
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from drone.relay_cache import RelayManager, make_entry
++from drone.relay_attention_mappo import (RelayActorCritic, RelayAttention, RAW_WIDTH, RELAY_TOKENS,
++    RELAY_FEATURES, AGE, HOP, VEHICLE, SIGMA, MODES)
++from drone.cooperative_mappo import CooperativeActorCritic, CooperativeNavigator, RAW_WIDTH as V7_WIDTH
++from drone.mappo import ActorCritic
++from simulator.relay_channel import RelayChannel
++from simulator.mappo_experiment import Experiment
++from simulator.train_mappo import validate_config, train, run_episode, fixed_schedule, make_model, feature_version
++
++
++def config():
++    return json.loads((Path(__file__).resolve().parents[2]/'config/algorithm/mappo_training_v8.json').read_text())
++
++
++def state(device, now, position=(0., 0., 15.), boot=0):
++    manager = RelayManager(device, boot_id=boot)
++    manager.originate(now, 'drone_state', position, (1., 0., 0.))
++    return manager
++
++
++class RelayProtocolTests(unittest.TestCase):
++    def test_source_time_kept_and_hops_increment_across_three_relays(self):
++        a, b, c, d = (RelayManager(k) for k in 'abcd')
++        a.originate(10., 'drone_state', (1., 2., 15.), (0., 1., 0.))
++        b.receive(a.outgoing(10.), 11.)
++        c.receive(b.outgoing(11.), 12.)
++        d.receive(c.outgoing(12.), 14.)
++        for manager, hops in ((b, 1), (c, 2), (d, 3)):
++            entry = manager.cache['a']
++            self.assertEqual((entry['source_stamp'], entry['hop_count'], entry['expires_at']), (10., hops, 40.))
++        self.assertEqual(d.cache['a']['sender_id'], 'c')
++        row = d.tokens(14.)[0]
++        self.assertEqual((row['age'], row['hop']), (4., 3))
++        # The origin's own record never appears among its own tokens.
++        a.receive(d.outgoing(14.), 15.)
++        self.assertNotIn('a', a.cache)
++
++    def test_old_sequence_never_overwrites_newer_and_duplicates_count_once(self):
++        a, b = RelayManager('a'), RelayManager('b')
++        a.originate(1., 'drone_state', (1., 0., 15.))
++        first = a.outgoing(1.)
++        a.originate(2., 'drone_state', (2., 0., 15.))
++        second = a.outgoing(2.)
++        b.receive(second, 3.)
++        b.receive(first, 3.)  # reordered arrival
++        self.assertEqual(b.cache['a']['seq'], 1)
++        self.assertEqual(b.stats['stale'], 1)
++        b.receive(second, 4.)
++        self.assertEqual((b.stats['accepted'], b.stats['duplicate']), (1, 1))
++        self.assertEqual(b.cache['a']['receive_stamp'], 3.)
++
++    def test_duplicate_over_shorter_path_keeps_measurement_time(self):
++        a, relay, b = RelayManager('a'), RelayManager('r'), RelayManager('b')
++        a.originate(5., 'drone_state', (0., 0., 15.))
++        packet = a.outgoing(5.)
++        relay.receive(packet, 6.)
++        b.receive(relay.outgoing(6.), 7.)
++        self.assertEqual(b.cache['a']['hop_count'], 2)
++        b.receive(packet, 8.)
++        self.assertEqual((b.cache['a']['hop_count'], b.cache['a']['source_stamp']), (1, 5.))
++        self.assertEqual(b.stats['better_path'], 1)
++
++    def test_restart_and_clock_errors(self):
++        b = RelayManager('b')
++        b.receive(state('a', 50.).outgoing(50.), 51.)
++        b.receive(state('a', 40., boot=7).outgoing(40.), 52.)  # new boot, older time
++        self.assertEqual(b.cache['a']['boot_id'], 0)
++        b.receive(state('a', 53., boot=7).outgoing(53.), 53.)  # restarted, seq reset to 0
++        self.assertEqual((b.cache['a']['boot_id'], b.cache['a']['seq']), (7, 0))
++        b.receive(state('a', 90., boot=7).outgoing(90.), 60.)  # clock ahead beyond tolerance
++        self.assertEqual(b.stats['future'], 1)
++        self.assertEqual(b.cache['a']['source_stamp'], 53.)
++        # Unknown source time: conservative receive age plus a per-hop delay bound.
++        entry = make_entry('x', 0, 0, None, 'drone_state', (0., 0., 15.))
++        b.receive([entry], 60.)
++        age, unknown = b.age(b.cache['x'], 63.)
++        self.assertTrue(unknown)
++        self.assertEqual(age, 3.+1*b.per_hop_delay_bound)
++
++    def test_expiry_is_not_refreshed_by_forwarding_and_goal_epoch_is_monotone(self):
++        a, relay, b = RelayManager('a'), RelayManager('r'), RelayManager('b')
++        a.originate(0., 'drone_state', (0., 0., 15.))
++        relay.receive(a.outgoing(0.), 29.)
++        self.assertIn('a', relay.cache)
++        b.receive(relay.outgoing(29.5), 31.)  # forwarded copy already expired at 30 s
++        self.assertNotIn('a', b.cache)
++        self.assertEqual(relay.tokens(30.5), [])
++        vehicle = RelayManager('v')
++        vehicle.originate(1., 'vehicle_state', (0., 0., 0.), goal=(9., 9.), goal_epoch=2)
++        b.receive(vehicle.outgoing(1.), 2.)
++        vehicle.originate(3., 'vehicle_state', (0., 0., 0.), goal=(1., 1.), goal_epoch=1)
++        b.receive(vehicle.outgoing(3.), 4.)
++        self.assertEqual(b.cache['v']['state']['goal'], (9., 9.))
++        self.assertEqual(b.stats['rejected_epoch'], 1)
++
++    def test_channel_is_causal_lossy_and_reorders_only_with_jitter(self):
++        channel = RelayChannel(3, loss=0., delay_jitter=0)
++        channel.transmit([make_entry('a', 0, 0, 0., 'drone_state', (0, 0, 15))], ['b'], 5)
++        self.assertEqual(channel.deliver('b', 5), [])
++        self.assertEqual(len(channel.deliver('b', 6)), 1)
++        lossy = RelayChannel(3, loss=.5, delay_jitter=3)
++        for frame in range(200):
++            lossy.transmit([make_entry('a', 0, frame, frame, 'drone_state', (0, 0, 15))], ['b'], frame)
++        arrivals = [p[0]['seq'] for f in range(205) for p in lossy.deliver('b', f)]
++        self.assertTrue(.35 < lossy.stats['lost']/200 < .65)
++        self.assertNotEqual(arrivals, sorted(arrivals))
++        periodic = RelayChannel(3, period=3)
++        self.assertEqual(sum(periodic.due('x', f) for f in range(30)), 10)
++
++
++class RelayAttentionTests(unittest.TestCase):
++    def setUp(self):
++        torch.manual_seed(5)
++        torch.set_num_threads(1)
++
++    def tokens(self, ages, hops=None, vehicle=()):
++        x = torch.zeros(RELAY_TOKENS, RELAY_FEATURES)
++        valid = torch.zeros(RELAY_TOKENS, dtype=torch.bool)
++        for i, age in enumerate(ages):
++            x[i, :3] = torch.tensor([.1*i, -.05*i, 0.])
++            x[i, AGE], x[i, HOP] = age, (hops or [1]*len(ages))[i]
++            x[i, VEHICLE if i in vehicle else VEHICLE-1] = 1.
++            x[i, SIGMA] = .5/95
++            valid[i] = True
++        return x, valid
++
++    def test_empty_cache_is_zero_and_finite(self):
++        attention = RelayAttention(386)
++        x, valid = self.tokens([])
++        x[:] = 1e3  # padding content must not matter
++        context, stats = attention(torch.randn(386), x, valid)
++        self.assertTrue(torch.equal(context, torch.zeros_like(context)))
++        self.assertEqual(stats.tolist(), [0., 0., 0., 1.])
++
++    def test_gate_is_absolute_and_not_renormalized(self):
++        attention = RelayAttention(386)
++        softmax_only = RelayAttention(386, 'softmax')
++        softmax_only.load_state_dict({k: v for k, v in attention.state_dict().items() if k != 'mode'}, strict=False)
++        query = torch.randn(386)
++        reliability = []
++        for ages in ([1.], [25.], [25., 28.]):
++            x, valid = self.tokens(ages)
++            gated, stats = attention(query, x, valid)
++            relative, plain = softmax_only(query, x, valid)
++            self.assertEqual(float(plain[1]), 1.)
++            if len(ages) == 1:
++                # Softmax weight is 1 whatever the age; only the gate shrinks it.
++                torch.testing.assert_close(gated, relative*stats[1])
++            reliability.append(float(stats[1]))
++        self.assertLess(reliability[1], .1*reliability[0])
++        self.assertLess(reliability[2], .1*reliability[0])  # all stale stays small
++        # More hops: lower reliability at equal age.
++        x, valid = self.tokens([2., 2.], hops=[1, 6])
++        self.assertLess(float(attention(query, x[1:2].expand(RELAY_TOKENS, -1), valid)[1][2]),
++                        float(attention(query, x[0:1].expand(RELAY_TOKENS, -1), valid)[1][2]))
++
++    def test_token_order_and_padding_do_not_matter(self):
++        attention = RelayAttention(386)
++        query = torch.randn(386)
++        x, valid = self.tokens([1., 3., 7.], hops=[1, 2, 3], vehicle=(1,))
++        reordered = x.clone()
++        reordered[[0, 1, 2]] = x[[2, 0, 1]]
++        reordered[3:] = 77.
++        a = attention(query, x, valid)
++        b = attention(query, reordered, valid)
++        torch.testing.assert_close(a[0], b[0])
++        torch.testing.assert_close(a[1], b[1])
++
++    def test_modes_survive_checkpoints_and_v7_still_loads(self):
++        for mode in MODES:
++            model = ActorCritic.from_state_dict(RelayActorCritic(10, 2, mode).state_dict())
++            self.assertIsInstance(model, RelayActorCritic)
++            self.assertEqual(model.relay_attention, mode)
++        v7 = ActorCritic.from_state_dict(CooperativeActorCritic().state_dict())
++        self.assertNotIsInstance(v7, RelayActorCritic)
++
++    def test_features_ignore_device_names_and_require_the_cache(self):
++        model = RelayActorCritic().eval()
++        def features(name, origin):
++            nav = CooperativeNavigator(name, total_drones=3, model=model)
++            nav.cbf_margin_source = lambda: 2.
++            peers = {origin: [20., 0., 15.]}
++            row = dict(origin_id=origin, payload_type='drone_state', position=np.array([20., 0., 15.]),
++                       velocity=np.zeros(3), goal=None, age=2., hop=1, time_unknown=False, sigma=.5)
++            remote = dict(row, origin_id='far_'+origin, position=np.array([150., 10., 15.]), age=4., hop=2)
++            obs = dict(time=0., graph=None, nearby_drones={}, ground_robots={}, occupancy_map=np.zeros((12, 12)),
++                       cooperation=dict(peers=peers, velocities={origin: np.zeros(3)}, ground=None,
++                                        required=(origin,)), relay=[row, remote])
++            return nav.encode([0., 0., 15.], obs)[0]
++        x = features('device', 'peer')
++        np.testing.assert_array_equal(x, features('other_name', 'renamed_peer'))
++        self.assertEqual(x.shape, (RAW_WIDTH,))
++        tokens = x[V7_WIDTH:V7_WIDTH+RELAY_TOKENS*RELAY_FEATURES].reshape(RELAY_TOKENS, RELAY_FEATURES)
++        self.assertEqual(tokens[:2, 12].tolist(), [1., 0.])  # sensed one hop vs remote
++        self.assertEqual(x[-RELAY_TOKENS:].sum(), 2.)
++        nav = CooperativeNavigator('d', total_drones=3, model=model)
++        nav.cbf_margin_source = lambda: 2.
++        with self.assertRaises(KeyError):
++            nav.encode([0., 0., 15.], dict(time=0., graph=None, nearby_drones={}, ground_robots={},
++                occupancy_map=np.zeros((12, 12)), cooperation=dict(peers={}, velocities={}, ground=None, required=())))
++
++
++class RelayIntegrationTests(unittest.TestCase):
++    def setUp(self):
++        torch.manual_seed(12)
++        torch.set_num_threads(1)
++
++    def test_remote_state_reaches_far_drone_over_two_hops(self):
++        with contextlib.redirect_stdout(io.StringIO()):
++            env = Experiment(20000, RelayActorCritic(), communication_mode='backbone', safety_filter='cbf')
++            # drone_1 beside the vehicle, drone_2 in the middle, drone_0 out of
++            # radio range of both drone_1 and the vehicle.
++            for drone, p in zip(env.env.drones, ([115, 115, 15], [5, 5, 15], [60, 60, 15])):
++                drone.position = np.array(p, float)
++            env.obs = env.env._get_observations()
++            far = env.ids[0]
++            self.assertEqual({n['id'] for n in env.obs[far]['neighbors']}, {env.ids[2]})
++            for frame in range(6):
++                _, _, metrics = env.step(frame)
++                self.assertEqual(metrics['backbone_connected'], 1.)
++        tokens = {row['origin_id']: row for row in env.controllers[0].relay.tokens(5.)}
++        self.assertEqual(tokens['drone_1']['hop'], 2)
++        self.assertEqual(tokens['ground_0']['hop'], 2)
++        self.assertGreaterEqual(tokens['drone_1']['age'], 2.)
++        self.assertGreater(metrics['relay_remote_fraction'], 0.)
++        self.assertEqual(metrics['relay_max_hop'], 2.)
++
++    def test_ideal_relay_degenerates_to_one_step_per_hop(self):
++        with contextlib.redirect_stdout(io.StringIO()):
++            env = Experiment(20000, RelayActorCritic(), communication_mode='backbone', safety_filter='cbf')
++            for frame in range(3):
++                env.step(frame)
++        for controller in env.controllers:
++            for row in controller.relay.tokens(2.):  # last decision time
++                self.assertEqual(row['age'], float(row['hop']))
++        self.assertEqual(env.relay_channel.stats['lost'], 0)
++
++
++class RelayConfigTests(unittest.TestCase):
++    def test_version_contract_and_relay_fields_are_explicit(self):
++        c = validate_config(config())
++        self.assertEqual(feature_version(c), 8)
++        self.assertIsInstance(make_model(c), RelayActorCritic)
++        for changes in (dict(drop=.1), dict(communication_mode='chain'), dict(relay_loss=1.),
++                        dict(relay_delay_jitter=-1), dict(relay_period=0), dict(relay_capacity=1.5),
++                        dict(relay_attention='mean')):
++            with self.assertRaises(ValueError):
++                validate_config(dict(c, **changes))
++        v7 = json.loads((Path(__file__).resolve().parents[2]/'config/algorithm/mappo_training_v7.json').read_text())
++        self.assertEqual(feature_version(validate_config(v7)), 7)
++        with self.assertRaises(ValueError):
++            validate_config(dict(v7, relay_loss=.1))
++        with self.assertRaises(ValueError):
++            Experiment(1, CooperativeActorCritic(), communication_mode='backbone', relay_loss=.1)
++
++    def test_real_training_checkpoint_validation_and_resume(self):
++        c = config()
++        c.update(episodes=2, steps=5, episodes_per_batch=2, validation_interval=2, snapshot_interval=2,
++                 validation_seeds=[60000], validation_samples=1, ppo_epochs=1, critic_epochs=1,
++                 relay_attention='hop')
++        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
++            train(c, directory, workers=1)
++            path = Path(directory)
++            saved = torch.load(path/'latest.pt', weights_only=True)
++            self.assertEqual(saved['feature_version'], 8)
++            model = ActorCritic.from_state_dict(saved['model'])
++            self.assertIsInstance(model, RelayActorCritic)
++            self.assertEqual(model.relay_attention, 'hop')
++            episode, summary = run_episode(model, validate_config(c), 50000, fixed_schedule(c, 0), True)
++            self.assertEqual(episode[0][0].shape, (3, RAW_WIDTH))
++            self.assertTrue(all(np.isfinite(row[0]).all() for row in episode))
++            self.assertIn('relay_packets_delivered', summary)
++            validation = json.loads((path/'validation.jsonl').read_text().splitlines()[-1])
++            self.assertIn('relay_age_s', validation['means'])
++            train(c, directory, resume=True, workers=1)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff -ruN a/src/teamed-planning/scripts/simulator/train_mappo.py b/src/teamed-planning/scripts/simulator/train_mappo.py
+--- a/src/teamed-planning/scripts/simulator/train_mappo.py	2026-10-28 12:56:23.340218405 +0800
++++ b/src/teamed-planning/scripts/simulator/train_mappo.py	2026-10-28 12:56:23.358218524 +0800
+@@ -95,7 +95,14 @@
+     # per PPO batch (None: one per worker, cut at snapshot/validation episodes).
+     actor_input_version=1,episodes_per_batch=None,
+     surprise_weight=0.,surprise_weight_final=0.,surprise_clip=3.,
+-    surprise_episode_budget=5.,surprise_learning_rate=3e-4,surprise_epochs=1)
++    surprise_episode_budget=5.,surprise_learning_rate=3e-4,surprise_epochs=1,
++    # v8 relayed state evidence: per-link loss, extra delay jitter (steps beyond
++    # the minimum one), send period (steps), entries per envelope, and the
++    # attention ablation (full=v8-D, age=v8-A, hop=v8-B, softmax=v8-C).
++    relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,relay_attention='full')
++
++COOPERATIVE_ARCHITECTURES=('gat_cooperative_v7','gat_relay_attention_v8')
++GRAPH_ARCHITECTURES=('gat_map_v1',)+COOPERATIVE_ARCHITECTURES
+ 
+ OPTIMIZER_CONFIG_FIELDS={'rollout_mode','ppo_target_kl','ppo_max_kl','ppo_max_backtracks',
+                          'critic_epochs','critic_minibatch_size','value_normalization'}
+@@ -125,13 +132,13 @@
+     if unknown:
+         raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
+     config = dict(DEFAULTS, **config)
+-    if config['policy_architecture'] not in ('mlp','gat_map_v1','gat_cooperative_v7'):
++    if config['policy_architecture'] not in ('mlp',)+GRAPH_ARCHITECTURES:
+         raise ValueError('Unknown policy_architecture')
+-    if config['policy_architecture'] in ('gat_map_v1','gat_cooperative_v7') and (config['action_mode']!='velocity'
++    if config['policy_architecture'] in GRAPH_ARCHITECTURES and (config['action_mode']!='velocity'
+             or config['rollout_mode']!='synchronous' or not config['critic_epochs']
+             or not config['value_normalization']):
+         raise ValueError('Map GAT requires synchronous velocity policy and separate PopArt critic')
+-    if config['policy_architecture'] in ('gat_map_v1','gat_cooperative_v7') and any(n>16 for n in config['fleet_sizes']):
++    if config['policy_architecture'] in GRAPH_ARCHITECTURES and any(n>16 for n in config['fleet_sizes']):
+         raise ValueError('Graph critic batches support at most 16 agents')
+     if config['actor_input_version'] not in (1,2) or isinstance(config['actor_input_version'],bool):
+         raise ValueError('actor_input_version must be 1 or 2')
+@@ -210,11 +217,23 @@
+             raise ValueError('Reward and entropy coefficients must be nonnegative')
+     if config['learning_rate'] <= 0:
+         raise ValueError('learning_rate must be positive')
+-    cooperative = config['policy_architecture']=='gat_cooperative_v7'
++    cooperative = config['policy_architecture'] in COOPERATIVE_ARCHITECTURES
+     if config['communication_mode'] != ('backbone' if cooperative else 'chain') or config['safety_filter'] != 'cbf':
+         raise ValueError('Training requires CBF and matching chain/v7 backbone communication')
+     if cooperative and (config['actor_input_version']!=2 or config['drop']!=0.):
+-        raise ValueError('v7 requires input 2 and complete synchronous neighbor geometry (drop=0)')
++        raise ValueError('v7/v8 require input 2 and complete synchronous neighbor geometry (drop=0)')
++    relay={k:config[k] for k in ('relay_loss','relay_delay_jitter','relay_period','relay_capacity','relay_attention')}
++    if config['policy_architecture']!='gat_relay_attention_v8':
++        if relay!={k:DEFAULTS[k] for k in relay}:
++            raise ValueError('relay_* fields require policy_architecture gat_relay_attention_v8')
++    elif (isinstance(relay['relay_loss'],bool) or not isinstance(relay['relay_loss'],(int,float))
++            or not 0<=relay['relay_loss']<1
++            or any(type(relay[k]) is not int for k in ('relay_delay_jitter','relay_period','relay_capacity'))
++            or not 0<=relay['relay_delay_jitter']<=10 or not 1<=relay['relay_period']<=10
++            or not 1<=relay['relay_capacity']<=64
++            or relay['relay_attention'] not in ('full','age','hop','softmax')):
++        raise ValueError('v8 relay: loss in [0,1), jitter 0..10, period 1..10, capacity 1..64 '
++                         'steps/entries, attention full/age/hop/softmax')
+     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
+         raise ValueError('Safety penalty weights must be nonnegative')
+     if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
+@@ -345,7 +364,9 @@
+ 
+ 
+ def feature_version(config):
+-    """Feature contract: 1 candidate, 2/5 velocity MLP, 4/6 map GAT, 7 cooperative GAT."""
++    """Feature contract: 1 candidate, 2/5 velocity MLP, 4/6 map GAT, 7 cooperative GAT, 8 relay attention."""
++    if config['policy_architecture']=='gat_relay_attention_v8':
++        return 8
+     if config['policy_architecture']=='gat_cooperative_v7':
+         return 7
+     if config['action_mode']!='velocity':
+@@ -357,6 +378,9 @@
+ 
+ 
+ def make_model(config):
++    if config['policy_architecture']=='gat_relay_attention_v8':
++        from drone.relay_attention_mappo import RelayActorCritic
++        return RelayActorCritic(GLOBAL_FEATURES,config['actor_input_version'],config['relay_attention'])
+     if config['policy_architecture']=='gat_cooperative_v7':
+         from drone.cooperative_mappo import CooperativeActorCritic
+         return CooperativeActorCritic(GLOBAL_FEATURES,config['actor_input_version'])
+@@ -376,7 +400,8 @@
+ 
+ 
+ def reward_contract(config):
+-    if config['policy_architecture']=='gat_cooperative_v7':
++    # v8 changes observations/transport only; its reward is v7's unchanged.
++    if config['policy_architecture'] in COOPERATIVE_ARCHITECTURES:
+         return 'uav_mapping_route_quality_and_backbone_v7'+('_surprise' if config['surprise_weight'] else '')
+     if config['reward_mode']!='velocity_mapping':
+         return config['reward_mode']
+@@ -443,6 +468,8 @@
+             frontier_progress_weight=config['frontier_progress_weight'],
+             chain_ground_range=config['chain_ground_range'],
+             chain_link_range=config['chain_link_range'],
++            relay_loss=config['relay_loss'],relay_delay_jitter=config['relay_delay_jitter'],
++            relay_period=config['relay_period'],relay_capacity=config['relay_capacity'],
+             num_drones=config['fleet_sizes'][scene_seed % len(config['fleet_sizes'])],**options)
+         rollout=[];reason='budget';stable=0;max_link=0.;bonus=0.;quality_bonus=0.
+         encoder=TaskMapEncoder(env) if config.get('surprise_weight',0.) else None

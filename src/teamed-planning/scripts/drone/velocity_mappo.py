@@ -124,6 +124,9 @@ class VelocityNavigator(DroneNavigator):
         obs = legal_observation(observation)
         if hasattr(self, 'cooperation_features'):
             obs['cooperation'] = observation['cooperation']
+            if 'relay' in observation:
+                # v8: decision-time snapshot of this device's own relay cache.
+                obs['relay'] = observation['relay']
         self.chain.update(obs)
         p = np.asarray(position, float)
         version = getattr(self.model, 'input_version', 1)

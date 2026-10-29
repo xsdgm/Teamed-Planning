@@ -1,0 +1,221 @@
+% Four-slide advisor report. Build: tectonic vtemp.tex (or xelatex twice).
+% v7 is implemented in simulation; v8 and vtemp remain proposals.
+\documentclass[aspectratio=169,10pt]{beamer}
+\geometry{paperwidth=180mm,paperheight=101.25mm}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setmainfont{DejaVu Sans}
+\setsansfont{DejaVu Sans}
+\setCJKmainfont{Noto Sans CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+\usepackage{amsmath,amssymb,booktabs,tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\definecolor{navy}{HTML}{172C46}
+\definecolor{teal}{HTML}{007F86}
+\definecolor{orange}{HTML}{C36B24}
+\definecolor{paper}{HTML}{F1F5F8}
+\setbeamercolor{normal text}{fg=navy,bg=white}
+\setbeamercolor{frametitle}{fg=navy,bg=white}
+\setbeamercolor{structure}{fg=teal}
+\setbeamercolor{block title}{fg=white,bg=teal}
+\setbeamercolor{block body}{fg=navy,bg=paper}
+\setbeamerfont{frametitle}{size=\Large,series=\bfseries}
+\setbeamerfont{block title}{size=\small,series=\bfseries}
+\setbeamerfont{block body}{size=\small}
+\setbeamertemplate{navigation symbols}{}
+\setbeamersize{text margin left=7mm,text margin right=7mm}
+\setbeamertemplate{footline}{\hspace{7mm}\textcolor{teal}{\scriptsize vtemp · 面向车机协同的分层图注意力 MAPPO}\hfill
+  \textcolor{navy}{\scriptsize 方案汇报 · 2026.10.27\quad\insertframenumber/4}\hspace{7mm}\vspace{3mm}}
+\setbeamertemplate{itemize item}{\color{teal}\scriptsize$\bullet$}
+\setlength{\parskip}{1pt}
+\let\reportSmall\small
+\renewcommand{\small}{\reportSmall
+  \setlength{\abovedisplayskip}{4pt}\setlength{\belowdisplayskip}{4pt}
+  \setlength{\abovedisplayshortskip}{3pt}\setlength{\belowdisplayshortskip}{3pt}}
+\newcommand{\tagline}[1]{{\small\color{teal}#1}\par\vspace{2mm}}
+\newcommand{\notefoot}[1]{{\fontsize{6.8}{8}\selectfont\color{navy!75}#1\par}}
+\title{vtemp：面向车机协同的分层图注意力 MAPPO}
+\author{算法方案汇报}
+\date{2026年10月27日}
+
+\begin{document}
+
+\begin{frame}[t]{01\quad 问题与全流程：围绕当前路段自主形成协作}
+\tagline{目标：车辆行驶到最终目的地；无人机共同探索通路，并将有用地图经中继送达车辆。}
+\begin{columns}[T,onlytextwidth]
+\column{.51\textwidth}
+\begin{tikzpicture}[x=1cm,y=1cm,>=Stealth,font=\scriptsize]
+  \fill[paper,rounded corners] (-.25,-.35) rectangle (7.1,3.15);
+  \node[draw=navy,fill=white,rounded corners,minimum width=8mm] (g) at (.45,.55) {车辆};
+  \node[circle,fill=teal,text=white,inner sep=3pt] (a) at (1.9,1.1) {U};
+  \node[circle,fill=teal,text=white,inner sep=3pt] (b) at (3.5,1.4) {U};
+  \node[circle,fill=orange,text=white,inner sep=3pt] (c) at (5.15,1.) {U};
+  \node[draw=orange,fill=white,rounded corners] (q) at (5.7,.05) {$q_k$};
+  \node[draw=navy,dashed,rounded corners] (f) at (6.4,2.6) {$g_\star$};
+  \draw[teal,line width=1.2pt,<->] (g)--(a);
+  \draw[teal,line width=1.2pt,<->] (a)--(b);
+  \draw[teal,line width=1.2pt,<->] (b)--(c);
+  \draw[orange,->,dashed] (c)--(q);
+  \draw[navy,->,dashed] (q) to[bend right=20] (f);
+  \draw[navy!55,->] (.5,.25) to[bend right=15] (5.2,-.08);
+  \node[align=center] at (2.1,2.45) {近端／中间无人机\\维护通信、转发地图};
+  \node[align=center,text=orange] at (5.,1.85) {远端探索\\角色随状态改变};
+\end{tikzpicture}\par\medskip
+\small
+\textbf{学习对象：}共享策略输出各机水平速度；不把编号映射为“中继机”或“探索机”。\par
+\textbf{任务定义：}RL 负责无人机协作建图，保障\textbf{车辆当前位置到临时目标 $q_k$} 的导航；车辆仍由图规划器与跟踪控制器驾驶。
+
+\column{.46\textwidth}
+\begin{block}{慢层：滚动任务管理}
+车辆自己的融合图 + 最终目标 $g_\star$\par
+$\longrightarrow$ 选择 $q_k$、发布 goal\_epoch\par
+$\longrightarrow$ 到达／停滞后更新路段
+\end{block}
+\begin{block}{快层：分散策略与通信}
+每机局部传感器 + 本机地图 + 收到的队友消息\par
+$\longrightarrow$ 地图 GAT + 时效／跳数注意力\par
+$\longrightarrow$ 共享 Actor $\longrightarrow$ CBF $\longrightarrow$ 飞行
+\end{block}
+\begin{block}{闭环：信息必须真正送达}
+观测、增量地图、多跳转发 $\longrightarrow$ 车辆地图\par
+$\longrightarrow$ 规划／跟踪 $\longrightarrow$ 更新下一临时目标
+\end{block}
+\end{columns}
+\vspace{1mm}
+\notefoot{版本关系：v7 已实现仿真中的动态通信骨架与邻机注意力；v8 增加异步信息建模（方案）；vtemp 在 v8 上加入滚动目标（方案）。图中角色为行为示意，并非训练结果。}
+\end{frame}
+
+\begin{frame}[t]{02\quad 每机信息编码：相关性与新鲜度分别建模}
+\tagline{本机拥有的是接收时刻不同、覆盖不完整的局部知识；转发消息不等于当前物理邻居。}
+\begin{columns}[T,onlytextwidth]
+\column{.47\textwidth}
+\begin{block}{三个输入分支}
+\small
+\textbf{自身：}位置／速度、局部感知、当前目标、CBF 余量。\par
+\textbf{导航图：}已观测节点和通行边，经局部 GAT 编码；未知处不补成已知。\par
+\textbf{消息图：}直达与多跳队友状态／意图，携带源时间、序列号、跳数与不确定性。
+\end{block}
+\begin{tikzpicture}[x=1cm,y=1cm,>=Stealth,font=\scriptsize]
+  \node[draw=teal,rounded corners] (k) at (.35,.7) {远端 $k$};
+  \node[draw=teal,rounded corners] (j) at (2.6,.7) {邻机 $j$};
+  \node[draw=teal,fill=paper,rounded corners] (i) at (5.,.7) {本机 $i$};
+  \draw[->,teal] (k)--node[above] {第 1 跳}(j);
+  \draw[->,teal] (j)--node[above] {第 2 跳}(i);
+  \node[align=left,anchor=west] at (0,-.05) {$k$ 的源时间不变；$h=2$，年龄累积\\$j$ 自身状态另成条目：$h=1$，独立测量时间};
+\end{tikzpicture}\par\medskip
+\small
+同源证据去重；转发不刷新年龄、不重复增加置信度。动态状态与静态地图使用不同衰减尺度。
+
+\column{.50\textwidth}
+\small
+消息 $e$：年龄 $\Delta t_e$，跳数 $h_e$，协方差 $\Sigma_e$。
+\[
+ z_e=[x_e,\operatorname{TimeEnc}(\Delta t_e),\log(1+h_e),\Sigma_e]
+\]
+\[
+ \ell_{ie}=q_i^\top k_e/\sqrt d
+ -a\Delta t_e/\tau-b\log(1+h_e),\quad a,b\geq0
+\]
+\[
+ \alpha_{ie}=\operatorname{masked\ softmax}_e(\ell_{ie})
+\]
+\[
+ \rho_e=\mathbf1_{\rm valid}\exp\!\left[-\Delta t_e/\tau
+ -\lambda_h(h_e-1)-\lambda_\Sigma\operatorname{tr}\Sigma_e\right]
+\]
+\[
+ \boxed{c_i=\sum_e\alpha_{ie}\rho_e v_e}
+\]
+\textbf{为什么需要 $\rho$？}单个旧消息的 softmax 仍为 1；所有消息都旧时也不能表现为充分可信。门控后不再次归一化。\par
+过期／未知／旧任务版本先屏蔽；全空时 $c_i=0$ 并显式标记缺失。时间误差进入不确定性。
+\end{columns}
+\vspace{1mm}
+\notefoot{本页为拟议 v8 编码器；年龄与跳数可能相关，需做消融。时间编码参考 TGAT（Xu et al., ICLR 2020, arXiv:2002.07962）；跳数与绝对门控是本方案待验证设计。}
+\end{frame}
+
+\begin{frame}[t]{03\quad 策略、团队奖励与安全：让协作成为共同收益}
+\tagline{集中训练、分散执行（CTDE）；安全骨架由几何／协议约束维护，协作移动由策略学习。}
+\begin{columns}[T,onlytextwidth]
+\column{.49\textwidth}
+\begin{block}{共享 Actor + 集中 Critic}
+\small
+$o_i$ 为本机合法观测，$c_i$ 为消息上下文：
+\[
+ a_i\sim\pi_\theta(\cdot\mid o_i,c_i),\qquad
+ u_i^{\rm nom}=v_{\max}\frac{a_i}{\sqrt{1+\|a_i\|^2}}.
+\]
+Critic 集中估值；执行仅需各机 Actor。\par
+PPO：同步采样，GAE 团队优势与 clip 更新；记录 CBF 前 latent 的 log-probability。独立价值网络采用 PopArt。
+\end{block}
+\small
+\textbf{团队奖励（完整组成）：}
+\[
+ r_t=w_1\Delta\Phi_{\rm delivered}+w_2\Delta Q_{\rm route}
+ +r_{\rm success}+r_{\rm novelty}-c_t
+\]
+\[
+ c_t=c_{\rm time}+c_{\rm CBF}+c_{\rm infeasible}
+\]
+收益来自\textbf{车辆实际收到}的地图与任务进度；探索与中继共享收益。惊讶度仅作有预算上限的训练辅助。
+
+\column{.48\textwidth}
+\begin{block}{v7 已实现的几何安全骨架}
+\small
+对当前邻机 $j$，若不存在 $k$ 使
+\[
+ \max(d_{ik},d_{jk})<d_{ij},
+\]
+则保留 $ij$；RNG 随几何重选，车辆也作为节点。完整同步观测下保持连通。
+\end{block}
+\small
+CBF 求最接近名义速度的可行动作：
+\[
+ u_i^*=\arg\min_u\|u-u_i^{\rm nom}\|^2
+\]
+约束：采样周期内避碰、骨架链路距离、速度与边界；无解显式终止。
+\begin{block}{v8 / vtemp 的延迟边界}
+\small
+延迟状态只作策略上下文。一跳测量也延迟时：扩张误差集合，确认新边再释放旧边；重新验证 CBF 可行性及连通性。
+\end{block}
+\end{columns}
+\notefoot{Actor 仅消费已到达消息，训练保留逐跳延迟／丢包／乱序。MAPPO：Yu et al., NeurIPS 2022, arXiv:2103.01955。}
+\end{frame}
+
+\begin{frame}[t]{04\quad 滚动临时目标：将远距离任务闭环分解为可推进路段}
+\tagline{最终目标固定，当前目标滚动；车辆实际行驶与通信能力共同决定何时向前推进。}
+\begin{columns}[T,onlytextwidth]
+\column{.51\textwidth}
+\small
+\textbf{慢层候选：}车辆局部融合图上的可达节点／已知自由区域边界；结合最终目标方向与保守通信预算筛选。未知候选只能作为探索方向，不能让车辆盲行。
+\[
+ q_k=\arg\min_{q\in\mathcal C_k}
+ \left[\hat d(p_g,q)+\lambda\|q-g_\star\|
+ +\mu U(q)+\nu C(q)\right]
+\]
+$U$：未知风险；$C$：通信成本。$N R$ 仅是理想几何量级，不是可靠通信距离保证。
+\begin{block}{目标生命周期与交接}
+\small
+选择 $q_k$、增加 goal\_epoch $\rightarrow$ 广播／确认\par
+$\rightarrow$ 无人机协作建图，车辆规划并跟踪\par
+$\rightarrow$ 到达且链路稳定：前移 $q_{k+1}$\par
+$\rightarrow$ 停滞／超时／断链：缩短、回退或重选
+\end{block}
+\small
+切换时重建当前路段的势函数基准；不把目标跳变记为进展，不清空整任务探索奖励预算。\textbf{临时目标完成不等于最终任务成功。}
+
+\column{.46\textwidth}
+\begin{block}{必须验证的四类现象}
+\small
+\textbf{自主分工：}交换编号／初始位置，职责随几何与任务改变；移除实际中继后远端送达受影响。\par
+\textbf{异步鲁棒：}对比无时效、仅年龄、仅跳数、无门控、完整方案。\par
+\textbf{长程推进：}比较无中间目标／固定间距／滚动目标；检查回退与目标版本一致性。\par
+\textbf{任务指标：}最终到达率、成图时间、证据年龄与送达率、断连时间、CBF 无解率、路径代价。
+\end{block}
+\small
+\textbf{工程接入条件：}ROS 增加源时间、序列号、跳数及去重转发；确认实际无线多跳能力、公共坐标与时钟误差，再做硬件在环测试。\par
+\textcolor{orange}{当前证据仅支持 v7 实现与回归验证；v8、vtemp 尚无性能或实飞结论。}
+\end{columns}
+\vspace{1mm}
+\notefoot{设计意图：强化学习负责每一当前路段的车机协作保障；车辆路径规划与跟踪是独立执行层。现有 SubgoalManager 可复用到达、停滞和回退逻辑，但尚未将本页完整设计接入训练。}
+\end{frame}
+\end{document}

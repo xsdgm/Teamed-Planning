@@ -76,6 +76,9 @@ class DroneController:
         self.safety_filter=safety_filter or 'legacy'
         self.safety_stats={}
         self.communication_mode=communication_mode or 'direct'
+        # v8 relay cache (drone/relay_cache.py); the transport layer supplies
+        # delivered envelopes as observation['relay_envelopes'].
+        self.relay=None
         from drone.chain_state import ChainState
         self._chain_state=ChainState(drone_id,total_drones if self.communication_mode=='chain' else 1)
 
@@ -446,6 +449,13 @@ class DroneController:
             required = relative_neighborhood(self.position, visible, self.communication_range)
             self.navigator.required_links = required
             nav_obs['cooperation'] = dict(peers=peers, velocities=velocities, ground=ground, required=required)
+        if self.relay is not None:
+            # Only envelopes that actually arrived by now; never neighbor broadcasts.
+            for envelope in simulator_obs.get('relay_envelopes', ()):
+                self.relay.receive(envelope, current_time)
+            self.relay.originate(current_time, 'drone_state', self.position,
+                                 simulator_obs['self'].get('velocity'))
+            nav_obs['relay'] = self.relay.tokens(current_time)
         
         # Step 6: Compute navigation target
         with self.timer.measure("navigation"):

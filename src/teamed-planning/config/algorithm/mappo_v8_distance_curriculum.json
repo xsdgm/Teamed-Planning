@@ -1,0 +1,20 @@
+{
+  "base_config": "mappo_training_v8.json",
+  "inner_radius_m": 100.0,
+  "outer_stage_bounds_m": [
+    400.0,
+    500.0,
+    600.0,
+    750.0
+  ],
+  "episodes_per_stage": 800,
+  "evaluation_seeds": [
+    61000,
+    61001,
+    61002,
+    61003,
+    61004,
+    61005
+  ],
+  "evaluation_samples": 4
+}

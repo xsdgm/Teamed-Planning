@@ -95,7 +95,14 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     # per PPO batch (None: one per worker, cut at snapshot/validation episodes).
     actor_input_version=1,episodes_per_batch=None,
     surprise_weight=0.,surprise_weight_final=0.,surprise_clip=3.,
-    surprise_episode_budget=5.,surprise_learning_rate=3e-4,surprise_epochs=1)
+    surprise_episode_budget=5.,surprise_learning_rate=3e-4,surprise_epochs=1,
+    # v8 relayed state evidence: per-link loss, extra delay jitter (steps beyond
+    # the minimum one), send period (steps), entries per envelope, and the
+    # attention ablation (full=v8-D, age=v8-A, hop=v8-B, softmax=v8-C).
+    relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,relay_attention='full')
+
+COOPERATIVE_ARCHITECTURES=('gat_cooperative_v7','gat_relay_attention_v8')
+GRAPH_ARCHITECTURES=('gat_map_v1',)+COOPERATIVE_ARCHITECTURES
 
 OPTIMIZER_CONFIG_FIELDS={'rollout_mode','ppo_target_kl','ppo_max_kl','ppo_max_backtracks',
                          'critic_epochs','critic_minibatch_size','value_normalization'}
@@ -125,13 +132,13 @@ def validate_config(config):
     if unknown:
         raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
     config = dict(DEFAULTS, **config)
-    if config['policy_architecture'] not in ('mlp','gat_map_v1','gat_cooperative_v7'):
+    if config['policy_architecture'] not in ('mlp',)+GRAPH_ARCHITECTURES:
         raise ValueError('Unknown policy_architecture')
-    if config['policy_architecture'] in ('gat_map_v1','gat_cooperative_v7') and (config['action_mode']!='velocity'
+    if config['policy_architecture'] in GRAPH_ARCHITECTURES and (config['action_mode']!='velocity'
             or config['rollout_mode']!='synchronous' or not config['critic_epochs']
             or not config['value_normalization']):
         raise ValueError('Map GAT requires synchronous velocity policy and separate PopArt critic')
-    if config['policy_architecture'] in ('gat_map_v1','gat_cooperative_v7') and any(n>16 for n in config['fleet_sizes']):
+    if config['policy_architecture'] in GRAPH_ARCHITECTURES and any(n>16 for n in config['fleet_sizes']):
         raise ValueError('Graph critic batches support at most 16 agents')
     if config['actor_input_version'] not in (1,2) or isinstance(config['actor_input_version'],bool):
         raise ValueError('actor_input_version must be 1 or 2')
@@ -210,11 +217,23 @@ def validate_config(config):
             raise ValueError('Reward and entropy coefficients must be nonnegative')
     if config['learning_rate'] <= 0:
         raise ValueError('learning_rate must be positive')
-    cooperative = config['policy_architecture']=='gat_cooperative_v7'
+    cooperative = config['policy_architecture'] in COOPERATIVE_ARCHITECTURES
     if config['communication_mode'] != ('backbone' if cooperative else 'chain') or config['safety_filter'] != 'cbf':
         raise ValueError('Training requires CBF and matching chain/v7 backbone communication')
     if cooperative and (config['actor_input_version']!=2 or config['drop']!=0.):
-        raise ValueError('v7 requires input 2 and complete synchronous neighbor geometry (drop=0)')
+        raise ValueError('v7/v8 require input 2 and complete synchronous neighbor geometry (drop=0)')
+    relay={k:config[k] for k in ('relay_loss','relay_delay_jitter','relay_period','relay_capacity','relay_attention')}
+    if config['policy_architecture']!='gat_relay_attention_v8':
+        if relay!={k:DEFAULTS[k] for k in relay}:
+            raise ValueError('relay_* fields require policy_architecture gat_relay_attention_v8')
+    elif (isinstance(relay['relay_loss'],bool) or not isinstance(relay['relay_loss'],(int,float))
+            or not 0<=relay['relay_loss']<1
+            or any(type(relay[k]) is not int for k in ('relay_delay_jitter','relay_period','relay_capacity'))
+            or not 0<=relay['relay_delay_jitter']<=10 or not 1<=relay['relay_period']<=10
+            or not 1<=relay['relay_capacity']<=64
+            or relay['relay_attention'] not in ('full','age','hop','softmax')):
+        raise ValueError('v8 relay: loss in [0,1), jitter 0..10, period 1..10, capacity 1..64 '
+                         'steps/entries, attention full/age/hop/softmax')
     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
         raise ValueError('Safety penalty weights must be nonnegative')
     if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
@@ -345,7 +364,9 @@ def validate_config(config):
 
 
 def feature_version(config):
-    """Feature contract: 1 candidate, 2/5 velocity MLP, 4/6 map GAT, 7 cooperative GAT."""
+    """Feature contract: 1 candidate, 2/5 velocity MLP, 4/6 map GAT, 7 cooperative GAT, 8 relay attention."""
+    if config['policy_architecture']=='gat_relay_attention_v8':
+        return 8
     if config['policy_architecture']=='gat_cooperative_v7':
         return 7
     if config['action_mode']!='velocity':
@@ -357,6 +378,9 @@ def feature_version(config):
 
 
 def make_model(config):
+    if config['policy_architecture']=='gat_relay_attention_v8':
+        from drone.relay_attention_mappo import RelayActorCritic
+        return RelayActorCritic(GLOBAL_FEATURES,config['actor_input_version'],config['relay_attention'])
     if config['policy_architecture']=='gat_cooperative_v7':
         from drone.cooperative_mappo import CooperativeActorCritic
         return CooperativeActorCritic(GLOBAL_FEATURES,config['actor_input_version'])
@@ -376,7 +400,8 @@ def optimizer_contract(config):
 
 
 def reward_contract(config):
-    if config['policy_architecture']=='gat_cooperative_v7':
+    # v8 changes observations/transport only; its reward is v7's unchanged.
+    if config['policy_architecture'] in COOPERATIVE_ARCHITECTURES:
         return 'uav_mapping_route_quality_and_backbone_v7'+('_surprise' if config['surprise_weight'] else '')
     if config['reward_mode']!='velocity_mapping':
         return config['reward_mode']
@@ -443,6 +468,8 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             frontier_progress_weight=config['frontier_progress_weight'],
             chain_ground_range=config['chain_ground_range'],
             chain_link_range=config['chain_link_range'],
+            relay_loss=config['relay_loss'],relay_delay_jitter=config['relay_delay_jitter'],
+            relay_period=config['relay_period'],relay_capacity=config['relay_capacity'],
             num_drones=config['fleet_sizes'][scene_seed % len(config['fleet_sizes'])],**options)
         rollout=[];reason='budget';stable=0;max_link=0.;bonus=0.;quality_bonus=0.
         encoder=TaskMapEncoder(env) if config.get('surprise_weight',0.) else None

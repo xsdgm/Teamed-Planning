@@ -21,10 +21,17 @@ from ground.ground_main import GroundRobotController
 from simulator.scenarios import generate_scene, ENVIRONMENT_VERSION
 from simulator.navigation_metrics import task_graph_metrics, RouteQualityTracker
 from simulator.ppo_batch import clip_gradients
+from simulator.relay_channel import RelayChannel
+from drone.relay_cache import RelayManager
 
 
 COMMUNICATION_RANGE_M = 95.
 FLIGHT_HEIGHT_M = 15.
+COOPERATIVE_ARCHITECTURES = ('gat_cooperative_v7', 'gat_relay_attention_v8')
+RELAY_DEFAULTS = dict(relay_loss=0., relay_delay_jitter=0, relay_period=1, relay_capacity=16)
+# Per-step relay diagnostics (v8); evaluator truth is used only for the error.
+RELAY_STEP_METRICS = ('relay_token_count', 'relay_vehicle_known', 'relay_remote_fraction',
+                      'relay_age_s', 'relay_max_hop', 'relay_position_error_m')
 
 
 def navigation_cost(graph, start, goal):
@@ -212,7 +219,8 @@ class Experiment:
                  num_drones=3,chain_soft_ratio=.85,chain_risk_weight=0.,
                  chain_outward_weight=0.,chain_missing_weight=0.,
                  path_quality_weight=0.,route_reference_length=None,mapping_until_connected=False,
-                 cbf_margin_weight=0.,cbf_margin_scale=8.,frontier_progress_weight=0.):
+                 cbf_margin_weight=0.,cbf_margin_scale=8.,frontier_progress_weight=0.,
+                 relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16):
         if type(num_drones) is not int or num_drones < 2:
             raise ValueError('At least two drones are required for the chain experiment')
         if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
@@ -226,11 +234,22 @@ class Experiment:
         self.stop_on_ground_arrival=bool(stop_on_ground_arrival)
         self.rng = np.random.default_rng(seed)
         self.drop = drop
-        cooperative = getattr(model, 'policy_architecture', None)=='gat_cooperative_v7'
+        architecture = getattr(model, 'policy_architecture', None)
+        cooperative = architecture in COOPERATIVE_ARCHITECTURES
         if cooperative != (communication_mode=='backbone'):
-            raise ValueError('v7 cooperative model requires backbone communication and vice versa')
+            raise ValueError('v7/v8 cooperative models require backbone communication and vice versa')
         if cooperative and (drop!=0. or safety_filter!='cbf'):
             raise ValueError('v7 backbone requires synchronous complete geometry and CBF')
+        relay = dict(relay_loss=relay_loss,relay_delay_jitter=relay_delay_jitter,
+                     relay_period=relay_period,relay_capacity=relay_capacity)
+        # v8 delays/drops only relayed state evidence; one-hop geometry, maps
+        # and the CBF keep the v7 synchronous contract.
+        self.relay_channel=(RelayChannel(seed,relay_loss,relay_delay_jitter,relay_period)
+                            if architecture=='gat_relay_attention_v8' else None)
+        if self.relay_channel is None and relay!=RELAY_DEFAULTS:
+            raise ValueError('relay_* settings require the v8 relay attention policy')
+        if type(relay_capacity) is not int or relay_capacity<1:
+            raise ValueError('relay_capacity must be a positive integer')
         self.communication_mode=communication_mode
         self.safety_filter=safety_filter
         self.spacing_penalty_weight=spacing_penalty_weight
@@ -314,6 +333,8 @@ class Experiment:
                     algorithm=algorithm, deterministic=not stochastic)
             else:
                 c.navigator.fov_radius = 12.  # Same actual 24m sensor footprint.
+            if self.relay_channel is not None:
+                c.relay = RelayManager(c.drone_id, capacity=relay_capacity)
             self.controllers.append(c)
             # Surveyed world bounds are part of the simulator task contract.
             c.graph_builder.world_bounds = bounds
@@ -326,6 +347,9 @@ class Experiment:
             subgoal_arrival=subgoal_arrival,
             world_bounds=bounds)
         self.ground_controller.set_goal(tuple(self.goal))
+        # The vehicle only originates its own state/task evidence; it does not forward.
+        self.ground_relay=(RelayManager(self.ground_controller.robot_id, capacity=relay_capacity)
+                           if self.relay_channel is not None else None)
         self.subgoals=self.ground_controller.subgoals
         self.goal_reached=False
         self.ground_action=self._ground_action() if moving_ground else None
@@ -399,15 +423,27 @@ class Experiment:
         valid_counts, selected_distances, holds = [], [], []
         old = []
         interventions=[];observed_violations=[];infeasible=0;chain_terms=[];margins=[]
+        relay_rows=[]
+        if self.relay_channel is not None:
+            self._relay_vehicle(frame, actions[self.ground])
         for index,(rid,c) in enumerate(zip(self.ids,self.controllers)):
             received = dict(self.obs[rid])
             # Packet loss applies equally to all algorithms; no actor truth fields.
             received['neighbors'] = [n for n in received['neighbors']
                                      if self.rng.random() >= self.drop]
+            if self.relay_channel is not None:
+                received['relay_envelopes'] = self.relay_channel.deliver(rid, frame)
             old.append(np.asarray(received['self']['position']).copy())
             tic = time.perf_counter()
             action = c.get_action(received)
             decision_ms.append((time.perf_counter()-tic)*1000)
+            if self.relay_channel is not None:
+                now=float(received['full_state']['time'])
+                relay_rows.append((c.relay.tokens(now),{n['id'] for n in received['neighbors']}))
+                if self.relay_channel.due(rid, frame):
+                    # Sent now, readable no earlier than the next decision step.
+                    self.relay_channel.transmit(c.relay.outgoing(now),
+                        [n['id'] for n in received['neighbors'] if n['type']=='drone'], frame)
             target = c.navigator._current_target
             if target is not None and self.safety_filter!='cbf':
                 distance = np.linalg.norm(np.asarray(target)-old[-1])
@@ -620,6 +656,8 @@ class Experiment:
             hold_fraction=float(np.mean(holds)) if holds else 0.,
             selected_waypoint_distance=float(np.mean(selected_distances)) if selected_distances else 0.,
             zero_reward=float(abs(reward)<1e-8))
+        if self.relay_channel is not None:
+            metrics.update(self._relay_metrics(relay_rows, old, old_ground))
         if getattr(self.controllers[0].navigator, 'uses_velocity', False):
             metrics['nominal_speed_mean'] = float(np.mean([
                 np.linalg.norm(c.navigator.nominal_velocity) for c in self.controllers]))
@@ -627,6 +665,41 @@ class Experiment:
                 np.linalg.norm(actions[rid]['motion']) for rid in self.ids]))
         self.trace.append(dict(positions=current.tolist(),ground_position=ground_position.tolist(), **metrics))
         return samples, reward, metrics
+
+    def _relay_vehicle(self, frame, action):
+        """The vehicle wraps its own mission broadcast as vehicle_state evidence."""
+        own=self.obs[self.ground]['self']
+        message=action.get('broadcast') or {}
+        position=np.asarray(own['position'],float)
+        position=np.r_[position[:2],position[2] if len(position)>2 else 0.]
+        target=message.get('target')
+        now=float(message.get('timestamp',self.env.time))
+        self.ground_relay.originate(now,'vehicle_state',position,own.get('velocity'),
+                                    None if target is None else target[:2])
+        if self.relay_channel.due('ground',frame):
+            self.relay_channel.transmit(self.ground_relay.outgoing(now),
+                [n['id'] for n in self.obs[self.ground]['neighbors'] if n['type']=='drone'],frame)
+
+    def _relay_metrics(self, relay_rows, old, ground):
+        """Evaluator-only relay diagnostics; truth here never reaches an actor."""
+        truth={c.drone_id:np.asarray(p,float) for c,p in zip(self.controllers,old)}
+        truth[self.ground_controller.robot_id]=np.r_[np.asarray(ground,float)[:2],
+            np.asarray(ground,float)[2] if len(ground)>2 else 0.]
+        index={c.drone_id:rid for c,rid in zip(self.controllers,self.ids)}
+        rows=[row for tokens,_ in relay_rows for row in tokens]
+        drones=[(row,sensed) for tokens,sensed in relay_rows for row in tokens
+                if row['payload_type']=='drone_state']
+        errors=[np.linalg.norm(row['position'][:2]-truth[row['origin_id']][:2]) for row in rows
+                if row['origin_id'] in truth]
+        return dict(relay_token_count=float(np.mean([len(tokens) for tokens,_ in relay_rows])),
+            relay_vehicle_known=float(np.mean([any(r['payload_type']=='vehicle_state' for r in tokens)
+                                               for tokens,_ in relay_rows])),
+            # Teammate records whose origin is NOT a current one-hop neighbor.
+            relay_remote_fraction=float(np.mean([index.get(row['origin_id']) not in sensed
+                                                 for row,sensed in drones])) if drones else 0.,
+            relay_age_s=float(np.mean([row['age'] for row in rows])) if rows else 0.,
+            relay_max_hop=float(max((row['hop'] for row in rows),default=0)),
+            relay_position_error_m=float(np.mean(errors)) if errors else 0.)
 
     def summary(self):
         total = {k: float(sum(t[k] for t in self.trace)) for k in
@@ -682,6 +755,13 @@ class Experiment:
             total[key]=float(sum(t[key] for t in self.trace))
         total['min_separation']=float(min(t['min_separation'] for t in self.trace))
         total['cbf_intervention']=float(np.mean([t['cbf_intervention'] for t in self.trace]))
+        if self.relay_channel is not None:
+            for key in RELAY_STEP_METRICS:
+                total[key]=float(np.mean([t[key] for t in self.trace]))
+            for key,value in self.relay_channel.stats.items():
+                total[f'relay_packets_{key}']=float(value)
+            for key in ('accepted','duplicate','stale','expired','future'):
+                total[f'relay_entries_{key}']=float(sum(c.relay.stats[key] for c in self.controllers))
         if getattr(self.controllers[0].navigator, 'uses_velocity', False):
             total['nominal_speed_mean'] = float(np.mean([t['nominal_speed_mean'] for t in self.trace]))
             total['executed_speed_mean'] = float(np.mean([t['executed_speed_mean'] for t in self.trace]))

@@ -37,20 +37,22 @@ class CooperativeEncoder(nn.Module):
 
 
 class CooperativeCriticEncoder(nn.Module):
-    def __init__(self, global_features):
+    def __init__(self, global_features, encoder=None, raw_width=RAW_WIDTH, encoded_width=ENCODED_WIDTH):
         super().__init__()
-        self.encoder = CooperativeEncoder()
+        self.encoder = CooperativeEncoder() if encoder is None else encoder
         self.global_features = global_features
+        self.raw_width, self.encoded_width = raw_width, encoded_width
 
     def forward(self, x):
+        raw, width = self.raw_width, self.encoded_width
         valid = x[..., -1] > 0
-        flat = x[..., :RAW_WIDTH].reshape(-1, RAW_WIDTH)
+        flat = x[..., :raw].reshape(-1, raw)
         ids = valid.reshape(-1).nonzero().squeeze(-1)
         values = self.encoder(flat[ids])
-        encoded = values.new_zeros((len(flat), ENCODED_WIDTH)).index_copy(0, ids, values)
-        pooled = encoded.reshape(*valid.shape, ENCODED_WIDTH).sum(-2)/valid.sum(-1, keepdim=True).clamp_min(1)
+        encoded = values.new_zeros((len(flat), width)).index_copy(0, ids, values)
+        pooled = encoded.reshape(*valid.shape, width).sum(-2)/valid.sum(-1, keepdim=True).clamp_min(1)
         if self.global_features:
-            pooled = torch.cat((pooled, x[..., 0, RAW_WIDTH:RAW_WIDTH+self.global_features]), -1)
+            pooled = torch.cat((pooled, x[..., 0, raw:raw+self.global_features]), -1)
         return pooled
 
 
