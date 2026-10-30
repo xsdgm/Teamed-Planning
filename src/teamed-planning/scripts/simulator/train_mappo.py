@@ -99,7 +99,10 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     # v8 relayed state evidence: per-link loss, extra delay jitter (steps beyond
     # the minimum one), send period (steps), entries per envelope, and the
     # attention ablation (full=v8-D, age=v8-A, hop=v8-B, softmax=v8-C).
-    relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,relay_attention='full')
+    relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,relay_attention='full',
+    # Vehicle-side fusion joins graph components within this distance (m) when the
+    # delivered occupancy shows a free corridor (0: off; at most the drones' 15 m edge).
+    fusion_bridge_distance=0.)
 
 COOPERATIVE_ARCHITECTURES=('gat_cooperative_v7','gat_relay_attention_v8')
 GRAPH_ARCHITECTURES=('gat_map_v1',)+COOPERATIVE_ARCHITECTURES
@@ -234,6 +237,9 @@ def validate_config(config):
             or relay['relay_attention'] not in ('full','age','hop','softmax')):
         raise ValueError('v8 relay: loss in [0,1), jitter 0..10, period 1..10, capacity 1..64 '
                          'steps/entries, attention full/age/hop/softmax')
+    bridge=config['fusion_bridge_distance']
+    if isinstance(bridge,bool) or not isinstance(bridge,(int,float)) or not 0<=bridge<=15:
+        raise ValueError('fusion_bridge_distance must be 0 (off) up to the 15 m drone edge length')
     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
         raise ValueError('Safety penalty weights must be nonnegative')
     if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
@@ -402,7 +408,9 @@ def optimizer_contract(config):
 def reward_contract(config):
     # v8 changes observations/transport only; its reward is v7's unchanged.
     if config['policy_architecture'] in COOPERATIVE_ARCHITECTURES:
-        return 'uav_mapping_route_quality_and_backbone_v7'+('_surprise' if config['surprise_weight'] else '')
+        # Bridging changes which delivered maps count as connected (map success).
+        return ('uav_mapping_route_quality_and_backbone_v7'+('_surprise' if config['surprise_weight'] else '')
+                +('_bridged' if config['fusion_bridge_distance'] else ''))
     if config['reward_mode']!='velocity_mapping':
         return config['reward_mode']
     if config['surprise_weight']:
@@ -470,6 +478,7 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             chain_link_range=config['chain_link_range'],
             relay_loss=config['relay_loss'],relay_delay_jitter=config['relay_delay_jitter'],
             relay_period=config['relay_period'],relay_capacity=config['relay_capacity'],
+            fusion_bridge_distance=config['fusion_bridge_distance'],
             num_drones=config['fleet_sizes'][scene_seed % len(config['fleet_sizes'])],**options)
         rollout=[];reason='budget';stable=0;max_link=0.;bonus=0.;quality_bonus=0.
         encoder=TaskMapEncoder(env) if config.get('surprise_weight',0.) else None

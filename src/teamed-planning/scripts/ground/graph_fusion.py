@@ -40,7 +40,12 @@ class GraphFusion:
         self.unified_graph = TopologicalGraph(drone_id=f"{robot_id}_unified")
         self.source_graphs = {}  # {drone_id: TopologicalGraph}
         self._merge_buckets = {}
-        
+        # Optional component bridging (off unless both are set): nodes of
+        # different components within bridge_distance (m) are joined when
+        # bridge_check(a, b) confirms the segment from delivered observations.
+        self.bridge_distance = 0.
+        self.bridge_check = None
+
         # Uncertainty handling (placeholder for future)
         self.uncertainty_enabled = False
         
@@ -128,13 +133,43 @@ class GraphFusion:
                         self.unified_graph.add_edge(unified_node1, unified_node2, 
                                                    weight=weight, attributes=attributes)
         
+        if self.bridge_distance > 0 and self.bridge_check is not None:
+            self._bridge_components()
+
         # Rebuild spatial index for efficient queries
         self.unified_graph.build_spatial_index()
-        
+
         print(f"[GraphFusion] Unified graph: {len(self.unified_graph)} nodes, "
               f"{self.unified_graph.graph.number_of_edges()} edges from "
               f"{len(self.source_graphs)} drones")
     
+    def _bridge_components(self):
+        """Join components that the drones' own graphs leave apart.
+
+        A drone links two nodes only when a single frame shows both, so a gap
+        of a few metres between components built in different frames stays
+        open. Cross-component pairs are tried shortest first; an edge is added
+        only when bridge_check confirms the segment, never from proximity alone.
+        """
+        import networkx as nx
+        from scipy.spatial import cKDTree
+        graph = self.unified_graph.graph
+        if graph.number_of_nodes() < 2:
+            return
+        ids = list(graph.nodes)
+        points = np.asarray([graph.nodes[n]['position'][:2] for n in ids], float)
+        components = nx.utils.UnionFind()
+        for component in nx.connected_components(graph):
+            components.union(*component)
+        candidates = sorted((float(np.linalg.norm(points[i] - points[j])), i, j)
+                            for i, j in cKDTree(points).query_pairs(self.bridge_distance)
+                            if components[ids[i]] != components[ids[j]])
+        for distance, i, j in candidates:
+            a, b = ids[i], ids[j]
+            if components[a] != components[b] and self.bridge_check(points[i], points[j]):
+                self.unified_graph.add_edge(a, b, weight=distance, attributes={'bridged': True})
+                components.union(a, b)
+
     def _find_merge_candidate(self, position: Tuple[float, float]) -> Optional[str]:
         """
         Find a node in the unified graph that should be merged with this position.

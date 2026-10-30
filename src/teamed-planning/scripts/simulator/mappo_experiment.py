@@ -29,6 +29,8 @@ COMMUNICATION_RANGE_M = 95.
 FLIGHT_HEIGHT_M = 15.
 COOPERATIVE_ARCHITECTURES = ('gat_cooperative_v7', 'gat_relay_attention_v8')
 RELAY_DEFAULTS = dict(relay_loss=0., relay_delay_jitter=0, relay_period=1, relay_capacity=16)
+# Vehicle-side component bridging: free corridor half-width, the drones' graph clearance.
+BRIDGE_CLEARANCE_M = 1.5
 # Per-step relay diagnostics (v8); evaluator truth is used only for the error.
 RELAY_STEP_METRICS = ('relay_token_count', 'relay_vehicle_known', 'relay_remote_fraction',
                       'relay_age_s', 'relay_max_hop', 'relay_position_error_m')
@@ -188,6 +190,22 @@ class DeliveredEvidence:
         x,y=cells[:,0],cells[:,1]
         return bool((self.seen[y,x] & (self.log_odds[y,x]<0)).all())
 
+    def segment_clear(self, start, end, clearance):
+        """Every cell within clearance (m) of the segment is received and free."""
+        start,end=np.asarray(start,float)[:2],np.asarray(end,float)[:2]
+        delta=end-start
+        length=float(np.linalg.norm(delta))
+        step=self.resolution/4
+        along=np.linspace(0.,1.,max(2,int(length/step)+1))
+        normal=np.array([-delta[1],delta[0]])/length if length>0 else np.zeros(2)
+        across=np.linspace(-clearance,clearance,max(1,2*int(np.ceil(clearance/step))+1))
+        points=(start+along[:,None]*delta)[:,None,:]+across[None,:,None]*normal
+        cells=np.floor(points.reshape(-1,2)/self.resolution).astype(int)
+        if not ((cells>=0)&(cells<self.n)).all():
+            return False
+        x,y=cells[:,0],cells[:,1]
+        return bool((self.seen[y,x] & (self.log_odds[y,x]<0)).all())
+
 
 def evidence_metrics(before, after, old_seen, seen, region, area=4.):
     """Read-only evidence diagnostics; these values do not define the reward."""
@@ -220,7 +238,8 @@ class Experiment:
                  chain_outward_weight=0.,chain_missing_weight=0.,
                  path_quality_weight=0.,route_reference_length=None,mapping_until_connected=False,
                  cbf_margin_weight=0.,cbf_margin_scale=8.,frontier_progress_weight=0.,
-                 relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16):
+                 relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,
+                 fusion_bridge_distance=0.):
         if type(num_drones) is not int or num_drones < 2:
             raise ValueError('At least two drones are required for the chain experiment')
         if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
@@ -229,6 +248,8 @@ class Experiment:
             raise ValueError('A stationary vehicle keeps its map receiver and has no subgoals')
         if subgoal_radius is not None and not (subgoal_radius>0 and moving_ground):
             raise ValueError('subgoal_radius must be positive and requires a moving ground robot')
+        if not 0<=fusion_bridge_distance<float('inf'):
+            raise ValueError('fusion_bridge_distance must be a finite nonnegative distance')
         self.world_size=float(world_size)
         self.start=np.asarray(start,dtype=float)
         self.stop_on_ground_arrival=bool(stop_on_ground_arrival)
@@ -356,6 +377,12 @@ class Experiment:
         self.initial_goal_distance=float(np.linalg.norm(self.goal-self.start))
         self._initial_route_cost=self._route_cost=navigation_cost(None,self.start,self.goal)
         self.ledger = DeliveredEvidence(world=self.world_size)
+        if fusion_bridge_distance:
+            # The vehicle joins graph components only across corridors that the
+            # occupancy delivered to it shows free; drones' graphs are unchanged.
+            fusion=self.ground_controller.graph_fusion
+            fusion.bridge_distance=float(fusion_bridge_distance)
+            fusion.bridge_check=lambda a,b: self.ledger.segment_clear(a,b,BRIDGE_CLEARANCE_M)
         self.reward_task_region = self.ledger.task_mask(self.start, self.goal)
         self.algorithm = algorithm
         self.trace = []
