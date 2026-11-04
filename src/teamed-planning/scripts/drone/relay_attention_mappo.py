@@ -154,6 +154,8 @@ class RelayActorCritic(CooperativeActorCritic):
         p[:len(position)] = position
         data = observation.get('cooperation', {})
         sensed = set(data.get('peers', {}))
+        # CoGraph: several vehicles; each token is flagged by its own one-hop link.
+        vehicles = data.get('grounds')
         # KeyError on purpose: v8 never silently acts without its relay cache.
         # The cache lists vehicle/task records first, then fresher and shorter
         # paths, so truncation never drops the only task record for distance.
@@ -167,7 +169,8 @@ class RelayActorCritic(CooperativeActorCritic):
                          *((velocity[0]/6., velocity[1]/6.) if velocity is not None else (0., 0.)),
                          float(velocity is not None), row['age'], row['hop'],
                          float(not vehicle), float(vehicle), row['sigma']/95., float(row['time_unknown']),
-                         float(data.get('ground') is not None) if vehicle else float(row['origin_id'] in sensed),
+                         (float(data.get('ground') is not None) if vehicles is None else
+                          float(row['origin_id'] in vehicles)) if vehicle else float(row['origin_id'] in sensed),
                          *(((goal[0]-p[0])/350., (goal[1]-p[1])/350.) if goal is not None else (0., 0.)),
                          float(goal is not None)]
             valid[i] = 1.

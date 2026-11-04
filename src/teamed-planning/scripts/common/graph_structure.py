@@ -11,6 +11,36 @@ import json
 import time
 import copy
 
+_ATOMIC = (str, int, float, bool, type(None), np.generic)
+
+
+def _copy_value(value):
+    """deepcopy for the attribute shapes graphs actually carry (scalars, tuples
+    of scalars, dicts of scalars), without deepcopy's per-object memo cost."""
+    if isinstance(value, _ATOMIC):
+        return value
+    if type(value) is tuple and all(isinstance(item, _ATOMIC) for item in value):
+        return value
+    if type(value) is dict and all(type(key) is str for key in value) and all(
+            isinstance(item, _ATOMIC) for item in value.values()):
+        return dict(value)
+    return copy.deepcopy(value)
+
+
+def copy_attributes(attributes):
+    return {key: _copy_value(value) for key, value in attributes.items()}
+
+
+def copy_link_data(data):
+    """Independent copy of networkx node-link data (nodes/edges lists of attribute dicts)."""
+    result = {}
+    for key, value in data.items():
+        if key in ('nodes', 'edges', 'links') and type(value) is list and all(type(item) is dict for item in value):
+            result[key] = [copy_attributes(item) for item in value]
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
 
 class TopologicalGraph:
     """
@@ -65,8 +95,8 @@ class TopologicalGraph:
             position: (x, y) position of the node
             attributes: Additional attributes (terrain_type, traversability, etc.)
         """
-        attributes = copy.deepcopy(attributes or {})
-        
+        attributes = copy_attributes(attributes or {})
+
         # Add default fusion attributes if not provided
         if 'observation_count' not in attributes:
             attributes['observation_count'] = 1
@@ -110,7 +140,8 @@ class TopologicalGraph:
         
         edge_attrs = {'weight': weight, **attributes}
         self.graph.add_edge(node_id1, node_id2, **edge_attrs)
-        self.metadata['edge_count'] = self.graph.number_of_edges()
+        # Counting edges is O(nodes) in networkx; to_message records the exact
+        # count when it is actually transmitted (nothing reads it in between).
         
     def build_spatial_index(self):
         """
@@ -200,8 +231,10 @@ class TopologicalGraph:
             Dictionary containing graph data and metadata
         """
         # Use NetworkX's node-link format
-        graph_data = copy.deepcopy(nx.node_link_data(self.graph))
-        
+        graph_data = copy_link_data(nx.node_link_data(self.graph))
+        self.metadata['node_count'] = self.graph.number_of_nodes()
+        self.metadata['edge_count'] = self.graph.number_of_edges()
+
         return {
             'graph_data': graph_data,
             'metadata': dict(self.metadata)
@@ -219,7 +252,7 @@ class TopologicalGraph:
             TopologicalGraph instance
         """
         graph = cls(drone_id=message_data['metadata'].get('drone_id'))
-        graph.graph = nx.node_link_graph(copy.deepcopy(message_data['graph_data']))
+        graph.graph = nx.node_link_graph(copy_link_data(message_data['graph_data']))
         graph.metadata = dict(message_data['metadata'])
         graph._spatial_index_valid = False
         

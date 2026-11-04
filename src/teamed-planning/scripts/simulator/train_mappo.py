@@ -102,9 +102,23 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,relay_attention='full',
     # Vehicle-side fusion joins graph components within this distance (m) when the
     # delivered occupancy shows a free corridor (0: off; at most the drones' 15 m edge).
-    fusion_bridge_distance=0.)
+    fusion_bridge_distance=0.,
+    # CoGraph (policy_architecture cograph_v1): vehicles in the one team and the
+    # inclusive range of task targets per episode (null for single-target runs).
+    vehicle_count=1,target_count_range=None,
+    # CoGraph v2: 'single_task' scenes put every target under the drone network
+    # at once (one task; 'any' is v1's sampling); 'decentralized' vehicles each
+    # claim, broadcast and drive to their own targets ('parked' is v1's stationary
+    # team): a vehicle departs once its own graph reaches vehicle_depart_progress
+    # of the way, and a target passes to a vehicle cheaper by vehicle_transfer_margin;
+    # 'tree' budgets by the drones' coverage tree instead of the sum of target routes.
+    scene_regime='any',vehicle_planner='parked',budget_reference='sum',
+    vehicle_depart_progress=.5,vehicle_transfer_margin=.15)
 
-COOPERATIVE_ARCHITECTURES=('gat_cooperative_v7','gat_relay_attention_v8')
+# cograph_v2 is v1 plus the learned per-drone target choice (drone/cograph_v2_mappo.py).
+COGRAPH_ARCHITECTURES=('cograph_v1','cograph_v2')
+COOPERATIVE_ARCHITECTURES=('gat_cooperative_v7','gat_relay_attention_v8')+COGRAPH_ARCHITECTURES
+RELAY_ARCHITECTURES=('gat_relay_attention_v8',)+COGRAPH_ARCHITECTURES
 GRAPH_ARCHITECTURES=('gat_map_v1',)+COOPERATIVE_ARCHITECTURES
 
 OPTIMIZER_CONFIG_FIELDS={'rollout_mode','ppo_target_kl','ppo_max_kl','ppo_max_backtracks',
@@ -226,7 +240,44 @@ def validate_config(config):
     if cooperative and (config['actor_input_version']!=2 or config['drop']!=0.):
         raise ValueError('v7/v8 require input 2 and complete synchronous neighbor geometry (drop=0)')
     relay={k:config[k] for k in ('relay_loss','relay_delay_jitter','relay_period','relay_capacity','relay_attention')}
-    if config['policy_architecture']!='gat_relay_attention_v8':
+    if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
+        counts=config['target_count_range']
+        if (not isinstance(counts,(list,tuple)) or len(counts)!=2 or any(type(n) is not int for n in counts)
+                or not 1<=counts[0]<=counts[1]<=8):
+            raise ValueError('CoGraph target_count_range must be two integers within 1..8')
+        if type(config['vehicle_count']) is not int or not 1<=config['vehicle_count']<=3:
+            raise ValueError('CoGraph v1 has a start layout for 1..3 vehicles')
+        if (len(config['fleet_sizes'])!=1 or config['task_distance_range'] is None
+                or config['reward_mode']!='velocity_mapping'):
+            raise ValueError('CoGraph: one fleet size, a task_distance_range and velocity_mapping')
+        if (config['scene_regime'] not in ('any','single_task')
+                or config['vehicle_planner'] not in ('parked','decentralized')
+                or config['budget_reference'] not in ('sum','tree')):
+            raise ValueError("CoGraph scene_regime is any|single_task, vehicle_planner parked|decentralized, "
+                             "budget_reference sum|tree")
+        # v1 parks the team (the option space is built from the start); v2's
+        # decentralized vehicles drive themselves, so they are not stationary.
+        if config['ground_stationary']!=(config['vehicle_planner']=='parked'):
+            raise ValueError('CoGraph: ground_stationary must be true exactly for the parked team')
+        for name,low,high in (('vehicle_depart_progress',0.,1.),('vehicle_transfer_margin',0.,1.)):
+            value=config[name]
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not (low<value<=high if
+                    name=='vehicle_depart_progress' else low<=value<high):
+                raise ValueError(f'{name} out of range')
+        if (config['vehicle_planner']=='parked' and (config['vehicle_depart_progress'],
+                config['vehicle_transfer_margin'])!=(DEFAULTS['vehicle_depart_progress'],DEFAULTS['vehicle_transfer_margin'])):
+            raise ValueError('vehicle_depart_progress/vehicle_transfer_margin need decentralized vehicles')
+        if (config['surprise_weight'] or config['route_reward_weight'] or config['exploration_weight']
+                or config['map_quality_reward'] or config['init_optimizer']):
+            raise ValueError('CoGraph v1 has no surprise, route-cost, area or final-quality terms and '
+                             'cannot restore an optimizer of another architecture')
+    elif (config['target_count_range'] is not None or config['vehicle_count']!=1
+            or (config['scene_regime'],config['vehicle_planner'],config['budget_reference'])!=('any','parked','sum')
+            or (config['vehicle_depart_progress'],config['vehicle_transfer_margin'])
+               !=(DEFAULTS['vehicle_depart_progress'],DEFAULTS['vehicle_transfer_margin'])):
+        raise ValueError('target_count_range/vehicle_count/scene_regime/vehicle_planner/budget_reference/'
+                         'vehicle_* require a CoGraph policy_architecture')
+    if config['policy_architecture'] not in RELAY_ARCHITECTURES:
         if relay!={k:DEFAULTS[k] for k in relay}:
             raise ValueError('relay_* fields require policy_architecture gat_relay_attention_v8')
     elif (isinstance(relay['relay_loss'],bool) or not isinstance(relay['relay_loss'],(int,float))
@@ -369,8 +420,21 @@ def validate_config(config):
     return config
 
 
+def critic_features(config):
+    """Width of the centralized critic state (CoGraph has its own multi-target state)."""
+    if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
+        from drone.cograph_mappo import GLOBAL_FEATURES as COGRAPH_FEATURES
+        return COGRAPH_FEATURES
+    return GLOBAL_FEATURES
+
+
 def feature_version(config):
-    """Feature contract: 1 candidate, 2/5 velocity MLP, 4/6 map GAT, 7 cooperative GAT, 8 relay attention."""
+    """Feature contract: 1 candidate, 2/5 velocity MLP, 4/6 map GAT, 7 cooperative GAT, 8 relay attention,
+    9 CoGraph v1 (v8 plus target tokens), 10 CoGraph v2 (graph-reach tokens, target choice)."""
+    if config['policy_architecture']=='cograph_v2':
+        return 10
+    if config['policy_architecture']=='cograph_v1':
+        return 9
     if config['policy_architecture']=='gat_relay_attention_v8':
         return 8
     if config['policy_architecture']=='gat_cooperative_v7':
@@ -384,6 +448,12 @@ def feature_version(config):
 
 
 def make_model(config):
+    if config['policy_architecture']=='cograph_v2':
+        from drone.cograph_v2_mappo import CoGraphV2ActorCritic
+        return CoGraphV2ActorCritic(critic_features(config),config['actor_input_version'],config['relay_attention'])
+    if config['policy_architecture']=='cograph_v1':
+        from drone.cograph_mappo import CoGraphActorCritic
+        return CoGraphActorCritic(critic_features(config),config['actor_input_version'],config['relay_attention'])
     if config['policy_architecture']=='gat_relay_attention_v8':
         from drone.relay_attention_mappo import RelayActorCritic
         return RelayActorCritic(GLOBAL_FEATURES,config['actor_input_version'],config['relay_attention'])
@@ -406,6 +476,17 @@ def optimizer_contract(config):
 
 
 def reward_contract(config):
+    if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
+        # v8 terms per target, averaged over targets; success = every target connected.
+        bridged='_bridged' if config['fusion_bridge_distance'] else ''
+        if (config['scene_regime'],config['vehicle_planner'],config['budget_reference'])==('any','parked','sum'):
+            return 'cograph_v1_multi_target_option_space'+bridged
+        # CoGraph v2: same per-target terms; the episode distribution, budget and
+        # vehicle behaviour differ, so checkpoints are labelled apart from v1.
+        return ('cograph_v2_task_option_space'
+                +('_single_task' if config['scene_regime']=='single_task' else '')
+                +('_decentralized_vehicles' if config['vehicle_planner']=='decentralized' else '')
+                +('_tree_budget' if config['budget_reference']=='tree' else '')+bridged)
     # v8 changes observations/transport only; its reward is v7's unchanged.
     if config['policy_architecture'] in COOPERATIVE_ARCHITECTURES:
         # Bridging changes which delivered maps count as connected (map success).
@@ -445,6 +526,9 @@ def append_json(path, value):
 
 
 def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, stop=None):
+    if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
+        from simulator.cograph_experiment import run_cograph_episode
+        return run_cograph_episode(model,config,scene_seed,schedule,stochastic,progress,stop)
     large=config['world_size']==1000.
     scene=(generate_training_scene(scene_seed,config['task_distances'],
                                   distance_range=config['task_distance_range'],
@@ -721,16 +805,28 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
         # A new phase resets counters/RNG; curricula may retain Adam state.
         path=Path(config['init_checkpoint']).resolve()
         initial=torch.load(path,map_location='cpu',weights_only=True)
-        if (initial.get('critic_global_features',0)!=GLOBAL_FEATURES or
+        warm=None
+        if (config['policy_architecture'] in COGRAPH_ARCHITECTURES
+                and initial.get('policy_architecture')=='gat_relay_attention_v8'):
+            # Cross-architecture warm start: shared v8 modules, fresh target attention
+            # (and, for v2, the target selector at its nearest-unconnected prior).
+            if initial.get('relay_attention',initial['config'].get('relay_attention'))!=config['relay_attention']:
+                raise ValueError('v8 warm start must use the same relay_attention mode')
+            warm=model.warm_start(initial['model'])
+        elif (initial.get('critic_global_features',0)!=critic_features(config) or
                 initial.get('feature_version')!=feature_version(config) or
                 initial.get('action_mode','candidate')!=config['action_mode']):
             raise ValueError('init_checkpoint must use the current actor features and global-state critic')
-        model.load_state_dict(initial['model'])
+        else:
+            model.load_state_dict(initial['model'])
         if config['init_optimizer']:
             initial_optimizer=initial['optimizer']
         initial_weights=dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                              training_episodes=initial.get('training_episodes'),
-                             optimizer_restored=config['init_optimizer'])
+                             optimizer_restored=config['init_optimizer'],
+                             source_architecture=initial.get('policy_architecture'),
+                             warm_start=None if warm is None else dict(copied=warm['copied'],
+                                 partial=warm['partial'],fresh=warm['fresh']))
     optimizer=torch.optim.Adam(model.parameters(),lr=config['learning_rate'])
     if initial_optimizer is not None:
         optimizer.load_state_dict(initial_optimizer)
@@ -744,7 +840,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
     joint_steps=0;optimizer_batches=0;upgrade_changes={}
     if resume:
         saved=torch.load(latest,map_location='cpu',weights_only=True)
-        if saved.get('critic_global_features',0)!=GLOBAL_FEATURES or saved.get('policy_mode')!='sample':
+        if saved.get('critic_global_features',0)!=critic_features(config) or saved.get('policy_mode')!='sample':
             raise ValueError('Checkpoint predates the global-state critic and sampled validation; '
                              'start a separate training run')
         upgrade_changes=optimizer_config_changes(saved['config'],config,upgrade_optimizer)
@@ -813,7 +909,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
             policy_architecture=config['policy_architecture'],
             actor_input_version=config['actor_input_version'],
             action_mode=config['action_mode'],
-            critic_global_features=GLOBAL_FEATURES,policy_mode='sample',
+            critic_global_features=critic_features(config),policy_mode='sample',
             exploration_candidates=config['exploration_candidates'],world_bounds=[0.,0.,config['world_size'],config['world_size']],
             communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],

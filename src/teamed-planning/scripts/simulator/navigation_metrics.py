@@ -102,3 +102,50 @@ def task_graph_metrics(graph, start, goal, connector_clear, endpoint_radius=10.)
         result['graph_frontier_goal_distance_m'] = min(float(np.linalg.norm(
             np.asarray(g.nodes[n]['position'])[:2]-goal)) for n in distances)
     return result
+
+
+def multi_target_graph_metrics(graph, start, goals, connector_clear, endpoint_radius=10.):
+    """task_graph_metrics for several goals from one start, with one search.
+
+    Returns per-goal arrays: connected, physical route length (inf without a
+    route) and frontier distance (least straight-line goal distance of a node
+    reachable from the start; 0 once connected)."""
+    start = np.asarray(start, float)[:2]
+    goals = np.asarray(goals, float).reshape(-1, 2)
+    result = dict(connected=np.zeros(len(goals), bool), length=np.full(len(goals), np.inf),
+                  frontier=np.linalg.norm(goals-start, axis=1), nodes=0, edges=0)
+    if graph is None or not len(graph):
+        return result
+    g = graph.graph
+    nodes = list(g.nodes)
+    points = np.asarray([g.nodes[n]['position'][:2] for n in nodes], float)
+    result.update(nodes=len(nodes), edges=g.number_of_edges())
+    def endpoint(point):
+        near = np.flatnonzero(np.linalg.norm(points-point, axis=1) <= endpoint_radius)
+        return {i: float(np.linalg.norm(points[i]-point)) for i in near if connector_clear(point, points[i])}
+    starts = endpoint(start)
+    if not starts:
+        return result
+    index = {n: i for i, n in enumerate(nodes)}
+    distances = dict(starts)
+    queue = [(cost, i) for i, cost in starts.items()]
+    heapq.heapify(queue)
+    while queue:
+        cost, i = heapq.heappop(queue)
+        if cost != distances[i]:
+            continue
+        for other in g[nodes[i]]:
+            j = index[other]
+            next_cost = cost+float(np.linalg.norm(points[i]-points[j]))
+            if next_cost < distances.get(j, math.inf):
+                distances[j] = next_cost
+                heapq.heappush(queue, (next_cost, j))
+    reached = np.fromiter(distances, int)
+    for m, goal in enumerate(goals):
+        ends = endpoint(goal)
+        lengths = [distances[i]+d for i, d in ends.items() if i in distances]
+        if lengths:
+            result['connected'][m], result['length'][m], result['frontier'][m] = True, min(lengths), 0.
+        else:
+            result['frontier'][m] = float(np.linalg.norm(points[reached]-goal, axis=1).min())
+    return result

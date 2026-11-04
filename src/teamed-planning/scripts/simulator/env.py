@@ -193,7 +193,7 @@ class MultiRobotEnv:
             
             # Detect obstacles within perception radius
             visible_obstacles = []
-            for obs in self.obstacles:
+            for obs in self._nearby_obstacles(robot.position, self.config.perception_radius):
                 # Use only x,y for distance (obstacles are 2D, robots are 3D)
                 robot_xy = robot.position[:2]
                 distance = np.linalg.norm(robot_xy - obs.position)
@@ -283,7 +283,7 @@ class MultiRobotEnv:
         obstacle_count = 0
 
         # Rasterize each obstacle
-        for obs in self.obstacles:
+        for obs in self._nearby_obstacles(robot_position, perception_range):
             # Calculate distance to obstacle (use only x,y, obstacles are 2D)
             robot_xy = robot_position[:2]
             distance = np.linalg.norm(robot_xy - obs.position)
@@ -360,6 +360,19 @@ class MultiRobotEnv:
 
         return occupancy_map
     
+    def _nearby_obstacles(self, position, reach, slack=5.):
+        """Obstacles in original order that the exact per-obstacle tests below
+        could accept: a vectorized prefilter with generous slack, so every
+        caller still applies its own unchanged scalar distance check."""
+        if getattr(self, '_obstacle_cache', (None,))[0] != len(self.obstacles):
+            centers = np.array([obs.position for obs in self.obstacles], float).reshape(-1, 2)
+            sizes = np.array([obs.radius if hasattr(obs, 'radius') else max(obs.size) / 2.0
+                              for obs in self.obstacles], float)
+            self._obstacle_cache = (len(self.obstacles), centers, sizes)
+        _, centers, sizes = self._obstacle_cache
+        near = np.linalg.norm(centers - np.asarray(position, float)[:2], axis=1) <= reach + sizes + slack
+        return [self.obstacles[i] for i in np.flatnonzero(near)]
+
     def _handle_collisions(self, info: Dict):
         """Handle ground robot collisions"""
         for robot in self.ground_robots:

@@ -79,6 +79,8 @@ class DroneController:
         # v8 relay cache (drone/relay_cache.py); the transport layer supplies
         # delivered envelopes as observation['relay_envelopes'].
         self.relay=None
+        # CoGraph: several vehicles are separate backbone nodes, keyed by robot_id.
+        self.multi_vehicle=False
         from drone.chain_state import ChainState
         self._chain_state=ChainState(drone_id,total_drones if self.communication_mode=='chain' else 1)
 
@@ -201,7 +203,14 @@ class DroneController:
                         if waypoint is not None:
                             neighbor_waypoints[other_drone_id] = tuple(waypoint)
                         for robot_id, mission in broadcast_msg.get('ground_missions', {}).items():
-                            ground_robots.setdefault(robot_id,dict(mission,direct=False))
+                            stored = ground_robots.get(robot_id)
+                            if (self.multi_vehicle and stored is not None and not stored.get('direct')
+                                    and mission.get('source_time', -np.inf) > stored.get('source_time', -np.inf)):
+                                # Keep the freshest forwarded copy; two drones relaying each
+                                # other's first-come copies would otherwise let it age out.
+                                ground_robots[robot_id] = dict(mission, direct=False)
+                            else:
+                                ground_robots.setdefault(robot_id,dict(mission,direct=False))
             # Handle ground robots
             elif neighbor['type'] in ['diff_drive', 'holonomic']:
                 # Get broadcast data from ground robot
@@ -219,6 +228,9 @@ class DroneController:
                             'direct': True,
                             'broadcast': broadcast_msg
                         }
+                        if broadcast_msg.get('targets') is not None:
+                            # CoGraph mission: every task target and this vehicle's route status.
+                            ground_robots[robot_id]['targets'] = broadcast_msg['targets']
         
         return {
             'position': position,
@@ -283,7 +295,13 @@ class DroneController:
                 did=(neighbor.get('broadcast') or {}).get('drone_id',f"robot_{neighbor['id']}")
                 peers[did]=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
         chain=getattr(self.navigator,'chain',self._chain_state)
-        if self.communication_mode=='backbone':
+        grounds=None
+        if self.communication_mode=='backbone' and self.multi_vehicle:
+            from drone.local_backbone import received_geometry_multi, relative_neighborhood
+            peers, _, grounds = received_geometry_multi(self.position, observation)
+            required = relative_neighborhood(self.position, {**peers, **grounds}, self.communication_range)
+            ground = None
+        elif self.communication_mode=='backbone':
             from drone.local_backbone import received_geometry, relative_neighborhood
             peers, _, ground = received_geometry(self.position, observation)
             visible = dict(peers)
@@ -307,7 +325,7 @@ class DroneController:
             self.communication_range,self.max_speed).filter(velocity,self.position,peers,dt,
             required_links=required,ground=ground,
             ground_max_speed=getattr(self,'ground_max_speed',0.),
-            world_bounds=getattr(self.navigator,'world_bounds',None),drone_id=self.drone_id)
+            world_bounds=getattr(self.navigator,'world_bounds',None),drone_id=self.drone_id,grounds=grounds)
 
     def _current_cbf_margin(self, observation):
         """Feasibility margin (m/s) of this step's CBF constraints, before acting.
@@ -440,7 +458,15 @@ class DroneController:
             nav_obs['occupancy_map'] = parsed_obs['occupancy_map']
             nav_obs['sensor_valid'] = simulator_obs.get('sensor_valid', True)
         self._chain_state.update(nav_obs)
-        if self.communication_mode=='backbone':
+        if self.communication_mode=='backbone' and self.multi_vehicle:
+            from drone.local_backbone import received_geometry_multi, relative_neighborhood
+            peers, velocities, grounds = received_geometry_multi(self.position, simulator_obs)
+            required = relative_neighborhood(self.position, {**peers, **grounds}, self.communication_range)
+            self.navigator.required_links = required
+            nearest = min(grounds.values(), key=lambda q: np.linalg.norm(q-self.position), default=None)
+            nav_obs['cooperation'] = dict(peers=peers, velocities=velocities, ground=nearest,
+                                          grounds=grounds, required=required)
+        elif self.communication_mode=='backbone':
             from drone.local_backbone import received_geometry, relative_neighborhood
             peers, velocities, ground = received_geometry(self.position, simulator_obs)
             visible = dict(peers)

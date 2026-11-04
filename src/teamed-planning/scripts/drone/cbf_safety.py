@@ -46,7 +46,9 @@ class CBFSafetyFilter:
         self.gain=float(gain)
 
     def filter(self, nominal, position, peers, dt, required_links=(), ground=None,
-               world_bounds=None, drone_id='', ground_max_speed=0.):
+               world_bounds=None, drone_id='', ground_max_speed=0., grounds=None):
+        """grounds: optional {vehicle_id: position}; each required vehicle link
+        gets the same non-cooperative constraint as the single '__ground__'."""
         if dt<=0 or not np.isfinite(dt):
             raise ValueError('CBF requires a positive finite control step')
         if not np.isfinite(ground_max_speed) or ground_max_speed < 0:
@@ -91,11 +93,13 @@ class CBFSafetyFilter:
                 # Sum the two endpoint inequalities to obtain a joint CBF.
                 bound=(min(self.gain,1.)*h/dt-4*speed**2*dt)/4
                 upper(r[:2],bound)
-        if '__ground__' in required and ground is not None:
-            r=p-np.r_[np.asarray(ground,float)[:2],0.]
+        vehicles={'__ground__':ground} if '__ground__' in required and ground is not None else {}
+        vehicles.update({k:q for k,q in (grounds or {}).items() if k in required})
+        for key,vehicle in vehicles.items():
+            r=p-np.r_[np.asarray(vehicle,float)[:2],0.]
             distance=float(np.linalg.norm(r))
-            link_distances['__ground__']=distance
-            link_outward_speeds['__ground__']=float(np.dot(r[:2],desired)/max(distance,1e-12))
+            link_distances[key]=distance
+            link_outward_speeds[key]=float(np.dot(r[:2],desired)/max(distance,1e-12))
             h=(self.comm_range-self.margin)**2-float(np.dot(r,r))
             # Ground need not cooperate with the aerial CBF. Protect against
             # every ground displacement within its configured speed bound.
@@ -129,4 +133,5 @@ class CBFSafetyFilter:
             received_peers=len(peers),
             required_link_distances_m=link_distances,
             required_link_nominal_outward_m_s=link_outward_speeds,
-            missing_links=sorted(required-set(peers)-({'__ground__'} if ground is not None else set())))
+            missing_links=sorted(required-set(peers)-({'__ground__'} if ground is not None else set())
+                                 -set(grounds or ())))

@@ -35,6 +35,36 @@ def received_geometry(position, observation):
     return peers, velocities, ground
 
 
+def received_geometry_multi(position, observation):
+    """received_geometry for several vehicles, keyed by their broadcast robot_id."""
+    peers, velocities, grounds = {}, {}, {}
+    p = np.asarray(position, float)
+    for neighbor in observation.get('neighbors', []):
+        q = p+np.asarray(neighbor['relative_position'], float)
+        if neighbor['type'] == 'drone':
+            key = (neighbor.get('broadcast') or {}).get('drone_id', f"robot_{neighbor['id']}")
+            peers[key] = q
+            velocities[key] = np.asarray(neighbor.get('relative_velocity', (0., 0., 0.)), float)
+        elif neighbor['type'] in ('diff_drive', 'holonomic'):
+            grounds[(neighbor.get('broadcast') or {}).get('robot_id', f"robot_{neighbor['id']}")] = q
+    return peers, velocities, grounds
+
+
+def backbone_metrics_multi(drones, grounds, comm_range=95.):
+    """Evaluator/critic only: every drone and vehicle in one RNG component?"""
+    points = {**{f'__ground__{k}': np.asarray(q, float) for k, q in grounds.items()}, **drones}
+    adjacency = {key: relative_neighborhood(p, {k: q for k, q in points.items() if k != key}, comm_range)
+                 for key, p in points.items()}
+    reached, pending = set(), [next(iter(points))]
+    while pending:
+        key = pending.pop()
+        if key not in reached:
+            reached.add(key)
+            pending.extend(adjacency[key])
+    lengths = [np.linalg.norm(points[k]-points[j]) for k, links in adjacency.items() for j in links]
+    return len(reached) == len(points), max(lengths, default=0.)
+
+
 def backbone_metrics(drones, ground, comm_range=95.):
     """Evaluator/critic only. Never pass this global reconstruction to an actor."""
     points = {'__ground__': np.asarray(ground, float), **drones}
