@@ -113,10 +113,17 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     # of the way, and a target passes to a vehicle cheaper by vehicle_transfer_margin;
     # 'tree' budgets by the drones' coverage tree instead of the sum of target routes.
     scene_regime='any',vehicle_planner='parked',budget_reference='sum',
-    vehicle_depart_progress=.5,vehicle_transfer_margin=.15)
+    vehicle_depart_progress=.5,vehicle_transfer_margin=.15,
+    # 'link_keeping': each decentralized vehicle's onboard filter keeps its own
+    # backbone links within vehicle_keep_range (m, 3D, inside the drones' CBF
+    # edge) and yields to other vehicles (ground/vehicle_motion.py); 'free' is the
+    # first v2 run's unfiltered drive.
+    vehicle_motion='free',vehicle_keep_range=88.)
 
 # cograph_v2 is v1 plus the learned per-drone target choice (drone/cograph_v2_mappo.py).
 COGRAPH_ARCHITECTURES=('cograph_v1','cograph_v2')
+# The drones' CBF keeps a link below comm range minus its margin (95 - 0.25 m).
+COGRAPH_LINK_EDGE_M=94.75
 COOPERATIVE_ARCHITECTURES=('gat_cooperative_v7','gat_relay_attention_v8')+COGRAPH_ARCHITECTURES
 RELAY_ARCHITECTURES=('gat_relay_attention_v8',)+COGRAPH_ARCHITECTURES
 GRAPH_ARCHITECTURES=('gat_map_v1',)+COOPERATIVE_ARCHITECTURES
@@ -264,6 +271,14 @@ def validate_config(config):
             if isinstance(value,bool) or not isinstance(value,(int,float)) or not (low<value<=high if
                     name=='vehicle_depart_progress' else low<=value<high):
                 raise ValueError(f'{name} out of range')
+        if (config['vehicle_motion'] not in ('free','link_keeping')
+                or (config['vehicle_motion']=='link_keeping' and config['vehicle_planner']!='decentralized')):
+            raise ValueError('vehicle_motion is free, or link_keeping with decentralized vehicles')
+        keep=config['vehicle_keep_range']
+        if isinstance(keep,bool) or not isinstance(keep,(int,float)) or not 20.<keep<COGRAPH_LINK_EDGE_M:
+            raise ValueError(f'vehicle_keep_range must lie in (20, {COGRAPH_LINK_EDGE_M}) m')
+        if config['vehicle_motion']=='free' and keep!=DEFAULTS['vehicle_keep_range']:
+            raise ValueError('vehicle_keep_range needs vehicle_motion link_keeping')
         if (config['vehicle_planner']=='parked' and (config['vehicle_depart_progress'],
                 config['vehicle_transfer_margin'])!=(DEFAULTS['vehicle_depart_progress'],DEFAULTS['vehicle_transfer_margin'])):
             raise ValueError('vehicle_depart_progress/vehicle_transfer_margin need decentralized vehicles')
@@ -274,7 +289,9 @@ def validate_config(config):
     elif (config['target_count_range'] is not None or config['vehicle_count']!=1
             or (config['scene_regime'],config['vehicle_planner'],config['budget_reference'])!=('any','parked','sum')
             or (config['vehicle_depart_progress'],config['vehicle_transfer_margin'])
-               !=(DEFAULTS['vehicle_depart_progress'],DEFAULTS['vehicle_transfer_margin'])):
+               !=(DEFAULTS['vehicle_depart_progress'],DEFAULTS['vehicle_transfer_margin'])
+            or (config['vehicle_motion'],config['vehicle_keep_range'])
+               !=(DEFAULTS['vehicle_motion'],DEFAULTS['vehicle_keep_range'])):
         raise ValueError('target_count_range/vehicle_count/scene_regime/vehicle_planner/budget_reference/'
                          'vehicle_* require a CoGraph policy_architecture')
     if config['policy_architecture'] not in RELAY_ARCHITECTURES:
@@ -486,7 +503,8 @@ def reward_contract(config):
         return ('cograph_v2_task_option_space'
                 +('_single_task' if config['scene_regime']=='single_task' else '')
                 +('_decentralized_vehicles' if config['vehicle_planner']=='decentralized' else '')
-                +('_tree_budget' if config['budget_reference']=='tree' else '')+bridged)
+                +('_tree_budget' if config['budget_reference']=='tree' else '')
+                +('_vehicle_link_keeping' if config['vehicle_motion']=='link_keeping' else '')+bridged)
     # v8 changes observations/transport only; its reward is v7's unchanged.
     if config['policy_architecture'] in COOPERATIVE_ARCHITECTURES:
         # Bridging changes which delivered maps count as connected (map success).

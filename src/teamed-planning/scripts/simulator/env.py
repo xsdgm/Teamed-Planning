@@ -413,8 +413,8 @@ class MultiRobotEnv:
                 ):
                     robot1.position = robot1.prev_position.copy()
                     robot2.position = robot2.prev_position.copy()
-                    robot1.velocity = np.zeros(2)
-                    robot2.velocity = np.zeros(2)
+                    robot1.velocity = np.zeros(3)  # 3D velocity, like every other reset
+                    robot2.velocity = np.zeros(3)
                     info['collisions'].append({
                         'robot_id': robot1.robot_id,
                         'object': 'robot',

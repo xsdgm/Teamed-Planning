@@ -21,6 +21,11 @@ target as served and claims the next. Vehicles pool their fused graphs only
 while in radio range of each other (direct exchange); a vehicle that leaves
 keeps a copy and fuses on its own. The drones' CBF assumes the vehicle speed
 whenever a vehicle may move.
+
+vehicle_motion='link_keeping' (v2 only) adds each vehicle's onboard motion
+filter (ground/vehicle_motion.py): it keeps its own backbone links inside the
+drones' CBF edge (it waits for coverage instead of pulling drones past
+feasibility) and passes, makes way for or yields to other vehicles.
 """
 import contextlib
 import copy
@@ -36,6 +41,7 @@ from drone.relay_cache import RelayManager
 from ground.ground_main import GroundRobotController
 from ground.task_planner import coverage_tree
 from ground.vehicle_claims import VehicleClaimAgent
+from ground.vehicle_motion import EVENTS as MOTION_EVENTS, LocalMap, VehicleMotionFilter
 from simulator.cograph_scenarios import generate_cograph_scene
 from simulator.env import EnvConfig, MultiRobotEnv
 from simulator.mappo_experiment import (COMMUNICATION_RANGE_M, FLIGHT_HEIGHT_M, BRIDGE_CLEARANCE_M,
@@ -58,7 +64,8 @@ class CoGraphExperiment:
                  intervention_weight=0., chain_soft_ratio=.85, cbf_margin_weight=0., cbf_margin_scale=8.,
                  frontier_progress_weight=0., path_quality_weight=0., time_penalty=0.,
                  relay_loss=0., relay_delay_jitter=0, relay_period=1, relay_capacity=16,
-                 fusion_bridge_distance=0., vehicle_planner='parked', claim_options=None):
+                 fusion_bridge_distance=0., vehicle_planner='parked', claim_options=None,
+                 vehicle_motion='free', vehicle_keep_range=88.):
         architecture = getattr(model, 'policy_architecture', None)
         if architecture not in ('cograph_v1', 'cograph_v2'):
             raise ValueError('CoGraphExperiment requires a CoGraph policy')
@@ -66,6 +73,8 @@ class CoGraphExperiment:
         navigator = CoGraphV2Navigator if architecture == 'cograph_v2' else CoGraphNavigator
         if vehicle_planner not in ('parked', 'decentralized'):
             raise ValueError('vehicle_planner must be parked or decentralized')
+        if vehicle_motion not in ('free', 'link_keeping') or (vehicle_motion != 'free' and vehicle_planner != 'decentralized'):
+            raise ValueError('vehicle_motion is free, or link_keeping for decentralized vehicles')
         self.start = np.asarray(scene['start'], float)
         self.goals = np.asarray(scene['goals'], float)
         self.scene_attempts = scene['attempts']
@@ -125,6 +134,12 @@ class CoGraphExperiment:
         self.agents = ([VehicleClaimAgent(v.robot_id, k, **(claim_options or {})) for k, v in enumerate(self.vehicles)]
                        if vehicle_planner == 'decentralized' else None)
         self.vehicle_travel, self.vehicle_spread_max, self.pool_splits = 0., 0., 0
+        self.motion_filters = ([VehicleMotionFilter(v.robot_id, k, comm_range=COMMUNICATION_RANGE_M,
+                                                    keep_range=vehicle_keep_range, max_speed=ground_speed)
+                                for k, v in enumerate(self.vehicles)] if vehicle_motion == 'link_keeping' else None)
+        self.vehicle_contacts = 0
+        self.vehicle_stall = np.zeros(len(self.vehicles), int)
+        self.vehicle_stall_max = 0
         self.learned_choice = architecture == 'cograph_v2'
         self.distinct_foci = []
         self.vehicle_actions = [self._vehicle_action(k) for k in range(len(self.vehicles))]
@@ -188,10 +203,25 @@ class CoGraphExperiment:
                 # Stopped this cycle: never execute the motion computed before the stop.
                 action['motion'] = (0., 0.)
             action['broadcast'].update(agent.message())
+        if self.motion_filters is not None:
+            self._filter_vehicle_motion()
         moving = (any(v.goal_position is not None for v in self.vehicles)
                   or any(np.linalg.norm(a['motion']) > 0. for a in self.vehicle_actions))
         for c in self.controllers:
             c.ground_max_speed = self.ground_speed if moving else 0.
+
+    def _filter_vehicle_motion(self):
+        """Each vehicle's own onboard filter on its own command (link keeping, yielding)."""
+        for k, (vehicle, motion_filter) in enumerate(zip(self.vehicles, self.motion_filters)):
+            action = self.vehicle_actions[k]
+            waypoint = vehicle.global_planner.get_current_waypoint() if vehicle.final_goal is not None else None
+            semantic = getattr(vehicle, '_last_semantic_map', None)
+            local = None
+            if semantic is not None:
+                blocked, _ = vehicle.local_planner.observed_blocked_cells(
+                    semantic, vehicle.resolution, include_boundary=False, distance=.5)
+                local = LocalMap(blocked, vehicle.resolution, vehicle._last_semantic_map_position)
+            action['motion'], _ = motion_filter.filter(action['motion'], self.obs[self.vehicle_ids[k]], waypoint, local)
 
     def _split_pools(self, positions):
         """Vehicles exchange fused graphs directly only within radio range: a group
@@ -310,6 +340,11 @@ class CoGraphExperiment:
         for vehicle in self.vehicles:
             vehicle.unified_graph = vehicle.graph_fusion.get_unified_graph()
         if self.agents is not None:
+            self.vehicle_contacts += sum(c.get('object') == 'robot' for c in info['collisions'])
+            moved = np.array([np.linalg.norm(a-b) > .05 for a, b in zip(vehicles, old_vehicles)])
+            driving = np.array([v.final_goal is not None for v in self.vehicles])
+            self.vehicle_stall = np.where(driving & ~moved, self.vehicle_stall+1, 0)
+            self.vehicle_stall_max = max(self.vehicle_stall_max, int(self.vehicle_stall.max(initial=0)))
             self.vehicle_travel += float(sum(np.linalg.norm(a-b) for a, b in zip(vehicles, old_vehicles)))
             self.vehicle_spread_max = max(self.vehicle_spread_max, max(
                 (float(np.linalg.norm(a-b)) for a in vehicles for b in vehicles), default=0.))
@@ -435,7 +470,11 @@ class CoGraphExperiment:
                 vehicle_switches=float(sum(a.switches for a in agents)),
                 vehicle_departures=float(sum(a.departures for a in agents)),
                 targets_served=float(len(set().union(*(a.served for a in agents)))),
-                graph_pool_splits=float(self.pool_splits))
+                graph_pool_splits=float(self.pool_splits),
+                vehicle_contacts=float(self.vehicle_contacts), vehicle_stall_max_steps=float(self.vehicle_stall_max))
+            if self.motion_filters is not None:
+                total.update({f'vehicle_{event}_steps': float(sum(f.counts[event] for f in self.motion_filters))
+                              for event in MOTION_EVENTS})
         return total
 
 
@@ -467,7 +506,8 @@ def run_cograph_episode(model, config, scene_seed, schedule, stochastic, progres
             relay_period=config['relay_period'], relay_capacity=config['relay_capacity'],
             fusion_bridge_distance=config['fusion_bridge_distance'], vehicle_planner=config.get('vehicle_planner', 'parked'),
             claim_options=dict(depart_progress=config.get('vehicle_depart_progress', .5),
-                               transfer_margin=config.get('vehicle_transfer_margin', .15)))
+                               transfer_margin=config.get('vehicle_transfer_margin', .15)),
+            vehicle_motion=config.get('vehicle_motion', 'free'), vehicle_keep_range=config.get('vehicle_keep_range', 88.))
         rollout, reason, stable, max_link, bonus = [], 'budget', 0, 0., 0.
         improve = config['map_improvement_steps'] > 0
         milestone = last_gain = -1

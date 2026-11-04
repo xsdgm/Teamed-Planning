@@ -204,7 +204,10 @@ class SceneAndConfigTests(unittest.TestCase):
     def test_v2_config_contract_and_budget(self):
         v1, v2 = config('cograph_v1.json'), config('cograph_v2.json')
         self.assertEqual(reward_contract(v1), 'cograph_v1_multi_target_option_space_bridged')
-        self.assertEqual(reward_contract(v2),
+        # The first v2 run (free vehicles) and the link-keeping vehicles are labelled apart.
+        self.assertEqual(reward_contract(v2), 'cograph_v2_task_option_space_single_task_decentralized_vehicles'
+                         '_tree_budget_vehicle_link_keeping_bridged')
+        self.assertEqual(reward_contract(config('cograph_v2.json', vehicle_motion='free', vehicle_keep_range=88.)),
                          'cograph_v2_task_option_space_single_task_decentralized_vehicles_tree_budget_bridged')
         self.assertEqual((v2['ground_stationary'], v2['vehicle_planner'], v2['policy_architecture']),
                          (False, 'decentralized', 'cograph_v2'))

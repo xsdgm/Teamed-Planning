@@ -86,5 +86,7 @@
   "vehicle_planner": "decentralized",
   "budget_reference": "tree",
   "vehicle_depart_progress": 0.5,
-  "vehicle_transfer_margin": 0.15
+  "vehicle_transfer_margin": 0.15,
+  "vehicle_motion": "link_keeping",
+  "vehicle_keep_range": 88.0
 }
