@@ -1,0 +1,26 @@
+{
+  "algorithm": "vtmp3",
+  "model_architecture": "rssm_ab_vtmp3",
+  "parameters": {
+    "v11_config": "mappo_training_v11_2.json",
+    "train_scenes": 32,
+    "val_scenes": 8,
+    "test_scenes": 4,
+    "train_seed": 220000,
+    "val_seed": 320000,
+    "test_seed": 420000,
+    "max_steps": 32,
+    "max_seconds": 2400,
+    "epochs": 100,
+    "rounds": 2,
+    "threads": 2,
+    "device": "cpu",
+    "setup_seconds": 8,
+    "survey_speed": 2,
+    "delay_jitter": 0.5,
+    "failure_probability": 0.15,
+    "distance_failure_probability": 0.15,
+    "communication_failure_probability": 0.05,
+    "timeout_seconds": 180
+  }
+}

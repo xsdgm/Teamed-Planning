@@ -54,7 +54,7 @@ def reference_route(free,start,goal,resolution=1.):
 
 
 def generate_large_scene(seed,distances=(100.,250.,500.,750.),world=1000.,density=ORIGINAL_ACTIVE_DENSITY,
-                         start=None, heading=0.):
+                         start=None, heading=0., ground_safety_distance=1.5):
     rng=np.random.default_rng(seed)
     start=np.array([30.,world/2.]) if start is None else np.asarray(start,dtype=float)
     direction=np.array([np.cos(heading),np.sin(heading)])
@@ -70,17 +70,17 @@ def generate_large_scene(seed,distances=(100.,250.,500.,750.),world=1000.,densit
         components,_=label(feasible)
         sx,sy=np.floor(start).astype(int)
         if not components[sy,sx] or any(components[int(g[1]),int(g[0])]!=components[sy,sx] for g in goals.values()):continue
-        reference=raster_free(circles,world,1.5+math.sqrt(.5))
+        reference=raster_free(circles,world,ground_safety_distance+math.sqrt(.5))
         routes={d:reference_route(reference,start,g) for d,g in goals.items()}
         # Check actual continuous segments, including endpoint-to-grid access.
         # A disconnected or geometrically invalid sample is never dispatched.
-        if not all(reference_geometry_clear(circles, start, goals[d], route['points'], world)
+        if not all(reference_geometry_clear(circles, start, goals[d], route['points'], world, ground_safety_distance)
                    for d, route in routes.items()):
             continue
         return dict(seed=seed,start=start.tolist(),world=world,goals={d:g.tolist() for d,g in goals.items()},
             circles=[(p.tolist(),r) for p,r in circles],attempts=attempt,density=density,
-            reference_resolution_m=1.,reference_clearance_m=1.5+math.sqrt(.5),references=routes,
-            reference_geometry_validated=True,reference_geometric_clearance_m=1.5)
+            reference_resolution_m=1.,reference_clearance_m=ground_safety_distance+math.sqrt(.5),references=routes,
+            reference_geometry_validated=True,reference_geometric_clearance_m=ground_safety_distance)
     raise RuntimeError(f'No feasible large scene for seed {seed}')
 
 
@@ -102,8 +102,8 @@ class CircleGeometry:
         return bool((np.linalg.norm(relative-t[:,None]*delta,axis=1)>self.radii[ids]+self.clearance).all())
 
 
-def reference_geometry_clear(circles, start, goal, points, world=1000.):
-    geometry = CircleGeometry(circles, world=world, clearance=1.5)
+def reference_geometry_clear(circles, start, goal, points, world=1000., clearance=1.5):
+    geometry = CircleGeometry(circles, world=world, clearance=clearance)
     path = [start, *points, goal]
     return all(geometry.clear(a, b) for a, b in zip(path, path[1:]))
 
@@ -115,7 +115,7 @@ def reference_polyline_length(start, goal, points):
 
 
 def generate_training_scene(seed, distances=(350,550,750), world=1000., distance_range=None,
-                            distance_sampling='linear'):
+                            distance_sampling='linear', ground_safety_distance=1.5):
     """Random task pose, same obstacle density; truth used only at setup."""
     rng=np.random.default_rng(seed ^ 0x5A17)
     if distance_sampling not in ('linear', 'annulus_area'):
@@ -137,7 +137,8 @@ def generate_training_scene(seed, distances=(350,550,750), world=1000., distance
     upper=np.minimum(world-margin,world-margin-delta)
     if (upper<=lower).any():raise ValueError('Task distance does not fit world with formation margin')
     start=rng.uniform(lower,upper)
-    scene=generate_large_scene(seed,(distance,),world,start=start,heading=heading)
+    scene=generate_large_scene(seed,(distance,),world,start=start,heading=heading,
+                               ground_safety_distance=ground_safety_distance)
     scene['distance']=distance
     scene['goal']=scene['goals'][distance_key(distance)]
     scene['reference_length']=scene['references'][distance_key(distance)]['length']

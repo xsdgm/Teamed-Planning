@@ -1,0 +1,14 @@
+{
+  "algorithm": "vtmp2",
+  "model_architecture": "rssm_target_vtmp2",
+  "parameters": {
+    "train_scenes": 32,
+    "val_scenes": 8,
+    "workers": 6,
+    "max_steps": 4000,
+    "epochs": 100,
+    "device": "cpu",
+    "horizon_steps": 8,
+    "particles": 4
+  }
+}
