@@ -13,10 +13,12 @@ from typing import Dict, Tuple, Optional
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from drone.semantic_segmentation import SemanticProcessor, TerrainType
+from drone.local_mapping import prepare_local_mapping, mapping_semantic_map
 from drone.skeleton_graph_builder import SkeletonGraphBuilder
-from drone.graph_broadcaster import GraphBroadcaster, RobotDetector
+from drone.communication import (
+    ChainState, received_geometry, received_geometry_multi, relative_neighborhood,
+)
 from drone.drone_navigator import DroneNavigator
-from common.message_definitions import SimpleMessageBroker
 from common.graph_structure import TopologicalGraph
 from common.timing import PerformanceTimer
 
@@ -31,6 +33,8 @@ class DroneController:
     - Graph broadcasting to other drones and robots
     - Graph fusion with nearby drones
     """
+
+    supports_local_mapping = True
     
     def __init__(self, drone_id: str, resolution: float = 0.5,
                  broadcast_interval: float = 5.0,
@@ -76,14 +80,11 @@ class DroneController:
         self.safety_filter=safety_filter or 'legacy'
         self.safety_stats={}
         self.communication_mode=communication_mode or 'direct'
-        # v8 relay cache (drone/relay_cache.py); the transport layer supplies
+        # v8 relay cache (drone/communication.py); the transport layer supplies
         # delivered envelopes as observation['relay_envelopes'].
         self.relay=None
         # CoGraph: several vehicles are separate backbone nodes, keyed by robot_id.
         self.multi_vehicle=False
-        from drone.chain_state import ChainState
-        self._chain_state=ChainState(drone_id,total_drones if self.communication_mode=='chain' else 1)
-
         # Initialize modules
         self.semantic_processor = SemanticProcessor(resolution=resolution)
 
@@ -120,15 +121,6 @@ class DroneController:
         if safety_filter is None:
             self.safety_filter=getattr(self.navigator,'checkpoint_safety_filter','legacy')
         self._chain_state=ChainState(drone_id,total_drones if self.communication_mode=='chain' else 1)
-        
-        # NOTE: GraphBroadcaster and RobotDetector are kept for future ground robot integration
-        # Currently using unified dict-based broadcast in get_action()
-        self.broadcaster = GraphBroadcaster(
-            drone_id=drone_id,
-            broadcast_interval=broadcast_interval
-        )
-        
-        self.robot_detector = RobotDetector()
         
         # Performance timer
         self.timer = PerformanceTimer(drone_id)
@@ -204,7 +196,7 @@ class DroneController:
                             neighbor_waypoints[other_drone_id] = tuple(waypoint)
                         for robot_id, mission in broadcast_msg.get('ground_missions', {}).items():
                             stored = ground_robots.get(robot_id)
-                            if (self.multi_vehicle and stored is not None and not stored.get('direct')
+                            if (stored is not None and not stored.get('direct')
                                     and mission.get('source_time', -np.inf) > stored.get('source_time', -np.inf)):
                                 # Keep the freshest forwarded copy; two drones relaying each
                                 # other's first-come copies would otherwise let it age out.
@@ -231,6 +223,10 @@ class DroneController:
                         if broadcast_msg.get('targets') is not None:
                             # CoGraph mission: every task target and this vehicle's route status.
                             ground_robots[robot_id]['targets'] = broadcast_msg['targets']
+                        if broadcast_msg.get('survey') is not None:
+                            # Survey endpoints are independent of the real vehicle position.
+                            # Forward them with the received mission, never simulator truth.
+                            ground_robots[robot_id]['survey'] = broadcast_msg['survey']
         
         return {
             'position': position,
@@ -297,12 +293,10 @@ class DroneController:
         chain=getattr(self.navigator,'chain',self._chain_state)
         grounds=None
         if self.communication_mode=='backbone' and self.multi_vehicle:
-            from drone.local_backbone import received_geometry_multi, relative_neighborhood
             peers, _, grounds = received_geometry_multi(self.position, observation)
             required = relative_neighborhood(self.position, {**peers, **grounds}, self.communication_range)
             ground = None
         elif self.communication_mode=='backbone':
-            from drone.local_backbone import received_geometry, relative_neighborhood
             peers, _, ground = received_geometry(self.position, observation)
             visible = dict(peers)
             if ground is not None:
@@ -310,8 +304,8 @@ class DroneController:
             required = relative_neighborhood(self.position, visible, self.communication_range)
         elif self.communication_mode=='chain' and chain is not None:
             required=chain.required
-            task=chain.task()
-            ground=task['position'] if task is not None and '__ground__' in chain.visible else None
+            # A vehicle without a navigation goal is still a radio endpoint.
+            ground=chain.visible.get('__ground__')
         else:
             required=('__ground__',)
             ground=self.navigator.ground_robot_position
@@ -321,6 +315,14 @@ class DroneController:
             if neighbor['type'] in ('diff_drive','holonomic') and ground is not None:
                 ground=np.asarray(self.position)+np.asarray(neighbor['relative_position'])
                 break
+        self.safety_request=dict(position=np.asarray(self.position,float).copy(),
+            nominal=np.asarray(velocity,float).copy(),peers=peers,dt=dt,
+            required_links=tuple(required),ground=ground,grounds=grounds,
+            ground_max_speed=getattr(self,'ground_max_speed',0.),
+            world_bounds=getattr(self.navigator,'world_bounds',None),
+            max_speed=self.max_speed,min_separation=self.navigator.min_separation,
+            comm_range=self.communication_range,margin=.25,
+            sample_time=observation.get('full_state',{}).get('time'))
         return CBFSafetyFilter(self.navigator.min_separation,
             self.communication_range,self.max_speed).filter(velocity,self.position,peers,dt,
             required_links=required,ground=ground,
@@ -399,14 +401,18 @@ class DroneController:
         
         # Step 1: Parse simulator observation (adapter)
         with self.timer.measure("observation_parsing"):
+            self._current_local_mapping = prepare_local_mapping(self, simulator_obs)
             parsed_obs = self._parse_simulator_observation(simulator_obs)
             self.position = parsed_obs['position']
         
         # Step 2: Transform occupancy map to semantic map
         with self.timer.measure("semantic_map_generation"):
-            semantic_map = self._generate_semantic_map(
-                parsed_obs['occupancy_map']
-            )
+            # Fine geometry is for mapping only; nav_obs below retains the
+            # original policy pixels, axes and checkpoint input dimensions.
+            semantic_map = (self._generate_semantic_map(parsed_obs['occupancy_map'])
+                            if self._current_local_mapping is None else
+                            mapping_semantic_map(self._current_local_mapping,
+                                                 self._generate_semantic_map))
             # Store for visualization (debug)
             self._last_semantic_map = semantic_map
             self._last_semantic_map_position = self.position
@@ -459,7 +465,6 @@ class DroneController:
             nav_obs['sensor_valid'] = simulator_obs.get('sensor_valid', True)
         self._chain_state.update(nav_obs)
         if self.communication_mode=='backbone' and self.multi_vehicle:
-            from drone.local_backbone import received_geometry_multi, relative_neighborhood
             peers, velocities, grounds = received_geometry_multi(self.position, simulator_obs)
             required = relative_neighborhood(self.position, {**peers, **grounds}, self.communication_range)
             self.navigator.required_links = required
@@ -467,7 +472,6 @@ class DroneController:
             nav_obs['cooperation'] = dict(peers=peers, velocities=velocities, ground=nearest,
                                           grounds=grounds, required=required)
         elif self.communication_mode=='backbone':
-            from drone.local_backbone import received_geometry, relative_neighborhood
             peers, velocities, ground = received_geometry(self.position, simulator_obs)
             visible = dict(peers)
             if ground is not None:
@@ -551,7 +555,6 @@ class DroneController:
             observation: Dictionary containing:
                 - 'position': (x, y, z) drone position
                 - 'semantic_map': np.ndarray of terrain types
-                - 'nearby_robots': List of (robot_id, (x, y)) tuples
                 - 'drones': Dict of {drone_id: {'position': (x,y,z)}} for nearby drones
                 - (optional) other sensor data
             other_drones_data: Optional dict of {drone_id: TopologicalGraph} from nearby drones
@@ -562,7 +565,6 @@ class DroneController:
         current_time = time.time()
         self.position = observation['position']
         semantic_map = observation['semantic_map']
-        nearby_robots = observation.get('nearby_robots', [])
         nearby_drones = observation.get('drones', {})
         
         # Step 1: Semantic processing and graph building/updating
@@ -595,19 +597,13 @@ class DroneController:
         self.last_fusion_stats = fusion_stats
         
         # Step 3: Prepare broadcast data with graph and position (unified for all robots)
-        # NOTE: Old GraphBroadcaster system commented out - now using unified dict format
-        # with self.timer.measure("broadcasting"):
-        #     message = self.broadcaster.broadcast(
-        #         graph=self.current_graph,
-        #         current_time=current_time,
-        #         nearby_robots=nearby_robots
-        #     )
-        
         broadcast_data = None
         if self.current_graph is not None:
             with self.timer.measure("broadcasting"):
+                self._broadcast_graph = self.current_graph.to_message()
+                self._last_graph_broadcast_time = current_time
                 broadcast_data = {
-                    'graph': self.current_graph.to_message(),
+                    'graph': self._broadcast_graph,
                     'position': list(self.position),
                     'drone_id': self.drone_id,
                     'timestamp': current_time,
@@ -708,7 +704,8 @@ class DroneController:
             'drone_id': self.drone_id,
             'position': self.position,
             'graph_nodes': len(self.current_graph) if self.current_graph else 0,
-            'last_broadcast_time': self.broadcaster.last_broadcast_time
+            'last_broadcast_time': (self._last_graph_broadcast_time
+                                    if self._broadcast_graph is not None else 0.0)
         }
 
 

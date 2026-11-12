@@ -16,13 +16,13 @@ v7 只改动 Python 仿真、训练和检查点恢复路径。ROS/PX4 实飞接�
 
 ## 为什么原来的 v6 不够
 
-[ChainState](../src/teamed-planning/scripts/drone/chain_state.py) 根据 fleet_ids 固定前驱、后继；CBF 必须保住这些边。共享团队奖励能够鼓励协作，但不能解除固定链条。原 [GAT](../src/teamed-planning/scripts/drone/graph_attention_mappo.py) 编码的是导航地图节点与可通行边，不是无人机消息图。
+[ChainState](../src/teamed-planning/scripts/drone/communication.py) 根据 fleet_ids 固定前驱、后继；CBF 必须保住这些边。共享团队奖励能够鼓励协作，但不能解除固定链条。原 [GAT](../src/teamed-planning/scripts/drone/graph_attention_mappo.py) 编码的是导航地图节点与可通行边，不是无人机消息图。
 
 ## v7 的三个组成部分
 
 ### 1. 动态局部通信骨架
 
-[local_backbone.py](../src/teamed-planning/scripts/drone/local_backbone.py) 使用相对邻域图（relative neighborhood graph，RNG）。对当前可见的 i、j，仅在不存在第三节点 k 同时满足下式时保留 ij：
+[communication.py](../src/teamed-planning/scripts/drone/communication.py) 使用相对邻域图（relative neighborhood graph，RNG）。对当前可见的 i、j，仅在不存在第三节点 k 同时满足下式时保留 ij：
 
 \[
 \max(\|p_i-p_k\|,\|p_j-p_k\|)<\|p_i-p_j\|.
@@ -84,7 +84,7 @@ v6 文件、默认行为、旧模型加载分支保留。v7 新开训练目录�
 
 ## 验证与下一步实验
 
-[专项测试](../src/teamed-planning/scripts/simulator/test_cooperative_v7.py) 覆盖几何规则的双端对称、重命名/排列不变、等距情况、多个随机点集的连通分量保持、CBF 连续步内连通、远端转发位置不冒充物理邻居、空邻居处理、真实短程训练/验证/检查点/恢复，以及实际远端证据多跳送达。
+[专项测试](../src/teamed-planning/scripts/tests/simulator/test_cooperative_v7.py) 覆盖几何规则的双端对称、重命名/排列不变、等距情况、多个随机点集的连通分量保持、CBF 连续步内连通、远端转发位置不冒充物理邻居、空邻居处理、真实短程训练/验证/检查点/恢复，以及实际远端证据多跳送达。
 
 首轮完整 simulator 回归：206 项、1 项按设计跳过，其余通过（104.929 秒）。随后增加并增强了一个真实多跳/角色交换测试，v7 专项 8 项全部通过（7.033 秒）：把 drone_1 放到车辆近端、drone_0 放到远端，远端证据经实际邻机转发后进入车辆账本，远端区域的导航节点也进入车辆融合图，且通信持续连通。短训练只验证实现链路，不代表已经学会中继行为。
 

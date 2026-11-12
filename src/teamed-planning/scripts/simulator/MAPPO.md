@@ -51,8 +51,10 @@ src/teamed-planning/scripts/simulator/start_mappo_training.sh --workers 16 --out
 python -I src/teamed-planning/scripts/simulator/train_mappo.py --config src/teamed-planning/config/algorithm/mappo_training_1000m.json --output artifacts/mappo-1000m-new
 python -I src/teamed-planning/scripts/simulator/validate_mappo_2d.py --run artifacts/mappo-navigation-v4-20261017 --output artifacts/mappo-current-validation-new --seeds 32000 32001
 python -I src/teamed-planning/scripts/simulator/evaluate_large_world.py --run artifacts/mappo-navigation-v4-20261017 --output artifacts/mappo-current-large-new
-python -I -m unittest discover -s src/teamed-planning/scripts/simulator -p 'test_*.py'
 ```
+
+回归测试已迁至 [tests/simulator](../tests/simulator)，完整运行命令见
+[测试说明](README.md#regression-tests)。历史运行时测试需分别启动独立进程，避免与当前包混用。
 
 以上是独立运行说明。输出目录必须为新目录；训练恢复使用 `--resume`。`artifacts/mappo-1000m-parallel-20261019` 已于第 820 回合按用户要求停止，其检查点早于下文修正，当前代码拒绝恢复该批次。
 

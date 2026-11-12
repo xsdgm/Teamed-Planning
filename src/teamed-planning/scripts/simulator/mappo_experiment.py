@@ -2,8 +2,9 @@
 
 Training entry point: simulator/train_mappo.py; validation: validate_mappo_2d.py
 No simulator full_state, velocity or obstacle list enters the learner/reward.
-A scalar feasible reference length may normalize training-only route quality;
-the reference path and map truth never enter Actor/Critic observations.
+A scalar feasible reference length normalizes legacy fixed-start route quality.
+V9 uses the current endpoints' straight-line lower bound, not an optimality
+oracle. Reference paths and map truth never enter Actor/Critic observations.
 """
 import sys
 import time
@@ -16,21 +17,21 @@ from drone.drone_main import DroneController
 from drone.drone_navigator import DroneNavigator
 from drone.mappo import ActorCritic, CandidateNavigator
 from drone.velocity_mappo import VelocityNavigator
-from simulator.env import EnvConfig, MultiRobotEnv
+from simulator.env import EnvConfig, MultiRobotEnv, RelayChannel
 from ground.ground_main import GroundRobotController
 from simulator.scenarios import generate_scene, ENVIRONMENT_VERSION
-from simulator.navigation_metrics import task_graph_metrics, RouteQualityTracker
+from simulator.navigation_metrics import task_graph_metrics, RouteQualityTracker, vehicle_route_update
 from simulator.ppo_batch import clip_gradients
-from simulator.relay_channel import RelayChannel
-from drone.relay_cache import RelayManager
+from drone.communication import RelayManager
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 
 
 COMMUNICATION_RANGE_M = 95.
 FLIGHT_HEIGHT_M = 15.
-COOPERATIVE_ARCHITECTURES = ('gat_cooperative_v7', 'gat_relay_attention_v8')
+COOPERATIVE_ARCHITECTURES = ('gat_cooperative_v7', 'gat_relay_attention_v8', 'gat_survey_v10', 'gat_route_ab_v11')
 RELAY_DEFAULTS = dict(relay_loss=0., relay_delay_jitter=0, relay_period=1, relay_capacity=16)
-# Vehicle-side component bridging: free corridor half-width, the drones' graph clearance.
-BRIDGE_CLEARANCE_M = 1.5
+# Compatibility alias; mapping, bridges and driving share one default.
+BRIDGE_CLEARANCE_M = DEFAULT_GROUND_CLEARANCE_M
 # Per-step relay diagnostics (v8); evaluator truth is used only for the error.
 RELAY_STEP_METRICS = ('relay_token_count', 'relay_vehicle_known', 'relay_remote_fraction',
                       'relay_age_s', 'relay_max_hop', 'relay_position_error_m')
@@ -88,7 +89,11 @@ def velocity_task_reward(cost_before, cost_after, old_seen, seen, task_region,
 def velocity_mapping_reward(cost_before, cost_after, initial_cost, old_seen, seen,
                             task_region, route_weight=10., exploration_weight=.2,
                             time_penalty=.01):
-    """Fixed surveyed start->goal map potential; no vehicle performance input."""
+    """Map improvement at matched endpoints chosen by the caller.
+
+    Legacy callers retain fixed start/goal across frames; v9 compares maps
+    before/after delivery at one frozen current position and active target.
+    """
     area=float(np.count_nonzero(seen & ~old_seen & task_region)*4.)
     mapping=route_weight*float(cost_before-cost_after)/max(initial_cost,1e-8)
     exploration=exploration_weight*area/400.
@@ -239,17 +244,33 @@ class Experiment:
                  path_quality_weight=0.,route_reference_length=None,mapping_until_connected=False,
                  cbf_margin_weight=0.,cbf_margin_scale=8.,frontier_progress_weight=0.,
                  relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,
-                 fusion_bridge_distance=0.):
+                 fusion_bridge_distance=0., mapping_route_origin='initial',
+                 ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M, coordinated_safety=False):
         if type(num_drones) is not int or num_drones < 2:
             raise ValueError('At least two drones are required for the chain experiment')
         if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
             raise ValueError('Unsupported reward_mode')
+        if mapping_route_origin not in ('initial', 'vehicle'):
+            raise ValueError('mapping_route_origin must be initial or vehicle')
+        self.mapping_route_origin = mapping_route_origin
+        self.vehicle_route_mapping = mapping_route_origin == 'vehicle'
+        if self.vehicle_route_mapping and (reward_mode != 'velocity_mapping' or not moving_ground
+                                          or ground_stationary):
+            raise ValueError('Vehicle-origin mapping requires a moving vehicle')
         if ground_stationary and (subgoal_radius is not None or not moving_ground):
             raise ValueError('A stationary vehicle keeps its map receiver and has no subgoals')
         if subgoal_radius is not None and not (subgoal_radius>0 and moving_ground):
             raise ValueError('subgoal_radius must be positive and requires a moving ground robot')
         if not 0<=fusion_bridge_distance<float('inf'):
             raise ValueError('fusion_bridge_distance must be a finite nonnegative distance')
+        if (isinstance(ground_safety_distance,bool) or not isinstance(ground_safety_distance,(int,float))
+                or not np.isfinite(ground_safety_distance) or ground_safety_distance<=0):
+            raise ValueError('ground_safety_distance must be positive and finite')
+        self.ground_safety_distance=float(ground_safety_distance)
+        self.coordinated_safety=bool(coordinated_safety)
+        self.coordinated_safety_events=[]
+        if self.coordinated_safety and (communication_mode!='backbone' or drop!=0. or safety_filter!='cbf'):
+            raise ValueError('Joint safety recovery requires synchronous backbone geometry and CBF')
         self.world_size=float(world_size)
         self.start=np.asarray(start,dtype=float)
         self.stop_on_ground_arrival=bool(stop_on_ground_arrival)
@@ -266,7 +287,7 @@ class Experiment:
         # v8 delays/drops only relayed state evidence; one-hop geometry, maps
         # and the CBF keep the v7 synchronous contract.
         self.relay_channel=(RelayChannel(seed,relay_loss,relay_delay_jitter,relay_period)
-                            if architecture=='gat_relay_attention_v8' else None)
+                            if architecture in ('gat_relay_attention_v8','gat_survey_v10', 'gat_route_ab_v11') else None)
         if self.relay_channel is None and relay!=RELAY_DEFAULTS:
             raise ValueError('relay_* settings require the v8 relay attention policy')
         if type(relay_capacity) is not int or relay_capacity<1:
@@ -293,12 +314,14 @@ class Experiment:
         self._frontier_best=0.
         self.route_reward_weight=float(route_reward_weight)
         self.path_quality_weight=float(path_quality_weight)
-        if self.path_quality_weight and route_reference_length is None:
+        if self.path_quality_weight and route_reference_length is None and not self.vehicle_route_mapping:
             raise ValueError('Path quality reward requires a physical reference length')
         self.route_quality_tracker=(RouteQualityTracker(route_reference_length)
-            if reward_mode=='velocity_mapping' and route_reference_length is not None else None)
+            if reward_mode=='velocity_mapping' and route_reference_length is not None
+            and not self.vehicle_route_mapping else None)
         self.mapping_until_connected=bool(mapping_until_connected)
-        if self.mapping_until_connected and (self.route_quality_tracker is None or not self.path_quality_weight):
+        if self.mapping_until_connected and (not self.path_quality_weight or
+                (not self.vehicle_route_mapping and self.route_quality_tracker is None)):
             raise ValueError('Map-term hand-over requires the route quality reward')
         self.time_penalty=float(time_penalty)
         # The vehicle still receives and fuses maps but does not drive.
@@ -336,7 +359,7 @@ class Experiment:
             c = DroneController(f'drone_{i}', resolution=2., total_drones=num_drones,
                 communication_range=COMMUNICATION_RANGE_M, max_speed=6., broadcast_interval=1., fusion_interval=5.,
                 communication_mode=communication_mode,safety_filter=safety_filter,
-                graph_min_clearance=1.5)
+                graph_min_clearance=self.ground_safety_distance)
             if getattr(model, 'action_mode', None) == 'velocity':
                 navigator_type = VelocityNavigator
                 if cooperative:
@@ -364,7 +387,7 @@ class Experiment:
         # With relay subgoals the vehicle drives to, and broadcasts, the subgoal.
         self.ground_controller=GroundRobotController('ground_0',resolution=2.,
             perception_range=8.,max_linear_vel=ground_speed,max_angular_vel=1.,
-            fusion_interval=5.,safety_distance=1.5,subgoal_radius=subgoal_radius,
+            fusion_interval=5.,safety_distance=self.ground_safety_distance,subgoal_radius=subgoal_radius,
             subgoal_arrival=subgoal_arrival,
             world_bounds=bounds)
         self.ground_controller.set_goal(tuple(self.goal))
@@ -382,8 +405,10 @@ class Experiment:
             # occupancy delivered to it shows free; drones' graphs are unchanged.
             fusion=self.ground_controller.graph_fusion
             fusion.bridge_distance=float(fusion_bridge_distance)
-            fusion.bridge_check=lambda a,b: self.ledger.segment_clear(a,b,BRIDGE_CLEARANCE_M)
-        self.reward_task_region = self.ledger.task_mask(self.start, self.goal)
+            fusion.bridge_check=lambda a,b: self.ledger.segment_clear(a,b,self.ground_safety_distance)
+        initial_target=(self.subgoals.target if self.vehicle_route_mapping
+                        and self.subgoals is not None else self.goal)
+        self.reward_task_region = self.ledger.task_mask(self.start, initial_target)
         self.algorithm = algorithm
         self.trace = []
         self.first_graph_connection_step = -1
@@ -427,7 +452,7 @@ class Experiment:
         links=[np.linalg.norm(drones[0]-ground)]+[np.linalg.norm(drones[i]-drones[i-1])
                                                   for i in range(1,len(drones))]
         if self.communication_mode=='backbone':
-            from drone.local_backbone import backbone_metrics
+            from drone.communication import backbone_metrics
             _, longest = backbone_metrics({str(i): np.r_[p, FLIGHT_HEIGHT_M] for i,p in enumerate(drones)},
                                           np.r_[ground, 0.], COMMUNICATION_RANGE_M)
             links = [longest]
@@ -435,9 +460,14 @@ class Experiment:
         scale=max(self.initial_goal_distance,1.)
         # Path cost after the previous step's map update; empty map before the first step.
         cost=self.trace[-1]['ground_path_cost'] if self.trace else scale/.05
+        target=self.goal
+        if self.vehicle_route_mapping:
+            target=self.goal if self.subgoals is None else self.subgoals.target
+            if not self.trace:
+                cost=navigation_cost(self.ground_controller.unified_graph,ground,target)
         connected=bool(self._graph_metrics and self._graph_metrics['graph_task_connected'])
         return np.array([frame/budget,(budget-frame)/1000.,self.ledger.seen.sum()*4/1e5,
-            float(connected),stability,np.linalg.norm(ground-self.goal)/scale,scale/1000.,
+            float(connected),stability,np.linalg.norm(ground-target)/scale,scale/1000.,
             min(float(cost)*.05/scale,2.),max(links)/95.,separation/100.],np.float32)
 
     def step(self, frame):
@@ -477,8 +507,8 @@ class Experiment:
                 speed = np.linalg.norm(action['motion'])
                 if speed > distance:
                     action['motion'] *= distance/max(speed, 1e-8)
-            # Never mutate a command after the CBF. Fail explicitly on an
-            # infeasible filter rather than silently proceeding as if safe.
+            # Only a second, explicit joint safety solve may replace these
+            # commands below. Never clip or zero a verified command afterward.
             stats=c.safety_stats
             chain_terms.append(communication_chain_terms(stats,self.chain_soft_ratio,
                 c.communication_range,c.max_speed))
@@ -517,6 +547,24 @@ class Experiment:
                     valid_counts.append(int(mask.sum()))
                     selected_distances.append(float(features[selected,2]*100.))
                     holds.append(float(selected == 0))
+        if infeasible and self.coordinated_safety:
+            from drone.cbf_safety import filter_joint
+            commands,diagnostic=filter_joint({c.drone_id:c.safety_request for c in self.controllers})
+            if commands is not None:
+                self.coordinated_safety_events.append(dict(frame=frame,**diagnostic))
+                for index,(rid,c) in enumerate(zip(self.ids,self.controllers)):
+                    actions[rid]['motion']=commands[c.drone_id]
+                    stats=c.safety_stats
+                    stats['independent_cbf_infeasible']=stats['infeasible']
+                    stats['independent_cbf_max_constraint_residual']=stats['max_constraint_residual']
+                    stats['infeasible']=False
+                    stats['coordinated_recovery']=True
+                    stats['max_constraint_residual']=diagnostic['max_constraint_residual']
+                    stats['feasibility_margin_scope']='independent_cbf_before_joint_recovery'
+                    stats['joint_min_slack_m_s']=diagnostic['min_slack_m_s']
+                    stats['intervention']=float(np.linalg.norm(commands[c.drone_id]-c._nominal_velocity))
+                    interventions[index]=stats['intervention']**2/36.
+                infeasible=0
         if infeasible:
             raise SafetyTermination(infeasible,samples)
         self.obs, info = self.env.step(actions)
@@ -530,6 +578,11 @@ class Experiment:
         # so a subgoal switch never appears as a map improvement.
         target=self.goal if self.subgoals is None else self.subgoals.target.copy()
         cost_before=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],target)
+        if self.vehicle_route_mapping:
+            # Freeze BOTH endpoints after physics, before fusion/delivery. Comparing
+            # successive timesteps would pay for driving or changing the subgoal.
+            vehicle_before=task_graph_metrics(self.ground_controller.unified_graph,
+                ground_position[:2],target,self.ledger.connector_clear)
         if self.moving_ground:
             self.ground_action=self._ground_action(ground_received)
         cost_after=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],target)
@@ -550,7 +603,20 @@ class Experiment:
                         self.latest_delivered_frames.get(source,-1))
         current = np.array([self.obs[r]['self']['position'] for r in self.ids])
         graph=self.ground_controller.unified_graph
-        if (self.reward_mode=='velocity_mapping' or self._graph_metrics is None
+        if self.vehicle_route_mapping:
+            vehicle_after=task_graph_metrics(graph,ground_position[:2],target,self.ledger.connector_clear)
+            vehicle_terms=vehicle_route_update(vehicle_before,vehicle_after,ground_position[:2],target)
+            active_target=(self.goal if self.subgoals is None else self.subgoals.target).copy()
+            target_changed=not np.array_equal(active_target,target)
+            # The reward remains on the frozen target; observations and displayed
+            # graph metrics follow the new active target immediately after a switch.
+            self._graph_metrics=(task_graph_metrics(graph,ground_position[:2],active_target,
+                self.ledger.connector_clear) if target_changed else vehicle_after)
+            active_terms=vehicle_route_update(self._graph_metrics,self._graph_metrics,
+                ground_position[:2],active_target)
+            region=self.ledger.task_mask(ground_position[:2],target)
+            self.reward_task_region=region
+        elif (self.reward_mode=='velocity_mapping' or self._graph_metrics is None
                 or graph is not self._graph_metric_source or frame % 5 == 0):
             self._graph_metrics=task_graph_metrics(graph,self.start,self.goal,
                                                   self.ledger.connector_clear)
@@ -563,10 +629,18 @@ class Experiment:
         reward,terms=cadmm_exploration_reward(cost_before,cost_after,old_seen,
             self.ledger.seen,self.exploration_weight,self.path_reward_scale)
         metrics.update(terms)
-        # Fixed start->goal route on the delivered graph, independent of the vehicle.
-        route_before=self._route_cost
-        self._route_cost=navigation_cost(self.ground_controller.unified_graph,self.start,self.goal)
-        route,route_terms=route_graph_reward(route_before,self._route_cost,self._initial_route_cost,
+        if self.vehicle_route_mapping:
+            route_before,route_after=cost_before,cost_after
+            route_scale=max(vehicle_terms['route_reference_length_m'],1.)/.05
+            self._route_cost=(navigation_cost(graph,ground_position[:2],active_target)
+                              if target_changed else cost_after)
+        else:
+            # Legacy v8 fixed-start potential is preserved for existing runs.
+            route_before=self._route_cost
+            self._route_cost=navigation_cost(self.ground_controller.unified_graph,self.start,self.goal)
+            route_after=self._route_cost
+            route_scale=self._initial_route_cost
+        route,route_terms=route_graph_reward(route_before,route_after,route_scale,
             self.route_reward_weight,self.time_penalty)
         metrics.update(route_terms)
         if self.reward_mode=='route_graph':
@@ -582,29 +656,49 @@ class Experiment:
                 self.path_reward_scale, self.time_penalty)
             metrics.update(focused_terms)
         elif self.reward_mode=='velocity_mapping':
-            if self.route_quality_tracker is not None:
+            if self.vehicle_route_mapping:
+                metrics.update(vehicle_terms)
+                # Signed changes also charge a lost route. Reconnection/rebuilds
+                # cannot repeatedly collect an unopposed first-connection bonus.
+                handed_over=self.mapping_until_connected and bool(
+                    vehicle_before['graph_task_connected'] or vehicle_after['graph_task_connected'])
+            elif self.route_quality_tracker is not None:
                 metrics.update(self.route_quality_tracker.update(self._graph_metrics))
-            # From the first connected route (this step included) route quality
-            # alone pays; the map cost would pay connection and shortening twice.
-            handed_over=self.mapping_until_connected and self.route_quality_tracker.first_length is not None
-            reward,focused_terms=velocity_mapping_reward(route_before,self._route_cost,
-                self._initial_route_cost,old_seen,self.ledger.seen,self.reward_task_region,
+            # Route quality alone pays connected routes, avoiding duplicate map
+            # cost credit. Legacy hands over once; v9 decides per frozen pair.
+            if not self.vehicle_route_mapping:
+                handed_over=self.mapping_until_connected and self.route_quality_tracker.first_length is not None
+            reward,focused_terms=velocity_mapping_reward(route_before,route_after,
+                route_scale,old_seen,self.ledger.seen,region if self.vehicle_route_mapping else self.reward_task_region,
                 0. if handed_over else self.route_reward_weight,self.exploration_weight,self.time_penalty)
             metrics.update(focused_terms)
             metrics['path_quality_reward']=self.path_quality_weight*metrics.get('route_quality_gain',0.)
             metrics['first_path_quality_reward']=self.path_quality_weight*metrics.get('route_first_quality_gain',0.)
             metrics['path_shortening_reward']=self.path_quality_weight*metrics.get('route_shortening_quality_gain',0.)
             reward+=metrics['path_quality_reward']
-            # v5: how far the delivered start-connected graph reaches toward the
-            # goal (1 once connected). Only best-so-far gains pay, so the episode
-            # sum is weight*best progress; graph rebuilds cannot farm it.
-            remaining=self._graph_metrics.get('graph_frontier_goal_distance_m',self.initial_goal_distance)
-            progress=1. if self._graph_metrics['graph_task_connected'] else float(
-                np.clip(1.-remaining/max(self.initial_goal_distance,1e-8),0.,1.))
-            gain=max(progress-self._frontier_best,0.)
-            self._frontier_best=max(self._frontier_best,progress)
-            metrics.update(frontier_progress=progress,frontier_best_progress=self._frontier_best,
-                frontier_progress_reward=self.frontier_progress_weight*gain)
+            if self.vehicle_route_mapping:
+                gain=vehicle_terms['frontier_progress_gain']
+                metrics.update(mapping_route_origin_vehicle=1.,
+                    route_origin_x=float(ground_position[0]),route_origin_y=float(ground_position[1]),
+                    route_target_x=float(active_target[0]),route_target_y=float(active_target[1]),
+                    reward_route_target_x=float(target[0]),reward_route_target_y=float(target[1]),
+                    route_target_changed=float(target_changed),
+                    reward_route_quality_after=vehicle_terms['route_quality'],
+                    reward_route_reference_length_m=vehicle_terms['route_reference_length_m'],
+                    route_quality=active_terms['route_quality'],
+                    route_reference_length_m=active_terms['route_reference_length_m'],
+                    current_route_length_m=self._graph_metrics['graph_task_path_length'],
+                    frontier_progress=active_terms['frontier_progress'],
+                    frontier_progress_reward=self.frontier_progress_weight*gain)
+            else:
+                # Legacy v5: best-so-far progress from the fixed initial start.
+                remaining=self._graph_metrics.get('graph_frontier_goal_distance_m',self.initial_goal_distance)
+                progress=1. if self._graph_metrics['graph_task_connected'] else float(
+                    np.clip(1.-remaining/max(self.initial_goal_distance,1e-8),0.,1.))
+                gain=max(progress-self._frontier_best,0.)
+                self._frontier_best=max(self._frontier_best,progress)
+                metrics.update(frontier_progress=progress,frontier_best_progress=self._frontier_best,
+                    frontier_progress_reward=self.frontier_progress_weight*gain)
             reward+=metrics['frontier_progress_reward']
         metrics.update(reward_beta=1.,reward_eta=self.exploration_weight)
         # Penalties use local received safety telemetry, not evaluator truth.
@@ -637,7 +731,7 @@ class Experiment:
             max(np.linalg.norm(np.asarray(old[i])-old[i-1]),np.linalg.norm(current[i]-current[i-1]))
             for i in range(1,len(self.ids))]
         if self.communication_mode=='backbone':
-            from drone.local_backbone import backbone_metrics
+            from drone.communication import backbone_metrics
             connected, _ = backbone_metrics({str(i): p for i,p in enumerate(current)}, ground_position,
                                              COMMUNICATION_RANGE_M)
             lookup = {c.drone_id:i for i,c in enumerate(self.controllers)}
@@ -676,7 +770,7 @@ class Experiment:
         metrics.update(ground_distance=float(np.linalg.norm(ground_position-old_ground)),
             ground_goal_distance=float(np.linalg.norm(ground_position[:2]-self.goal)),
             ground_collisions=float(len(info['collisions'])),goal_reached=float(self.goal_reached),
-            ground_path_cost=cost_after)
+            ground_path_cost=self._route_cost if self.vehicle_route_mapping else cost_after)
         metrics.update(self._graph_metrics)
         metrics.update(valid_actions=float(np.mean(valid_counts)) if valid_counts else 0.,
             forced_hold_fraction=float(np.mean(np.asarray(valid_counts)==1)) if valid_counts else 0.,
@@ -729,17 +823,44 @@ class Experiment:
             relay_position_error_m=float(np.mean(errors)) if errors else 0.)
 
     def summary(self):
+        # CBF can reject the very first joint action before any physics step.
+        # Report the observed initial state without inventing a trace sample.
+        if self.trace:
+            last = self.trace[-1]
+            graph_metrics = self._graph_metrics
+            initial_separation = 0.
+        else:
+            ground = np.asarray(self.obs[self.ground]['self']['position'], float)[:2]
+            target = self.goal if self.subgoals is None else self.subgoals.target
+            graph_metrics = task_graph_metrics(self.ground_controller.unified_graph,
+                ground if self.vehicle_route_mapping else self.start,
+                target if self.vehicle_route_mapping else self.goal, self.ledger.connector_clear)
+            last = dict(graph_metrics, ground_goal_distance=float(np.linalg.norm(ground-self.goal)),
+                        fallback=0)
+            if self.vehicle_route_mapping:
+                last.update(vehicle_route_update(graph_metrics, graph_metrics, ground, target))
+                last.update(mapping_route_origin_vehicle=1.,
+                    current_route_length_m=graph_metrics['graph_task_path_length'],
+                    route_origin_x=float(ground[0]), route_origin_y=float(ground[1]),
+                    route_target_x=float(target[0]), route_target_y=float(target[1]))
+            points = [np.asarray(self.obs[r]['self']['position'], float) for r in self.ids]
+            initial_separation = min((float(np.linalg.norm(a-b)) for i,a in enumerate(points)
+                                      for b in points[:i]), default=0.)
+        def mean(key):
+            return float(np.mean([t[key] for t in self.trace])) if self.trace else 0.
         total = {k: float(sum(t[k] for t in self.trace)) for k in
                  ('task_gain','outside_gain','outside_new','positive_task_gain',
                   'positive_outside_gain','distance','reward','spacing_violation','collisions','out_of_bounds',
                   'cadmm_gain','cadmm_reward','exploration_area','exploration_reward','ground_distance','ground_collisions',
                   'route_reward')}
         total['goal_reached']=float(self.goal_reached)
-        total['ground_goal_distance']=self.trace[-1]['ground_goal_distance']
+        total['ground_goal_distance']=last['ground_goal_distance']
         total['ground_progress']=self.initial_goal_distance-total['ground_goal_distance']
         total['episode_steps']=len(self.trace)
         total['scene_attempts']=self.scene_attempts
         total['num_drones']=len(self.ids)
+        total['coordinated_safety_enabled']=self.coordinated_safety
+        total['coordinated_safety_steps']=len(self.coordinated_safety_events)
         total['boundary_roundoff_count']=float(sum(t['boundary_roundoff_count'] for t in self.trace))
         for key in ('boundary_roundoff_max_m', 'boundary_violation_max_m'):
             total[key]=float(max((t[key] for t in self.trace), default=0.))
@@ -751,47 +872,59 @@ class Experiment:
             for key in ('path_quality_reward','first_path_quality_reward','path_shortening_reward',
                         'route_new_best_saving_m','frontier_progress_reward'):
                 total[key]=float(sum(t.get(key,0.) for t in self.trace))
-            total['frontier_best_progress']=float(self.trace[-1].get('frontier_best_progress',0.))
+            total['frontier_best_progress']=float(last.get('frontier_best_progress',0.))
             for key in ('route_first_length_m','route_best_length_m','route_quality',
                         'route_best_quality','route_excess_m'):
-                total[key]=float(self.trace[-1].get(key,0.))
+                total[key]=float(last.get(key,0.))
+            if self.vehicle_route_mapping:
+                # No "best route" is comparable across moving origins/targets.
+                for key in ('route_first_length_m','route_best_length_m','route_best_quality',
+                            'route_excess_m','route_new_best_saving_m','frontier_best_progress'):
+                    total.pop(key,None)
+                for key in ('mapping_route_origin_vehicle','route_reference_length_m',
+                            'route_reference_is_lower_bound','route_quality',
+                            'current_route_length_m','route_origin_x','route_origin_y',
+                            'route_target_x','route_target_y','frontier_progress'):
+                    total[key]=float(last[key])
+                total['route_target_switches']=float(sum(t['route_target_changed'] for t in self.trace))
+                total['route_length_delta_m']=float(sum(t['route_length_delta_m'] for t in self.trace))
         for key in ('chain_risk_cost','chain_outward_cost','chain_missing_cost','cbf_margin_cost'):
             total[key]=float(sum(t[key] for t in self.trace))
         for key in ('chain_risk','chain_outward_risk','chain_missing_fraction','chain_links_available',
                     'cbf_margin_risk'):
-            total[key]=float(np.mean([t[key] for t in self.trace]))
-        total['cbf_margin_min_m_s']=float(min(t['cbf_margin_min_m_s'] for t in self.trace))
-        total['chain_max_distance_ratio']=float(max(t['chain_max_distance_ratio'] for t in self.trace))
-        for key in self._graph_metrics:
-            total[key]=self.trace[-1][key]
+            total[key]=mean(key)
+        total['cbf_margin_min_m_s']=float(min((t['cbf_margin_min_m_s'] for t in self.trace), default=0.))
+        total['chain_max_distance_ratio']=float(max((t['chain_max_distance_ratio'] for t in self.trace), default=0.))
+        for key in graph_metrics:
+            total[key]=last[key]
         total['graph_first_connection_step']=float(self.first_graph_connection_step)
         for key in ('valid_actions','forced_hold_fraction','hold_fraction','selected_waypoint_distance','zero_reward'):
-            total[key]=float(np.mean([t[key] for t in self.trace]))
+            total[key]=mean(key)
         positive=np.maximum([t['reward'] for t in self.trace],0.)
         total['first_minute_positive_share']=float(positive[:60].sum()/max(positive.sum(),1e-8))
-        total['min_step_reward']=float(min(t['reward'] for t in self.trace))
-        total['max_step_reward']=float(max(t['reward'] for t in self.trace))
+        total['min_step_reward']=float(min((t['reward'] for t in self.trace), default=0.))
+        total['max_step_reward']=float(max((t['reward'] for t in self.trace), default=0.))
         for k in ('simultaneous_moving','moving_fraction','communication_outage','decision_ms',
                   'reward_beta','reward_eta','reward_focus','evidence_source_coverage','max_evidence_age'):
-            total[k] = float(np.mean([t[k] for t in self.trace]))
+            total[k] = mean(k)
         total['task_share'] = total['positive_task_gain']/max(total['positive_task_gain']+total['positive_outside_gain'],1e-8)
-        total['fallback'] = self.trace[-1]['fallback']
+        total['fallback'] = last['fallback']
         total['coverage_area'] = float(self.ledger.seen.sum()*4)
         total['confidence_area'] = float(self.ledger.confidence().sum()*4)
         for key in ('spacing_cost','intervention_cost','chain_link_violation'):
             total[key]=float(sum(t[key] for t in self.trace))
-        total['min_separation']=float(min(t['min_separation'] for t in self.trace))
-        total['cbf_intervention']=float(np.mean([t['cbf_intervention'] for t in self.trace]))
+        total['min_separation']=float(min((t['min_separation'] for t in self.trace), default=initial_separation))
+        total['cbf_intervention']=mean('cbf_intervention')
         if self.relay_channel is not None:
             for key in RELAY_STEP_METRICS:
-                total[key]=float(np.mean([t[key] for t in self.trace]))
+                total[key]=mean(key)
             for key,value in self.relay_channel.stats.items():
                 total[f'relay_packets_{key}']=float(value)
             for key in ('accepted','duplicate','stale','expired','future'):
                 total[f'relay_entries_{key}']=float(sum(c.relay.stats[key] for c in self.controllers))
         if getattr(self.controllers[0].navigator, 'uses_velocity', False):
-            total['nominal_speed_mean'] = float(np.mean([t['nominal_speed_mean'] for t in self.trace]))
-            total['executed_speed_mean'] = float(np.mean([t['executed_speed_mean'] for t in self.trace]))
+            total['nominal_speed_mean'] = mean('nominal_speed_mean')
+            total['executed_speed_mean'] = mean('executed_speed_mean')
         # Independent evaluator only: truth never enters rewards or network.
         seen = self.ledger.seen
         seen_positions = self.ledger.xy[seen]

@@ -30,7 +30,7 @@ import math
 
 import numpy as np
 
-from drone.local_backbone import relative_neighborhood
+from drone.communication import relative_neighborhood
 
 EVENTS = ('link_limited', 'link_hold', 'contact_limited', 'passing', 'make_way', 'yielding', 'retreat')
 

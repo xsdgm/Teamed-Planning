@@ -6,14 +6,10 @@ from torch.nn import functional as F
 
 if __package__:
     from .data import CHANNELS, FEATURES, SIDE, DELTA_SCALE
+    from .models import RecurrentWorldModel
 else:
     from data import CHANNELS, FEATURES, SIDE, DELTA_SCALE
-
-
-if __package__:
-    from .rssm import RecurrentWorldModel
-else:
-    from rssm import RecurrentWorldModel
+    from models import RecurrentWorldModel
 
 
 class Vtmp2WorldModel(RecurrentWorldModel):

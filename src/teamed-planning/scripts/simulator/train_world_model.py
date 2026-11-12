@@ -42,7 +42,7 @@ def build_command(config_path, overrides=(), algorithm=None):
             continue
         if not isinstance(value, (str, int, float)):
             raise ValueError('Pipeline option values must be scalars')
-        if key == 'v11_config':
+        if key in ('v11_config', 'wildscenes_manifest'):
             value = str((path.parent/value).resolve())
         arguments.extend((option, str(value)))
     return [sys.executable, '-I', '-B', str(SCRIPTS/'world_model'/PIPELINES[selected]),

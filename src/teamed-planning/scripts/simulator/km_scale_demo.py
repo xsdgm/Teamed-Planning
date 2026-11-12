@@ -5,7 +5,7 @@ Demonstrates navigation with broadcast communication
 
 import numpy as np
 from .env import MultiRobotEnv, EnvConfig
-from .forest_generator import create_forest_scenario
+from .obstacles import create_forest_scenario
 
 # Simple navigation policy with broadcast
 def navigate_to_target(obs, target):

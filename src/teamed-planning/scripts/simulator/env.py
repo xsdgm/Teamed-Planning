@@ -8,7 +8,6 @@ from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
 from .robots import GroundRobot, Drone
 from .obstacles import CircleObstacle, RectObstacle
-from .utils import check_collision_circle_circle, check_collision_circle_rect
 
 
 # Metres: only numerical boundary noise, not a physical safety margin.
@@ -30,6 +29,9 @@ class EnvConfig:
     ground_occupancy_map_size: int = None  # Size of occupancy map in pixels for ground robots (if None, auto-calculated)
     occupancy_map_resolution: float = 0.5  # Resolution in meters per pixel
     ground_occupancy_map_resolution: float = None  # Optional independent ground sensor resolution
+    # Same local footprint, finer obstacle raster for vehicle motion. Keep the
+    # original occupancy map available for legacy consumers and aerial policy.
+    ground_navigation_resolution: float = 0.1  # None disables the additional local sensor grid
     
 
 class MultiRobotEnv:
@@ -239,8 +241,49 @@ class MultiRobotEnv:
                     if isinstance(robot,GroundRobot) else self.config.occupancy_map_resolution)
                 observations[robot.robot_id]['map_axes'] = 'yx'
                 observations[robot.robot_id]['time_step'] = self.config.dt
+                if isinstance(robot, GroundRobot) and self.config.ground_navigation_resolution is not None:
+                    resolution = float(self.config.ground_navigation_resolution)
+                    if not np.isfinite(resolution) or resolution <= 0:
+                        raise ValueError('Ground navigation resolution must be positive and finite')
+                    if resolution < observations[robot.robot_id]['map_resolution']:
+                        grid, resolution = self._generate_ground_navigation_map(robot.position, resolution)
+                        observations[robot.robot_id]['navigation_map'] = grid
+                        observations[robot.robot_id]['navigation_resolution'] = resolution
         
         return observations
+
+    def _generate_ground_navigation_map(self, position, resolution):
+        """Conservative cell/obstacle intersections in the local sensor window.
+
+        A coarse occupied cell cannot establish whether the vehicle itself is
+        colliding. Resolve that ambiguity with a finer *observed* raster, never
+        by clearing the self cell or exposing the world's obstacle list to the
+        controller. No information outside the original footprint is added.
+        """
+        width = float(self.config.ground_perception_radius)
+        size = max(2, int(np.ceil(width / resolution)))
+        size += size % 2  # Preserve the existing even, vehicle-centred indexing.
+        resolution = width / size
+        lower = np.asarray(position, float)[:2] - width / 2.
+        grid = np.zeros((size, size), dtype=np.uint8)
+        for obstacle in self._nearby_obstacles(position, width):
+            center = np.asarray(obstacle.position, float)
+            extent = (np.full(2, obstacle.radius) if obstacle.type == 'circle'
+                      else np.asarray(obstacle.size, float) / 2.)
+            first = np.maximum(0, np.ceil((center-extent-lower)/resolution).astype(int)-1)
+            last = np.minimum(size-1, np.floor((center+extent-lower)/resolution).astype(int))
+            if np.any(first > last):
+                continue
+            x0, y0 = first; x1, y1 = last
+            if obstacle.type == 'circle':
+                xs = lower[0] + np.arange(x0, x1+1)*resolution
+                ys = lower[1] + np.arange(y0, y1+1)*resolution
+                dx = np.maximum(np.maximum(xs-center[0], center[0]-xs-resolution), 0.)
+                dy = np.maximum(np.maximum(ys-center[1], center[1]-ys-resolution), 0.)
+                grid[y0:y1+1, x0:x1+1] |= (dy[:,None]**2+dx[None,:]**2 <= obstacle.radius**2)
+            elif obstacle.type == 'rect':
+                grid[y0:y1+1, x0:x1+1] = 1
+        return grid, resolution
     
     def _generate_occupancy_map(self, robot_position: np.ndarray, robot_type: str = 'drone') -> np.ndarray:
         """
@@ -487,3 +530,78 @@ class MultiRobotEnv:
             if robot.robot_id == robot_id:
                 return robot
         return None
+
+
+def check_collision_circle_circle(pos1: np.ndarray, r1: float,
+                                  pos2: np.ndarray, r2: float) -> bool:
+    """Check if two circles collide"""
+    distance = np.linalg.norm(pos1 - pos2)
+    return distance < (r1 + r2)
+
+
+def check_collision_circle_rect(circle_pos: np.ndarray, circle_radius: float,
+                                rect_pos: np.ndarray, rect_width: float,
+                                rect_height: float) -> bool:
+    """Check if circle and rectangle collide (AABB method)"""
+    half_w = rect_width / 2
+    half_h = rect_height / 2
+
+    rect_left = rect_pos[0] - half_w
+    rect_right = rect_pos[0] + half_w
+    rect_bottom = rect_pos[1] - half_h
+    rect_top = rect_pos[1] + half_h
+
+    closest_x = np.clip(circle_pos[0], rect_left, rect_right)
+    closest_y = np.clip(circle_pos[1], rect_bottom, rect_top)
+    closest_point = np.array([closest_x, closest_y])
+
+    distance = np.linalg.norm(circle_pos - closest_point)
+    return distance < circle_radius
+
+
+class RelayChannel:
+    """Simulated v8 relay transport: one event queue per directed physical link.
+
+    A packet is transmitted only to devices within actual radio range at its send
+    step, arrives no earlier than the next decision step (so nothing propagates
+    recursively through the whole network within one step), and may be lost or
+    delayed (jitter also reorders packets). Every hop is a new transmission.
+    Receivers see packets only once arrival <= their decision step.
+    """
+
+    def __init__(self, seed, loss=0., delay_jitter=0, period=1):
+        if not 0. <= loss < 1.:
+            raise ValueError('relay loss must be in [0, 1)')
+        if type(delay_jitter) is not int or delay_jitter < 0 or type(period) is not int or period < 1:
+            raise ValueError('relay delay_jitter must be a nonnegative and period a positive integer')
+        # A private stream: the relay draws never shift other simulator randomness.
+        self.rng = np.random.default_rng([int(seed), 0x7638])
+        self.loss, self.delay_jitter, self.period = float(loss), delay_jitter, period
+        self.phase = {}
+        self.queues = {}
+        self.order = 0
+        self.stats = dict(sent=0, lost=0, delivered=0)
+
+    def due(self, sender, frame):
+        if sender not in self.phase:
+            self.phase[sender] = int(self.rng.integers(self.period))
+        return (frame+self.phase[sender]) % self.period == 0
+
+    def transmit(self, envelope, receivers, frame):
+        for receiver in receivers:
+            self.stats['sent'] += 1
+            if self.rng.random() < self.loss:
+                self.stats['lost'] += 1
+                continue
+            arrival = frame+1+int(self.rng.integers(self.delay_jitter+1))
+            self.order += 1
+            # Each receiver gets its own copy; later sender cache changes cannot leak in.
+            packet = [dict(e, state=dict(e['state'])) for e in envelope]
+            self.queues.setdefault(receiver, []).append((arrival, self.order, packet))
+
+    def deliver(self, receiver, frame):
+        queue = self.queues.get(receiver, [])
+        ready = sorted(item for item in queue if item[0] <= frame)
+        self.queues[receiver] = [item for item in queue if item[0] > frame]
+        self.stats['delivered'] += len(ready)
+        return [packet for _, _, packet in ready]

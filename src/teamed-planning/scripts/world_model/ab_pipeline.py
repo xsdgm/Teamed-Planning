@@ -23,9 +23,9 @@ import numpy as np
 import torch
 
 from simulator.large_world_scenarios import generate_training_scene
-from world_model.ab_contract import ACTION_CONTRACT, ALGORITHM
-from world_model.ab_environment import SurveyNavigationEnv
-from world_model.ab_mapping import MappingConfig, ProxyMapper
+from world_model.ab_environment import (
+    ACTION_CONTRACT, ALGORITHM, SurveyNavigationEnv, MappingConfig, ProxyMapper,
+)
 from world_model.ab_planner import ModelPlanner, bootstrap_select
 from world_model.ab_training import atomic_json, load_model, train
 
@@ -36,7 +36,8 @@ def scene_for(seed, config):
 
 
 def geometry_hash(scene):
-    geometry = {key: scene[key] for key in ('world', 'start', 'goal', 'circles')}
+    keys = ('world', 'start', 'goal', 'terrain_region_id') if 'terrain_region_id' in scene else ('world', 'start', 'goal', 'circles')
+    geometry = {key: scene[key] for key in keys}
     return hashlib.sha256(json.dumps(geometry, sort_keys=True).encode()).hexdigest()
 
 
@@ -64,7 +65,12 @@ def collect_episode(scene, config, max_steps, max_seconds, *, model=None, device
         terminated=np.array([False]*(n-1)+[env.done]), truncated=np.array([False]*(n-1)+[not env.done]),
         algorithm=np.asarray(ALGORITHM), action_contract=np.asarray(ACTION_CONTRACT),
         seed=np.asarray(scene['seed']), geometry_sha256=np.asarray(geometry_hash(scene)),
-        backend=np.asarray(ProxyMapper.name))
+        backend=np.asarray(env.mapper.name))
+    if 'terrain_region_id' in scene:
+        arrays.update(terrain_region_id=np.asarray(scene['terrain_region_id']),
+            terrain_source_sha256=np.asarray(scene['terrain_source_sha256']),
+            terrain_origin_xy=np.asarray(scene['terrain_origin_xy']),
+            terrain_world_m=np.asarray(scene['world']))
     summary = dict(seed=scene['seed'], reached=env.done, transitions=n,
         elapsed_seconds=env.elapsed, goal_distance_m=float(np.linalg.norm(env.goal-env.position)),
         failure_tasks=sum(row['status'] != 'complete' for row in decisions),
@@ -109,13 +115,22 @@ def freeze_sources(output, args):
     source_config = Path(args.v11_config).resolve()
     shutil.copyfile(source_config, output/'v11_2_config.json')
     manifest['v11_2_config.json'] = hashlib.sha256((output/'v11_2_config.json').read_bytes()).hexdigest()
+    if args.wildscenes_manifest:
+        from world_model.ab_wildscenes import freeze_manifest
+        frozen = freeze_manifest(args.wildscenes_manifest, output/'wildscenes_inputs')
+        for item in frozen.parent.glob('*.json'):
+            manifest[str(item.relative_to(output))] = hashlib.sha256(item.read_bytes()).hexdigest()
     atomic_json(output/'source_manifest.json', manifest)
     return sources/'world_model/ab_pipeline.py'
 
 
 def mapping_config(args):
     source = json.loads(Path(args.v11_config).read_text())
-    return MappingConfig(world=source['world_size'], resolution=source['survey_resolution'],
+    world = source['world_size']
+    if args.wildscenes_manifest:
+        from world_model.ab_wildscenes import load_manifest
+        world = load_manifest(args.wildscenes_manifest)['world_size_m']
+    return MappingConfig(world=world, resolution=source['survey_resolution'],
         half_width=source['survey_half_width'], clearance=source['ground_safety_distance'],
         ground_speed=source['ground_speed'], fleet_size=source['fleet_sizes'][0],
         failure_probability=args.failure_probability,
@@ -132,8 +147,18 @@ def run(args):
     torch.set_num_interop_threads(1)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    provider = None
+    backend_name = ProxyMapper.name
+    if args.wildscenes_manifest:
+        from world_model.ab_wildscenes import WildScenesSource, WildScenesMapper
+        provider = WildScenesSource(args.wildscenes_manifest, cfg)
+        backend_name = WildScenesMapper.name
+        atomic_json(output/'terrain_manifest.json', provider.spec)
+    def sample_scene(seed, split):
+        return provider.scene(seed, split) if provider else scene_for(seed, cfg)
     atomic_json(output/'config.json', dict(algorithm=ALGORITHM, action_contract=ACTION_CONTRACT,
-        args=vars(args), mapping=asdict(cfg), backend=ProxyMapper.name,
+        args=vars(args), mapping=asdict(cfg), backend=backend_name,
+        terrain='wildscenes_simplified' if provider else 'random_circles',
         proxy_calibrated_to_v11_2=False, real_uav_policy_used=False,
         navigation='Dijkstra on conservative received-cell navigation graph; bounded kinematic path follower',
         model_selection='one_macro_step_model_predictive_control',
@@ -150,7 +175,7 @@ def run(args):
     for split in ('train', 'val'):
         for seed in seeds[split]:
             atomic_json(output/'status.json', dict(stage='collecting', split=split, seed=seed, pid=os.getpid()))
-            scene = scene_for(seed, cfg)
+            scene = sample_scene(seed, split)
             scenes[seed] = scene
             atomic_json(output/'scenes'/f'{split}_{seed}.json', scene)
             summaries.append(save_episode(output, split, scene, cfg, args))
@@ -162,7 +187,9 @@ def run(args):
                 seed = args.train_seed+round_index*10000+index
                 if seed in set(sum(seeds.values(), [])) or seed in scenes:
                     raise ValueError('Aggregated training seed collides with an existing scene')
-                scene = scene_for(seed, cfg); scenes[seed] = scene
+                atomic_json(output/'status.json', dict(stage='collecting', split='train', round=round_index+1,
+                                                      seed=seed, pid=os.getpid()))
+                scene = sample_scene(seed, 'train'); scenes[seed] = scene
                 atomic_json(output/'scenes'/f'train_{seed}.json', scene)
                 summaries.append(save_episode(output, 'train', scene, cfg, args, model=model, exploration=.2))
             atomic_json(output/'collection_manifest.json', summaries)
@@ -174,7 +201,7 @@ def run(args):
     test_results = []
     for seed in seeds['test']:
         atomic_json(output/'status.json', dict(stage='closed_loop_test', seed=seed, pid=os.getpid()))
-        scene = scene_for(seed, cfg)
+        scene = sample_scene(seed, 'test')
         if geometry_hash(scene) in {geometry_hash(s) for s in scenes.values()}:
             raise ValueError('Test scene geometry overlaps training or validation')
         atomic_json(output/'scenes'/f'test_{seed}.json', scene)
@@ -200,6 +227,7 @@ def main():
     parser.add_argument('--output', required=True)
     default_config = Path(__file__).resolve().parents[2]/'config/algorithm/mappo_training_v11_2.json'
     parser.add_argument('--v11-config', default=str(default_config))
+    parser.add_argument('--wildscenes-manifest', help='Spatially separated simplified WildScenes regions')
     parser.add_argument('--frozen', action='store_true', help=argparse.SUPPRESS)
     for name, default in (('train-scenes', 32), ('val-scenes', 8), ('test-scenes', 4),
                           ('train-seed', 210000), ('val-seed', 310000), ('test-seed', 410000),
@@ -223,6 +251,8 @@ def main():
         forwarded = [value for value in sys.argv[1:]]
         command = [sys.executable, '-I', '-B', str(frozen_entry), *forwarded,
                    '--v11-config', str(output/'v11_2_config.json'), '--output', str(output), '--frozen']
+        if args.wildscenes_manifest:
+            command.extend(['--wildscenes-manifest', str(output/'wildscenes_inputs/manifest.json')])
         atomic_json(output/'launch.json', dict(command=command, started_at=time.time()))
         return subprocess.call(command)
     try:

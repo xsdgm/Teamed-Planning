@@ -4,7 +4,7 @@ import json
 import math
 import unittest
 
-from world_model.reconnaissance import ReconnaissanceEnvelope
+from world_model.runtime import ReconnaissanceEnvelope
 
 
 class ReconnaissanceEnvelopeTests(unittest.TestCase):

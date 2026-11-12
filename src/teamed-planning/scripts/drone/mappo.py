@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 from drone.drone_navigator import DroneNavigator, NavigationPhase
-from drone.chain_state import ChainState
+from drone.communication import ChainState
 
 FEATURES = 12
 MAX_ACTIONS = 21
@@ -22,7 +22,7 @@ def legal_observation(obs):
     """
     return dict(graph=obs.get('graph'), time=float(obs.get('time', 0)),
                 ground_robots={str(k): {f: v[f] for f in
-                    ('position', 'target', 'planned_path', 'source_time', 'direct', 'targets') if f in v}
+                    ('position', 'target', 'planned_path', 'source_time', 'direct', 'targets', 'survey') if f in v}
                     for k, v in obs.get('ground_robots', {}).items()},
                 nearby_drones={str(k): {'position': v['position']}
                     for k, v in obs.get('nearby_drones', {}).items()
@@ -45,6 +45,12 @@ class ActorCritic(nn.Module):
     @classmethod
     def from_state_dict(cls, state):
         """Rebuild with the critic width stored in the weights (older checkpoints: 0)."""
+        if 'route_ab_schema' in state:
+            from drone.survey_mappo import RouteABActorCritic
+            return RouteABActorCritic.from_state_dict(state)
+        if 'survey_schema' in state:
+            from drone.survey_mappo import SurveyActorCritic
+            return SurveyActorCritic.from_state_dict(state)
         if 'selector.prior.weight' in state:
             from drone.cograph_v2_mappo import CoGraphV2ActorCritic
             return CoGraphV2ActorCritic.from_state_dict(state)

@@ -95,13 +95,13 @@ R选点 = min(配置上限, R侦查)
 实现及依赖清单都在 [src/teamed-planning/scripts/world_model](../../../src/teamed-planning/scripts/world_model/)：
 
 - `data.py`：观测编码与数据采集。
+- [models.py](../../../src/teamed-planning/scripts/world_model/models.py)：共享循环模型与版本选择。
 - `model.py`：`Vtmp2WorldModel` 与训练损失；保留 `WorldModel` 导入别名。
 - `planner.py`：只读取当前合法观测的多步模型推演与候选评分。
 - `mission.py`：驾驶/无人机侦察联合任务选点与重选。
 - `mission_pipeline.py`：双任务数据采集、训练和模型闭环执行入口。
 - `vtmp2.py`：临时目标候选、证据检查、重选和运行时接口。
-- `reconnaissance.py`：通信约束下的侦查范围计算。
-- `runtime.py`：冻结控制器的运行时适配，不修改存档源码。
+- [runtime.py](../../../src/teamed-planning/scripts/world_model/runtime.py)：通信约束下的侦查范围计算，以及冻结控制器的运行时适配，不修改存档源码。
 - `feasibility.py`：训练场景的连续物理路径认证和证据存档。
 - `train.py`：世界模型监督训练、确定性验证和检查点续训。
 - `pipeline.py`：独立后台运行的筛选、采集、训练流程。

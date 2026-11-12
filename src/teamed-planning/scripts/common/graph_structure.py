@@ -330,11 +330,13 @@ class TopologicalGraph:
                        merge_distance_threshold: float = 3.0,
                        current_time: Optional[float] = None) -> Dict[str, int]:
         """
-        Fuse another graph into this graph with intelligent node merging.
+        Fuse observation evidence without changing the geometry of source edges.
         
         Args:
             other_graph: The graph to fuse into this one
-            merge_distance_threshold: Distance threshold for merging nodes (meters)
+            merge_distance_threshold: Retained for call compatibility. Proximity
+                alone cannot establish a traversable connection, so only nodes
+                at exactly the same coordinates are merged.
             current_time: Current timestamp (defaults to time.time())
             
         Returns:
@@ -349,14 +351,13 @@ class TopologicalGraph:
             'edges_added': 0
         }
         
-        # Incremental index for this fusion only. Rebuilding a KD-tree for
-        # every averaged node makes large fleet graphs unnecessarily slow.
-        cell_size = merge_distance_threshold if merge_distance_threshold > 0 else 1.
-        def cell(position):
-            return tuple(int(np.floor(value / cell_size)) for value in position[:2])
-        buckets = {}
+        # An observed edge certifies its original segment, not a segment to a
+        # nearby or averaged endpoint. Even very close nodes may be separated
+        # by an obstacle. Exact coordinate equality preserves that certificate
+        # and also makes repeated relay packets idempotent.
+        positions = {}
         for node_id, data in self.graph.nodes(data=True):
-            buckets.setdefault(cell(data['position']), []).append(node_id)
+            positions.setdefault(tuple(data['position']), node_id)
         
         # Track mapping from other_graph node_ids to this graph node_ids
         node_mapping = {}
@@ -365,84 +366,58 @@ class TopologicalGraph:
         for other_node_id, other_node_data in other_graph.graph.nodes(data=True):
             other_pos = other_node_data['position']
             
-            # Check if this position is close to an existing node
-            cx, cy = cell(other_pos)
-            nearby_nodes = []
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    for node_id in buckets.get((cx + dx, cy + dy), []):
-                        distance = float(np.linalg.norm(np.asarray(other_pos) - self.graph.nodes[node_id]['position']))
-                        if distance <= merge_distance_threshold:
-                            nearby_nodes.append((node_id, distance))
-            nearby_nodes.sort(key=lambda item: item[1])
-            
-            if len(nearby_nodes) > 0:
-                # Merge with the nearest existing node
-                nearest_node_id, _ = nearby_nodes[0]
-                node_mapping[other_node_id] = nearest_node_id
+            position_key = tuple(other_pos)
+            if position_key in positions:
+                existing_node_id = positions[position_key]
+                node_mapping[other_node_id] = existing_node_id
                 
                 # Update existing node with fusion logic
-                existing_node = self.graph.nodes[nearest_node_id]
-                
-                old_count = existing_node.get('observation_count', 1)
+                existing_node = self.graph.nodes[existing_node_id]
                 evidence = self.merge_observation_attributes(existing_node, other_node_data)
-                new_count = evidence['observation_count']
-                
-                # Update position with weighted average based on confidence
-                existing_confidence = existing_node.get('confidence', 0.1)
-                other_confidence = other_node_data.get('confidence', 0.1)
-                total_confidence = existing_confidence + other_confidence
-                
-                existing_pos = np.array(existing_node['position'])
-                other_pos_arr = np.array(other_pos)
-                new_pos = ((existing_pos * existing_confidence +
-                           other_pos_arr * other_confidence) / max(total_confidence, 1e-12)
-                           if new_count > old_count else existing_pos)
-                old_cell, new_cell = cell(existing_pos), cell(new_pos)
-                if old_cell != new_cell:
-                    buckets[old_cell].remove(nearest_node_id)
-                    buckets.setdefault(new_cell, []).append(nearest_node_id)
                 
                 # Update node attributes
                 self.update_node_attributes(
-                    nearest_node_id,
-                    position=tuple(new_pos),
+                    existing_node_id,
                     **evidence,
                     last_updated=max(existing_node.get('last_updated', 0.),
                                      other_node_data.get('last_updated', 0.))
                 )
                 
                 stats['nodes_merged'] += 1
-                self._spatial_index_valid = False  # Need to rebuild after position update
                 
             else:
                 # Add as new node
-                new_node_id = f"{self.metadata.get('drone_id', 'unknown')}_fused_{len(self.graph.nodes())}"
+                suffix = self.graph.number_of_nodes()
+                prefix = f"{self.metadata.get('drone_id', 'unknown')}_fused_"
+                new_node_id = f"{prefix}{suffix}"
+                while new_node_id in self.graph:
+                    suffix += 1
+                    new_node_id = f"{prefix}{suffix}"
                 node_mapping[other_node_id] = new_node_id
                 
                 # Copy all attributes
                 node_attrs = dict(other_node_data)
                 self.add_node(new_node_id, position=other_pos, attributes=node_attrs)
-                buckets.setdefault(cell(other_pos), []).append(new_node_id)
+                positions[position_key] = new_node_id
                 
                 stats['nodes_added'] += 1
         
         # Rebuild spatial index after all node updates
-        if stats['nodes_merged'] > 0 or stats['nodes_added'] > 0:
+        if stats['nodes_added'] > 0:
             self.build_spatial_index()
         
         # Process edges from other graph
         for node1, node2, edge_data in other_graph.graph.edges(data=True):
             # Map to this graph's node IDs
-            mapped_node1 = node_mapping.get(node1)
-            mapped_node2 = node_mapping.get(node2)
+            mapped_node1 = node_mapping[node1]
+            mapped_node2 = node_mapping[node2]
             
-            if mapped_node1 and mapped_node2:
+            if mapped_node1 != mapped_node2:
                 # Add edge if it doesn't exist
                 if not self.graph.has_edge(mapped_node1, mapped_node2):
                     self.add_edge(mapped_node1, mapped_node2, 
                                 weight=edge_data.get('weight'),
-                                attributes={k: v for k, v in edge_data.items() if k != 'weight'})
+                                attributes=copy_attributes({k: v for k, v in edge_data.items() if k != 'weight'}))
                     stats['edges_added'] += 1
         
         # Update metadata

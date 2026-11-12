@@ -3,9 +3,7 @@ import torch
 from torch.nn import functional as F
 
 from .ab_environment import ACTIONS, CHANNELS, DELTA_SCALE, FEATURES, SIDE
-
-
-from .rssm import RecurrentWorldModel
+from .models import RecurrentWorldModel
 
 
 class ABWorldModel(RecurrentWorldModel):

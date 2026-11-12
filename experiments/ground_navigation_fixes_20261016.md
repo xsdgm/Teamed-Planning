@@ -46,7 +46,7 @@
 ## 验证与产物
 
 - Conda 环境中完整测试套件 **56/56 通过**（包含 9 个导航回归测试），`git diff --check` 通过。
-- 新增可提交回归测试：`src/teamed-planning/scripts/simulator/test_ground_navigation.py`。
+- 新增可提交回归测试：`src/teamed-planning/scripts/tests/simulator/test_ground_navigation.py`。
 - 审计基线保存在 `artifacts/ground-audit/`，修复后结果另存 `artifacts/ground-audit/fixed/`。
 - 修复后 `validation.json` 保存五场景复评，`full_map.json` 保存完整地图验收。
 - `checkpoint_20001.json`、`checkpoint_20002.json` 保存失败场景逐步轨迹。

@@ -15,12 +15,10 @@ import time
 import numpy as np
 
 if __package__:
-    from .reconnaissance import ReconnaissanceEnvelope
-    from .runtime import make_vtmp2_controller
+    from .runtime import ReconnaissanceEnvelope, make_vtmp2_controller
     from .vtmp2 import Vtmp2SubgoalManager
 else:
-    from reconnaissance import ReconnaissanceEnvelope
-    from runtime import make_vtmp2_controller
+    from runtime import ReconnaissanceEnvelope, make_vtmp2_controller
     from vtmp2 import Vtmp2SubgoalManager
 
 ALGORITHM = 'vtmp2'

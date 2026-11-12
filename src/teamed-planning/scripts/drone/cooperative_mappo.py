@@ -6,7 +6,7 @@ Only currently sensed one-hop teammates are tokens; no age/hop model (v8).
 import numpy as np
 import torch
 from torch import nn
-from drone.chain_state import ChainState
+from drone.communication import ChainState
 from drone.velocity_mappo import VelocityNavigator
 from drone.graph_attention_mappo import (GraphAttentionActorCritic, GraphEncoder,
     GRAPH_BLOCK, MAX_FLEET, prefix_width, encode_graph)

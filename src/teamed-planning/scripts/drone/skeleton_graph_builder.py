@@ -16,6 +16,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.graph_structure import TopologicalGraph
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 from drone.semantic_segmentation import SemanticProcessor, TerrainType
 
 
@@ -36,7 +37,7 @@ class SkeletonGraphBuilder:
                  drone_id: str,
                  resolution: float = 0.5,
                  node_spacing: float = 8.0,
-                 min_clearance: float = 1.5,
+                 min_clearance: float = DEFAULT_GROUND_CLEARANCE_M,
                  max_edge_distance: float = 4.0,
                  k_neighbors: int = 3,
                  world_bounds=None):

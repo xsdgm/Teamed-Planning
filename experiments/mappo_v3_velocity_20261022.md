@@ -155,7 +155,7 @@ episode-400 / seed-60002 / sample-2 已使用原代码快照和动作种子精�
 
 仍在满足连续 30 步后结束本回合，未额外延长优化阶段；路线质量奖励引导策略在首次建图和这段稳定窗口中选择更短的路线。2D、3 架共享去中心化速度 Actor、五阶段环带和每阶段独立 final/best 权重保存均保持。训练继续暂停，旧权重及 STOP 文件保留，新奖励尚未进入正式训练。
 
-本版通过 19 项奖励专项检查与 46 项相关回归检查（共 65 项），涵盖真实 30 步稳定窗口、固定完成 +100、CBF 失败 -100、分项奖励与 rollout 总账一致、短路径优于长路径、断开/恢复不重复支付、真实图增加捷径、参考端点长度、去中心化速度、可达环带采样、每阶段保存、恢复与并行工作进程。检查入口为 `scripts/simulator/test_mapping_communication_reward.py` 和 `artifacts/mappo-v3-stage01-diagnosis-20261023/run_route_quality_checks.py`；语法检查与 `git diff --check` 通过。此处的短检查不构成正式训练效果验证。
+本版通过 19 项奖励专项检查与 46 项相关回归检查（共 65 项），涵盖真实 30 步稳定窗口、固定完成 +100、CBF 失败 -100、分项奖励与 rollout 总账一致、短路径优于长路径、断开/恢复不重复支付、真实图增加捷径、参考端点长度、去中心化速度、可达环带采样、每阶段保存、恢复与并行工作进程。检查入口为 `scripts/tests/simulator/test_mapping_communication_reward.py` 和 `artifacts/mappo-v3-stage01-diagnosis-20261023/run_route_quality_checks.py`；语法检查与 `git diff --check` 通过。此处的短检查不构成正式训练效果验证。
 
 ## 2026-10-23 13:32：按用户要求启动新奖励第一阶段
 

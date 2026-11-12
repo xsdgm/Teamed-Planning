@@ -15,7 +15,7 @@ the received target list, so v8 weights warm-start the policy.
 import numpy as np
 import torch
 from torch import nn
-from drone.chain_state import ChainState
+from drone.communication import ChainState
 from drone.cooperative_mappo import CooperativeCriticEncoder, CooperativeNavigator
 from drone.graph_attention_mappo import GraphAttentionActorCritic, MAX_FLEET, prefix_width
 from drone.relay_attention_mappo import (RelayActorCritic, RelayEncoder, MODES,

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from drone.mappo import ActorCritic
 from simulator.mappo_experiment import Experiment
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 from simulator.scenarios import ENVIRONMENT_VERSION,generate_scene
 from simulator.train_mappo import atomic_json,fixed_schedule
 
@@ -74,6 +75,7 @@ def evaluate(run,output,seeds):
                     communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
                     spacing_penalty_weight=config['spacing_penalty_weight'],intervention_weight=config['intervention_weight'],
                     moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],ground_speed=config['ground_speed'],
+                    ground_safety_distance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M),
                     path_reward_scale=config['path_reward_scale'])
                 initial_positions=[position3(env.obs[r]['self']['position']).tolist() for r in env.ids]
                 initial_ground=position3(env.obs[env.ground]['self']['position']).tolist()

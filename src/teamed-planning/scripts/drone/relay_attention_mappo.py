@@ -1,6 +1,6 @@
 """v8: v7 cooperative policy plus age/hop-aware attention over relayed state evidence.
 
-Tokens are this device's own relay cache (drone/relay_cache.py): teammates and
+Tokens are this device's own relay cache (drone/communication.py): teammates and
 the vehicle, directly sensed or not, with the ORIGINAL measurement age and the
 hop count of the path that delivered them. Relative relevance is a masked
 softmax whose logits subtract learned, type-specific age and hop penalties.

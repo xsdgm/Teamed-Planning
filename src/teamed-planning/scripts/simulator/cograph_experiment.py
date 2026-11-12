@@ -12,7 +12,7 @@ with the backbone intact for map_stability_steps, then v8's improvement phase.
 
 CoGraph v2 (vehicle_planner='decentralized'): the vehicles are not held still
 and there is no leader. Each vehicle runs its own VehicleClaimAgent
-(ground/vehicle_claims.py) on its own information: its position, its own fused
+(ground/task_planner.py) on its own information: its position, its own fused
 graph and the claims it receives from the other vehicles, directly within radio
 range or forwarded by the drones. It claims a target, broadcasts the claim,
 departs once its own graph has built part of the way, may hand the target over
@@ -26,6 +26,10 @@ vehicle_motion='link_keeping' (v2 only) adds each vehicle's onboard motion
 filter (ground/vehicle_motion.py): it keeps its own backbone links inside the
 drones' CBF edge (it waits for coverage instead of pulling drones past
 feasibility) and passes, makes way for or yields to other vehicles.
+
+cograph_route_reward='paired_current' compares old/new delivered maps at the
+same post-physics vehicle positions. Its quality uses the current team's
+straight-line lower bound; driving alone is not a map-improvement reward.
 """
 import contextlib
 import copy
@@ -36,18 +40,18 @@ import numpy as np
 from drone.drone_main import DroneController
 from drone.cograph_mappo import CoGraphNavigator, GLOBAL_FEATURES
 from drone.cograph_v2_mappo import CoGraphV2Navigator
-from drone.local_backbone import backbone_metrics_multi
-from drone.relay_cache import RelayManager
+from drone.communication import backbone_metrics_multi, RelayManager
 from ground.ground_main import GroundRobotController
-from ground.task_planner import coverage_tree
-from ground.vehicle_claims import VehicleClaimAgent
+from ground.task_planner import coverage_tree, VehicleClaimAgent
 from ground.vehicle_motion import EVENTS as MOTION_EVENTS, LocalMap, VehicleMotionFilter
 from simulator.cograph_scenarios import generate_cograph_scene
-from simulator.env import EnvConfig, MultiRobotEnv
-from simulator.mappo_experiment import (COMMUNICATION_RANGE_M, FLIGHT_HEIGHT_M, BRIDGE_CLEARANCE_M,
+from simulator.env import EnvConfig, MultiRobotEnv, RelayChannel
+from simulator.mappo_experiment import (COMMUNICATION_RANGE_M, FLIGHT_HEIGHT_M,
     DeliveredEvidence, SafetyTermination, communication_chain_terms, cbf_margin_terms)
-from simulator.navigation_metrics import multi_target_graph_metrics, RouteQualityTracker
-from simulator.relay_channel import RelayChannel
+from simulator.navigation_metrics import (
+    multi_target_graph_metrics, RouteQualityTracker, current_team_routes, paired_team_route_update,
+)
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 
 WORLD_M = 1000.
 SUM_KEYS = ('reward', 'distance', 'collisions', 'spacing_violation', 'chain_link_violation', 'out_of_bounds',
@@ -65,7 +69,12 @@ class CoGraphExperiment:
                  frontier_progress_weight=0., path_quality_weight=0., time_penalty=0.,
                  relay_loss=0., relay_delay_jitter=0, relay_period=1, relay_capacity=16,
                  fusion_bridge_distance=0., vehicle_planner='parked', claim_options=None,
-                 vehicle_motion='free', vehicle_keep_range=88.):
+                 vehicle_motion='free', vehicle_keep_range=88., cograph_route_reward='legacy',
+                 ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M):
+        if (isinstance(ground_safety_distance,bool) or not isinstance(ground_safety_distance,(int,float))
+                or not np.isfinite(ground_safety_distance) or ground_safety_distance<=0):
+            raise ValueError('ground_safety_distance must be positive and finite')
+        self.ground_safety_distance=float(ground_safety_distance)
         architecture = getattr(model, 'policy_architecture', None)
         if architecture not in ('cograph_v1', 'cograph_v2'):
             raise ValueError('CoGraphExperiment requires a CoGraph policy')
@@ -75,6 +84,11 @@ class CoGraphExperiment:
             raise ValueError('vehicle_planner must be parked or decentralized')
         if vehicle_motion not in ('free', 'link_keeping') or (vehicle_motion != 'free' and vehicle_planner != 'decentralized'):
             raise ValueError('vehicle_motion is free, or link_keeping for decentralized vehicles')
+        if cograph_route_reward not in ('legacy', 'paired_current'):
+            raise ValueError('cograph_route_reward must be legacy or paired_current')
+        self.paired_current = cograph_route_reward == 'paired_current'
+        if self.paired_current and (architecture != 'cograph_v2' or vehicle_planner != 'decentralized'):
+            raise ValueError('Paired current-route reward requires decentralized CoGraph v2 vehicles')
         self.start = np.asarray(scene['start'], float)
         self.goals = np.asarray(scene['goals'], float)
         self.scene_attempts = scene['attempts']
@@ -100,7 +114,7 @@ class CoGraphExperiment:
             self.ids.append(self.env.add_drone(x, y, FLIGHT_HEIGHT_M, max_speed=6.))
             c = DroneController(f'drone_{i}', resolution=2., total_drones=num_drones,
                 communication_range=COMMUNICATION_RANGE_M, max_speed=6., broadcast_interval=1., fusion_interval=5.,
-                communication_mode='backbone', safety_filter='cbf', graph_min_clearance=1.5)
+                communication_mode='backbone', safety_filter='cbf', graph_min_clearance=self.ground_safety_distance)
             c.multi_vehicle = True
             c.navigator = navigator(f'drone_{i}', total_drones=num_drones, comm_range=COMMUNICATION_RANGE_M,
                 min_separation=15., model=model, deterministic=not stochastic, max_speed=6., world_bounds=bounds)
@@ -113,11 +127,11 @@ class CoGraphExperiment:
         self.vehicles, self.vehicle_relays = [], []
         for k in range(len(self.vehicle_ids)):
             vehicle = GroundRobotController(f'ground_{k}', resolution=2., perception_range=8.,
-                max_linear_vel=ground_speed, max_angular_vel=1., fusion_interval=5., safety_distance=1.5,
+                max_linear_vel=ground_speed, max_angular_vel=1., fusion_interval=5., safety_distance=self.ground_safety_distance,
                 world_bounds=bounds)
             if fusion_bridge_distance:
                 vehicle.graph_fusion.bridge_distance = float(fusion_bridge_distance)
-                vehicle.graph_fusion.bridge_check = lambda a, b: self.ledger.segment_clear(a, b, BRIDGE_CLEARANCE_M)
+                vehicle.graph_fusion.bridge_check = lambda a, b: self.ledger.segment_clear(a, b, self.ground_safety_distance)
             if self.vehicles:
                 # The team starts < 30 m apart, in radio range: it pools what any of them
                 # receives into one fused graph, each drone graph once per interval
@@ -144,11 +158,15 @@ class CoGraphExperiment:
         self.distinct_foci = []
         self.vehicle_actions = [self._vehicle_action(k) for k in range(len(self.vehicles))]
         self.initial_distance = np.linalg.norm(self.goals-self.start, axis=1)
-        self.trackers = [RouteQualityTracker(length) for length in scene['reference_polyline_lengths']]
+        self.trackers = ([] if self.paired_current else
+                         [RouteQualityTracker(length) for length in scene['reference_polyline_lengths']])
+        self.current_route_reference = np.linalg.norm(
+            self.goals[None, :, :]-np.asarray(self._vehicle_positions())[:, None, :2], axis=2).min(axis=0)
         self.connected = np.zeros(count, bool)
         self.lengths = np.full(count, np.inf)
         self.frontier = self.initial_distance.copy()
         self.progress_best = np.zeros(count)
+        self.progress = np.zeros(count)
         self.quality = np.zeros(count)
         self.quality_best = np.zeros(count)
         self.first_connection = np.full(count, -1)
@@ -263,11 +281,14 @@ class CoGraphExperiment:
         separation = min(np.linalg.norm(drones[i]-drones[j]) for i in range(len(drones)) for j in range(i))
         pending = ~self.connected
         spread = np.linalg.norm(drones[:, :2]-self.start, axis=1)
+        reference = self.current_route_reference if self.paired_current else self.initial_distance
+        progress = self.progress if self.paired_current else self.progress_best
+        quality = self.quality if self.paired_current else self.quality_best
         return np.array([frame/budget, (budget-frame)/1000., self.ledger.seen.sum()*4/1e5,
-            self.connected.mean(), stability, self.progress_best.mean(), len(self.goals)/8.,
-            self.initial_distance[pending].mean()/400. if pending.any() else 0.,
-            self.initial_distance[pending].max()/400. if pending.any() else 0.,
-            self.quality_best.mean(), longest/95., separation/100., spread.mean()/400., spread.max()/400.,
+            self.connected.mean(), stability, progress.mean(), len(self.goals)/8.,
+            reference[pending].mean()/400. if pending.any() else 0.,
+            reference[pending].max()/400. if pending.any() else 0.,
+            quality.mean(), longest/95., separation/100., spread.mean()/400., spread.max()/400.,
             self.frontier[pending].min()/400. if pending.any() else 0., pending.sum()/8.], np.float32)
 
     def _relay_vehicles(self, frame):
@@ -329,6 +350,14 @@ class CoGraphExperiment:
         self.last_executed_velocities = np.asarray([actions[rid]['motion'] for rid in self.ids]).copy()
         current = np.array([self.obs[r]['self']['position'] for r in self.ids])
         vehicles = self._vehicle_positions()
+        if self.paired_current:
+            # Freeze numeric measurements BEFORE any shared fusion object or
+            # delivered endpoint evidence can change. Both sides use these same
+            # new positions, so neither driving nor switching the cheapest car
+            # can masquerade as information delivered by the UAVs.
+            before_routes = current_team_routes([
+                multi_target_graph_metrics(v.unified_graph, q, self.goals, self.ledger.connector_clear)
+                for v, q in zip(self.vehicles, vehicles)], vehicles, self.goals)
         if self.agents is not None:
             self._split_pools(vehicles)
         for k, gid in enumerate(self.vehicle_ids):
@@ -357,27 +386,44 @@ class CoGraphExperiment:
         self.connected = self.vehicle_status.any(0)
         if self.agents is not None:
             self._decide(per_vehicle, vehicles)
-        self.lengths = np.min([m['length'] for m in per_vehicle], axis=0)
-        self.frontier = np.min([m['frontier'] for m in per_vehicle], axis=0)
         self.first_connection[(self.first_connection < 0) & self.connected] = frame+1
         count = len(self.goals)
-        progress = np.where(self.connected, 1., np.clip(1.-self.frontier/np.maximum(self.initial_distance, 1e-8), 0., 1.))
-        frontier_gain = np.maximum(progress-self.progress_best, 0.)
-        self.progress_best = np.maximum(self.progress_best, progress)
-        quality_gain = np.zeros(count)
-        for m, tracker in enumerate(self.trackers):
-            terms = tracker.update(dict(graph_task_connected=float(self.connected[m]),
-                graph_task_path_length=float(self.lengths[m]) if self.connected[m] else 0.))
-            quality_gain[m], self.quality[m] = terms['route_quality_gain'], terms['route_quality']
-            self.quality_best[m] = terms['route_best_quality']
+        if self.paired_current:
+            update = paired_team_route_update(before_routes, per_vehicle, vehicles, self.goals)
+            after = update['after']
+            self.lengths, self.frontier = after['length'], after['frontier']
+            self.current_route_reference = after['reference_length']
+            self.quality, self.progress = after['quality'], after['progress']
+            quality_gain, frontier_gain = update['quality_gain'], update['frontier_gain']
+        else:
+            self.lengths = np.min([m['length'] for m in per_vehicle], axis=0)
+            self.frontier = np.min([m['frontier'] for m in per_vehicle], axis=0)
+            progress = np.where(self.connected, 1., np.clip(1.-self.frontier/np.maximum(self.initial_distance, 1e-8), 0., 1.))
+            frontier_gain = np.maximum(progress-self.progress_best, 0.)
+            self.progress_best = np.maximum(self.progress_best, progress)
+            quality_gain = np.zeros(count)
+            for m, tracker in enumerate(self.trackers):
+                terms = tracker.update(dict(graph_task_connected=float(self.connected[m]),
+                    graph_task_path_length=float(self.lengths[m]) if self.connected[m] else 0.))
+                quality_gain[m], self.quality[m] = terms['route_quality_gain'], terms['route_quality']
+                self.quality_best[m] = terms['route_best_quality']
         metrics = dict(frontier_progress_reward=self.frontier_progress_weight*frontier_gain.sum()/count,
             path_quality_reward=self.path_quality_weight*quality_gain.sum()/count,
             route_quality_gain=float(quality_gain.sum()), route_quality=float(self.quality.mean()),
             targets_connected=float(self.connected.sum()), all_connected=float(self.connected.all()),
-            frontier_best_progress=float(self.progress_best.mean()),
             vehicle_target_pairs_connected=float(self.vehicle_status.mean()),
             task_exploration_area=float(np.count_nonzero(self.ledger.seen & ~old_seen & self.region)*4.),
             outside_new=float(np.count_nonzero(self.ledger.seen & ~old_seen & ~self.region)*4.))
+        if self.paired_current:
+            metrics.update(cograph_paired_current_route=1.,
+                frontier_progress=float(self.progress.mean()),
+                route_reference_length_m=float(self.current_route_reference.mean()),
+                route_reference_is_lower_bound=1.,
+                route_quality_before=float(update['before']['quality'].mean()),
+                route_lengths_comparable=float(update['lengths_comparable'].mean()),
+                route_length_delta_m=float(update['length_delta_m'].mean()))
+        else:
+            metrics['frontier_best_progress'] = float(self.progress_best.mean())
         metrics['intervention_cost'] = self.intervention_weight*float(np.mean(interventions))
         metrics['cbf_intervention'] = float(np.mean(interventions))
         metrics.update(cbf_margin_terms(margins, self.cbf_margin_scale))
@@ -439,7 +485,7 @@ class CoGraphExperiment:
         total['min_separation'] = float(min(t['min_separation'] for t in trace))
         total['relay_max_hop'] = float(max(t['relay_max_hop'] for t in trace))
         connected = self.connected
-        straight = np.maximum(self.initial_distance, 1e-8)
+        straight = np.maximum(self.current_route_reference if self.paired_current else self.initial_distance, 1e-8)
         total.update(episode_steps=len(self.trace), scene_attempts=self.scene_attempts, num_drones=len(self.ids),
             num_vehicles=len(self.vehicles), target_count=len(self.goals),
             targets_connected=float(connected.sum()), targets_connected_fraction=float(connected.mean()),
@@ -456,6 +502,16 @@ class CoGraphExperiment:
             reward_beta=1., reward_eta=0., ground_distance=0., ground_goal_distance=0.,
             mean_target_distance_m=float(self.initial_distance.mean()),
             max_target_distance_m=float(self.initial_distance.max()))
+        if self.paired_current:
+            # A historical best at a different vehicle position is not a route
+            # improvement. Keep current values in diagnostics as in the critic.
+            total.pop('route_best_quality')
+            total.pop('frontier_best_progress')
+            total.update(cograph_paired_current_route=1.,
+                route_reference_length_m=float(self.current_route_reference.mean()),
+                route_reference_is_lower_bound=1., frontier_progress=float(self.progress.mean()),
+                route_length_delta_m=float(sum(t.get('route_length_delta_m', 0.) for t in self.trace)),
+                route_quality_gain=float(sum(t.get('route_quality_gain', 0.) for t in self.trace)))
         for key, value in self.relay_channel.stats.items():
             total[f'relay_packets_{key}'] = float(value)
         if self.learned_choice:
@@ -494,11 +550,14 @@ def run_cograph_episode(model, config, scene_seed, schedule, stochastic, progres
     """One CoGraph episode with v8's map termination and improvement phase."""
     scene = generate_cograph_scene(scene_seed, tuple(config['target_count_range']),
         tuple(config['task_distance_range']), config['distance_sampling'], config['vehicle_count'],
-        single_task=config.get('scene_regime', 'any') == 'single_task', num_drones=config['fleet_sizes'][0])
+        single_task=config.get('scene_regime', 'any') == 'single_task', num_drones=config['fleet_sizes'][0],
+        ground_safety_distance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M))
     budget = episode_budget(config, scene)
+    paired_current = config.get('cograph_route_reward', 'legacy') == 'paired_current'
     with contextlib.redirect_stdout(io.StringIO()):
         env = CoGraphExperiment(scene_seed, model, scene, stochastic=stochastic, num_drones=config['fleet_sizes'][0],
             ground_speed=config['ground_speed'], intervention_weight=config['intervention_weight'],
+            ground_safety_distance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M),
             chain_soft_ratio=config['chain_soft_ratio'], cbf_margin_weight=config['cbf_margin_weight'],
             cbf_margin_scale=config['cbf_margin_scale'], frontier_progress_weight=config['frontier_progress_weight'],
             path_quality_weight=config['path_quality_weight'], time_penalty=config['time_penalty'],
@@ -507,7 +566,8 @@ def run_cograph_episode(model, config, scene_seed, schedule, stochastic, progres
             fusion_bridge_distance=config['fusion_bridge_distance'], vehicle_planner=config.get('vehicle_planner', 'parked'),
             claim_options=dict(depart_progress=config.get('vehicle_depart_progress', .5),
                                transfer_margin=config.get('vehicle_transfer_margin', .15)),
-            vehicle_motion=config.get('vehicle_motion', 'free'), vehicle_keep_range=config.get('vehicle_keep_range', 88.))
+            vehicle_motion=config.get('vehicle_motion', 'free'), vehicle_keep_range=config.get('vehicle_keep_range', 88.),
+            cograph_route_reward=config.get('cograph_route_reward', 'legacy'))
         rollout, reason, stable, max_link, bonus = [], 'budget', 0, 0., 0.
         improve = config['map_improvement_steps'] > 0
         milestone = last_gain = -1
@@ -545,7 +605,9 @@ def run_cograph_episode(model, config, scene_seed, schedule, stochastic, progres
                         rollout[-1] = (*head, last+bonus, row_state)
                     if milestone >= 0:
                         if stable >= config['map_stability_steps'] and metrics['route_quality'] >= config['map_target_quality']:
-                            reason = 'map_optimal'; break
+                            # A current straight-line lower bound is an efficiency
+                            # threshold, never a certificate of an optimal route.
+                            reason = 'map_quality_target' if paired_current else 'map_optimal'; break
                         if frame-max(last_gain, milestone) >= config['map_improvement_steps']:
                             reason = 'map_plateau'; break
                 elif stable >= config['map_stability_steps']:
@@ -569,6 +631,8 @@ def run_cograph_episode(model, config, scene_seed, schedule, stochastic, progres
                 map_completion_step=float(milestone+1 if milestone >= 0 else -1),
                 map_optimal=float(reason == 'map_optimal'), map_plateau=float(reason == 'map_plateau'),
                 improvement_steps=float(len(rollout)-milestone-1 if milestone >= 0 else 0))
+            if paired_current:
+                summary['map_quality_target_reached'] = float(reason == 'map_quality_target')
         finally:
             env.env.close()
     return rollout, summary

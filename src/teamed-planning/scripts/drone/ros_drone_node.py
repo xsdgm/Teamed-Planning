@@ -31,7 +31,7 @@ if _scripts_dir not in sys.path:
 
 from drone.drone_main import DroneController
 from drone.drone_local_planner import DroneLocalPlanner
-from drone.evidence_grid import EvidenceGrid
+from drone.local_mapping import EvidenceGrid
 from common.graph_structure import TopologicalGraph
 
 

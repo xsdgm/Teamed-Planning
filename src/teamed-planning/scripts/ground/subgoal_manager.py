@@ -46,10 +46,36 @@ class SubgoalManager:
         self.selected=self.arrivals=self.failed=0
         self._best=self._since=self._approached=0.
         self._nodes=0
+        self.finishing=False
 
     def update(self, position, graph, now):
         """Return (target, changed); the vehicle replans only when changed."""
         p=np.asarray(position,float)[:2]
+        if self.finishing and np.linalg.norm(self.goal-p)>self.radius:
+            # A large detour must return to local reconnaissance targets;
+            # capturing the final goal never overrides the flight radius.
+            self.finishing=False
+            self.target=None
+            self.final=False
+        # Once near the real destination, keep it as the navigation goal.
+        # Failure penalties belong to exploratory approaches, not to the
+        # final arrival manoeuvre. This does NOT enlarge the arrival tolerance.
+        if self.finishing or np.linalg.norm(self.goal-p)<=min(self.arrival,25.):
+            self.finishing=True
+            if self.target is None or not self.final:
+                self.target=self.goal.copy()
+                self.origin=p.copy()
+                self.final=True
+                self.snapped=False
+                self.selected+=1
+                self._since=now
+                return self.target,True
+            # A local deadlock still requests replanning; it must not turn
+            # into a distant survey target that pulls the car away again.
+            if now-self._since>=self.stall:
+                self._since=now
+                return self.target,True
+            return self.target,False
         if self.target is None:
             return self._select(p,graph,now),True
         distance=float(np.linalg.norm(self.target-p))
@@ -120,6 +146,10 @@ class SubgoalManager:
         for position,time in self.failures:
             near=np.linalg.norm(points-position,axis=1)<=self.penalty_radius
             total+=near*self.radius*np.exp(-(now-time)/self.penalty_decay)
+        # A failed approach is not a failed mission destination. Penalizing
+        # the destination itself sends nearby missions on repeated 60m+
+        # excursions. The ground planner now handles failed local approaches.
+        total[np.linalg.norm(points-self.goal,axis=1)<1e-9]=0.
         return total
 
     def _snap_node(self, point, graph):

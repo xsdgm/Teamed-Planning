@@ -3,7 +3,7 @@ import math
 import numpy as np
 import torch
 
-from .ab_mapping import make_task, task_valid
+from .ab_environment import make_task, task_valid
 
 
 def candidates(position, goal, config, count=36):

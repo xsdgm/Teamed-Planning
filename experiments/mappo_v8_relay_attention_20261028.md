@@ -10,7 +10,7 @@
 
 ## 组成
 
-### 1. 中继缓存协议 [relay_cache.py](../src/teamed-planning/scripts/drone/relay_cache.py)
+### 1. 中继缓存协议 [communication.py](../src/teamed-planning/scripts/drone/communication.py)
 
 可部署逻辑，不含传输。每条条目：origin_id/boot_id/seq、source_stamp、sender_id、receive_stamp、hop_count、payload_type、frame_id、state、sigma、mission_id/goal_epoch、hop_limit、expires_at。
 
@@ -25,7 +25,7 @@
 | 任务版本 | 车辆 goal_epoch 不能回退；frame_id 或 mission_id 不符的条目拒收 |
 | 转发 | 每包最多 capacity 条：本机状态 → 车辆 → 上次未发的 → 更新的；hop_count 达到 hop_limit（16）后不再转发 |
 
-### 2. 仿真链路层 [relay_channel.py](../src/teamed-planning/scripts/simulator/relay_channel.py)
+### 2. 仿真链路层 [env.py](../src/teamed-planning/scripts/simulator/env.py)
 
 每条有向物理链路一个事件队列。只发给发送时刻实际在通信半径内的无人机；最早在下一个决策步到达，因此同一步内不会递归传遍全网。每次转发都是新事件。丢包、延迟抖动（会造成乱序）、发送周期都由独立随机流抽样，不改变其他仿真随机数。车辆只发布自己的 `vehicle_state`（把任务广播包装成证据），不转发。
 
@@ -75,7 +75,7 @@ OPENBLAS_NUM_THREADS=1 /home/bdi/miniconda3/envs/teamedplanning-2d/bin/python -E
 
 ## 验证
 
-- [专项测试](../src/teamed-planning/scripts/simulator/test_relay_attention_v8.py) 15 项全部通过（7 s）。覆盖：三跳源时间不变、跳数逐跳 +1；旧 seq 不覆盖新 seq；同源重复证据只计一次；短路径只更新元数据；设备重启；时钟超前隔离；未知源时间；转发不刷新过期时间；goal_epoch 不回退；链路因果性/丢包率/抖动乱序/发送周期；空缓存输出为零；单个旧条目时 α=1，只靠门控缩小，门控上下文 = ρ × softmax 上下文；全部陈旧时 ρ 仍然小；token 排列与填充无关；改名不变；没有缓存时显式报错；四种模式检查点往返；v7 检查点照常加载；真实三机 Experiment 中，远端无人机经 2 跳收到车辆和队友状态（hop=2）；理想链路退化为每跳 1 步（age=hop）；配置契约；真实短训练、验证、检查点与 resume。
+- [专项测试](../src/teamed-planning/scripts/tests/simulator/test_relay_attention_v8.py) 15 项全部通过（7 s）。覆盖：三跳源时间不变、跳数逐跳 +1；旧 seq 不覆盖新 seq；同源重复证据只计一次；短路径只更新元数据；设备重启；时钟超前隔离；未知源时间；转发不刷新过期时间；goal_epoch 不回退；链路因果性/丢包率/抖动乱序/发送周期；空缓存输出为零；单个旧条目时 α=1，只靠门控缩小，门控上下文 = ρ × softmax 上下文；全部陈旧时 ρ 仍然小；token 排列与填充无关；改名不变；没有缓存时显式报错；四种模式检查点往返；v7 检查点照常加载；真实三机 Experiment 中，远端无人机经 2 跳收到车辆和队友状态（hop=2）；理想链路退化为每跳 1 步（age=hop）；配置契约；真实短训练、验证、检查点与 resume。
 - 完整 simulator 回归：222 项，1 项按设计跳过，其余全部通过（110 s）。
 - 开销：150 步回合 175.8 vs 158.1 ms/步（+11%），按 v7 的 78 s/回合估算约 87 s/回合。
 - 冒烟（未训练策略）：每机约 3 个 token，车辆已知 98%，平均年龄 2.1 s，丢包约 10%，按真值计算的状态位置误差约 3.3 m（仅评估用，不进入 Actor）。

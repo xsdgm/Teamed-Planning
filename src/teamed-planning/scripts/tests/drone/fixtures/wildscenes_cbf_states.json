@@ -1,0 +1,114 @@
+[
+  {
+    "case": "K_01_1000m_forward_r0",
+    "positions": [
+      [
+        857.1867679321931,
+        349.15345333063993,
+        15.0
+      ],
+      [
+        922.232653101703,
+        316.3971478565136,
+        15.0
+      ],
+      [
+        763.1469409981268,
+        354.01185340839606,
+        15.0
+      ]
+    ],
+    "ground": [
+      670.3494307678897,
+      358.7314649333318,
+      0.0
+    ],
+    "world_size_m": 1393.0,
+    "source": "artifacts/wildscenes-legacy2d-formal-20261106/runs/K_01_1000m_forward/cases/K_01_1000m_forward_r0.json",
+    "source_sha256": "05f9443b0c64580d01abe4f1ae2adf5779eaa8978d66ad0c370e17e74936d84e"
+  },
+  {
+    "case": "K_01_1000m_forward_r2",
+    "positions": [
+      [
+        898.881757309973,
+        311.0818602378415,
+        15.0
+      ],
+      [
+        796.5535552820706,
+        340.65442425728327,
+        15.0
+      ],
+      [
+        889.79726069962,
+        327.6516860008039,
+        15.0
+      ]
+    ],
+    "ground": [
+      705.5960260400971,
+      357.86127160531,
+      0.0
+    ],
+    "world_size_m": 1393.0,
+    "source": "artifacts/wildscenes-legacy2d-formal-20261106/runs/K_01_1000m_forward/cases/K_01_1000m_forward_r2.json",
+    "source_sha256": "600d40dd8ac3df0c1584efe6d60e2b1a4af546caada654cc8c5b7199c0959052"
+  },
+  {
+    "case": "K_01_1500m_forward_r1",
+    "positions": [
+      [
+        1312.175810963569,
+        203.76568694389275,
+        15.0
+      ],
+      [
+        1311.3411175502108,
+        229.1308660662416,
+        15.0
+      ],
+      [
+        1226.4656010933184,
+        269.6277824802659,
+        15.0
+      ]
+    ],
+    "ground": [
+      1143.5661835333285,
+      310.47633648750224,
+      0.0
+    ],
+    "world_size_m": 1393.0,
+    "source": "artifacts/wildscenes-legacy2d-formal-20261106/runs/K_01_1500m_forward/cases/K_01_1500m_forward_r1.json",
+    "source_sha256": "e842e93688c93a2c7de25b14cb86441e61c9dd697b288fe8e8197eb0394c2f87"
+  },
+  {
+    "case": "K_01_control_200m_forward_r0",
+    "positions": [
+      [
+        573.344580032637,
+        843.883452140242,
+        15.0
+      ],
+      [
+        664.7325947582002,
+        846.694398739776,
+        15.0
+      ],
+      [
+        485.3038317267669,
+        873.4292707127861,
+        15.0
+      ]
+    ],
+    "ground": [
+      396.7746329305722,
+      902.0458158381094,
+      0.0
+    ],
+    "world_size_m": 1393.0,
+    "source": "artifacts/wildscenes-legacy2d-formal-20261106/runs/K_01_control_200m_forward/cases/K_01_control_200m_forward_r0.json",
+    "source_sha256": "a8daca66abb99ff94937aad5498a67b62fd9af2969698de186d1dea1d5095096"
+  }
+]

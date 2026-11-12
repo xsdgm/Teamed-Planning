@@ -13,7 +13,9 @@ vtmp3 的高层输出是两个世界坐标点 A、B。无人机后端负责探�
 5. 只把真正返回的区域证据合入地图。Dijkstra 在保守的已知自由栅格导航图上寻找到最终目标或最接近最终目标的可达节点的路径，车辆以 1 m/s 最多行驶 30 秒。
 6. 记录完整转移，回到第 1 步，直到到达最终目标或耗尽时间/任务数预算。
 
-模型的公共 RSSM 实现在 `world_model/rssm.py`，单目标版本 `model.py` 与两点任务版本 `ab_model.py` 继承同一个基础类；动作是 `[ax, ay, bx, by]/1000`。选点通过模型评分实现，不把 bootstrap 启发式采集器称为学习策略，也不声称模型直接回归坐标。当前规划器使用 **一个宏任务的预测视野**；训练包含默认四段自由推演损失，验证另外报告 1/2/4 段误差。多段预测训练不等于已经实现长期最优选区。
+模型的公共 RSSM 实现在 [models.py](../../../src/teamed-planning/scripts/world_model/models.py)，单目标版本 `model.py` 与两点任务版本 `ab_model.py` 继承同一个基础类；动作是 `[ax, ay, bx, by]/1000`。选点通过模型评分实现，不把 bootstrap 启发式采集器称为学习策略，也不声称模型直接回归坐标。当前规划器使用 **一个宏任务的预测视野**；训练包含默认四段自由推演损失，验证另外报告 1/2/4 段误差。多段预测训练不等于已经实现长期最优选区。
+
+任务契约、代理建图与已接收地图导航集中在 [ab_environment.py](../../../src/teamed-planning/scripts/world_model/ab_environment.py)；原 `ab_contract.py`、`ab_mapping.py` 和 `ab_navigation.py` 的调用已迁移到该模块。
 
 ## 与 v11-2 对齐的接口
 
@@ -94,6 +96,50 @@ cd src/teamed-planning/scripts
 
 当前车辆执行器是保守导航图上的有界运动学路径跟随器，尚未复用原差速车辆局部控制器。该简化和理想网格证据都需要在接入真实 v11-2 时做转移验证。
 
+## WildScenes 简化场景训练
+
+统一入口支持 `--config src/teamed-planning/config/algorithm/world_model_vtmp3_wildscenes.json`。
+它仍使用 vtmp3 的公共模型和 A—B 训练流程，由 `world_model/ab_wildscenes.py` 适配场景；
+测试位于 `tests/world_model/vtmp3/test_wildscenes.py`。
+
+场景来源为已导出的 `artifacts/wildscenes-legacy2d-20261106/scenes/K-01-r025.json` 和 `V-01.json`。
+默认划分由 `config/algorithm/world_model_wildscenes_scenes.json` 固定：
+
+| 用途 | 原始序列 | 600×600 m 裁剪窗口左下角（原场景坐标，m） |
+| --- | --- | --- |
+| 训练 | K-01 | (600, 0)、(0, 600) |
+| 验证 | K-01 | (0, 0) |
+| 测试 | V-01 | (0, 0) |
+
+裁剪仅平移坐标，保留米制尺度和窗口内矩形障碍形状。源 0.25/0.5 m 障碍矩形在建图后端
+保守汇聚到 2 m 网格：只要网格方块接触任一障碍，即记为占据，避免遗漏细小障碍。
+原始矩形几何独立检查每一段车辆实际运动。地图边界裁剪、保守栅格化和净空可能减少可行通道。
+车辆未收到的地图仍为未知；源几何仅用于任务生成、模拟传感和执行审计。
+
+起点从距障碍约 6–40 m 的安全区域采样，目标距起点 100–400 m，且两点在保守真值网格同一
+连通分量中。此可行性筛选仅发生在环境初始化；参考路径和完整地图不进入模型输入。
+每轮 128 个任务，3 轮共 384 个任务；32 个验证任务、32 个测试任务。
+这些是来自固定地理区域的不同导航任务，不能表述为 384 个独立森林或独立地形。
+训练/验证窗口空间不重叠，测试使用另一森林序列。接口与样本加载器均拒绝跨划分的区域重叠。
+训练任务的源码、场景文件、裁剪配置和 SHA-256 随运行目录一起冻结。
+
+```bash
+CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 \
+  /home/bdi/miniconda3/envs/teamedplanning-2d/bin/python -I -B \
+  src/teamed-planning/scripts/simulator/train_world_model.py --algorithm vtmp3 \
+  --config src/teamed-planning/config/algorithm/world_model_vtmp3_wildscenes.json \
+  --output artifacts/vtmp3-wildscenes-NEW --device cuda
+```
+
+论文表述建议：**基于澳大利亚真实森林数据构建的简化二维仿真环境**。
+WildScenes 的采集地点为澳大利亚布里斯班的 Karawatha Forest Park 与 Venman National Park，
+参见 [官方数据说明](https://csiro-robotics.github.io/WildScenes/) 和
+[数据集论文](https://doi.org/10.1177/02783649241278369)。
+这里的平面导航环境是我们从语义点云派生的表示；官方 WildScenes 的“2D”部分指图像。
+简化协议明确把原数据未测量空间视为仿真空地，传感结果在实际送达区域内理想准确，建图时延和失败
+尚未用 v11-2 校准，也未执行真实无人机动力学。因此实验应归类为真实数据衍生场景的仿真验证，
+不支持真实森林实地性能、完整三维地形或真实通信效果的结论。
+
 ## 2026-11-10 运行记录
 
 13 项专项测试通过，包含未探测地图隔离、未知区域禁止行驶、完整探测仍可能被障碍阻断、部分/通信失败、超时、去重、真实参数更新和权重重载。
@@ -101,3 +147,15 @@ cd src/teamed-planning/scripts
 预检位于 [vtmp3-proxy-preflight-20261110](../../../artifacts/vtmp3-proxy-preflight-20261110/)：2 个训练场景、1 个验证场景，5 次真实优化；另在 1 个测试场景执行模型选点和 bootstrap 对照。模型闭环 5 次任务后距终点约 65.69 m，因时间预算截断，未声称到达或优于对照。预检只验证流程。
 
 初轮代理环境训练已启动：[vtmp3-proxy-training-20261110](../../../artifacts/vtmp3-proxy-training-20261110/)。32 个初始训练场景（220000–220031），8 个验证场景（320000–320007），第二轮增加 32 个模型采集场景（230000–230031），每轮训练 100 epochs；4 个独立测试场景（420000–420003）。每场景最多 32 次任务，在宏任务边界检查 2400 秒预算，最后一项任务可能跨过该时间阈值。采集单进程、低 CPU 优先级；优化阶段使用物理 GPU 2。启动进程 PID 3418853，实际阶段和子进程见 [status.json](../../../artifacts/vtmp3-proxy-training-20261110/status.json)，日志见 [运行日志](../../../artifacts/vtmp3-proxy-training-20261110.log)。此段记录启动事实，不表示两轮训练已经完成。
+
+WildScenes 接入后，114 项世界模型测试通过；
+[最终预检](../../../artifacts/vtmp3-wildscenes-preflight-final-20261110/status.json) 完成两轮真实优化、
+模型采集与独立测试，仅验证流程，不作为算法性能结果。
+2026-11-10 15:13（UTC+8）启动
+[WildScenes 独立训练](../../../artifacts/vtmp3-wildscenes-128tasks-3rounds-20261110-151319/status.json)，
+与随机场景训练并行；启动进程 PID 3465704，物理 GPU 2，低优先级、2 个 CPU 线程。
+训练种子为 850000–850127、860000–860127、870000–870127；验证为 950000–950031，
+测试为 1050000–1050031，均与短程预检任务种子分离。
+完整命令、GPU、数据来源与验证记录见
+[启动记录](../../../artifacts/vtmp3-wildscenes-128tasks-3rounds-20261110-151319.launch.json)，
+当前进度以运行目录及日志为准。

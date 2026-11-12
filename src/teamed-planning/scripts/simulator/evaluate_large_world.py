@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from drone.mappo import ActorCritic
 from simulator.mappo_experiment import Experiment
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 from simulator.large_world_scenarios import generate_large_scene,CircleGeometry
 from simulator.train_mappo import atomic_json,fixed_schedule
 
@@ -44,7 +45,7 @@ def write_report(report,output):
     lines=['# 1505轮模型：1000×1000米迁移测试','',f"状态：{report['status']}；已完成{len(report['records'])}/{len(report['seeds'])*len(report['distances'])}次。",'',
         '冻结同一个1505轮模型，不训练。传感器24×24米、2米分辨率、通信95米、3机、高度15米、速度与原实验不变，原12维特征及/100归一化保持不变。',
         '障碍半径2–5米，按原障碍生成区域22/80²的空间密度扩展至约3438个；不是按整个120米地图的平均密度稀释。每个种子一张地图，四档距离共享障碍物，起终点及参考路径均经过离线可行性检查。','',
-        '以原始观测支持的任务图连通为完成条件，首次连通后再运行30秒；车辆到达不结束回合。步数预算为max(400,ceil(2.5×参考路径长度+120))。参考为1米栅格、物理净空1.5米外加半格对角线裕量、禁止对角穿角的可行路径，非严格连续最优解。',
+        '以原始观测支持的任务图连通为完成条件，首次连通后再运行30秒；车辆到达不结束回合。步数预算为max(400,ceil(2.5×参考路径长度+120))。参考为1米栅格、物理净空采用本次配置（默认1米），另加半格对角线裕量、禁止对角穿角的可行路径，非严格连续最优解。',
         '真值只用于生成、参考路线和独立几何审计，不输入控制器/Actor。通信检查包含初始状态与各步端点的三维距离。此为单个训练模型、每档2场景的探索性测试，不能代替大地图重新训练与多种子实验。','',
         '|距离(m)|种子|终止原因|图连通|几何审计连通|首次连通(s)|安全图路径/参考|最大链路(m)|超距步数|车辆剩余(m)|',
         '|---|---|---|---|---|---:|---:|---:|---:|---:|']
@@ -95,7 +96,8 @@ def evaluate(run,output,seeds,distances,resume=False):
     try:
         for seed in seeds:
             if str(seed) not in report['scenes']:
-                report['scenes'][str(seed)]=generate_large_scene(seed,distances)
+                report['scenes'][str(seed)]=generate_large_scene(seed,distances,
+                    ground_safety_distance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M))
                 atomic_json(output/'results.json',report)
             scene=report['scenes'][str(seed)]
         # Short-distance checks first, then progressively harder tasks.
@@ -106,13 +108,14 @@ def evaluate(run,output,seeds,distances,resume=False):
                 start=np.asarray(scene['start']);goal=np.asarray(scene['goals'][key]);circles=scene['circles']
                 reference=scene['references'][key];budget=max(400,math.ceil(2.5*reference['length']+120))
                 torch.manual_seed(seed);np.random.seed(seed);started=time.monotonic()
-                geometry=CircleGeometry(circles);first_verified=-1;first_audit=None;reason='budget_exhausted';error=None
+                geometry=CircleGeometry(circles,clearance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M));first_verified=-1;first_audit=None;reason='budget_exhausted';error=None
                 with open(os.devnull,'w',encoding='utf-8') as sink,contextlib.redirect_stdout(sink):
                     env=Experiment(seed,model,stochastic=False,drop=config['drop'],
                         exploration_weight=fixed_schedule(config,config['episodes']-1)['eta'],exploration_candidates=config['exploration_candidates'],
                         communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
                         spacing_penalty_weight=config['spacing_penalty_weight'],intervention_weight=config['intervention_weight'],
                         moving_ground=True,reward_mode=config['reward_mode'],ground_speed=config['ground_speed'],
+                        ground_safety_distance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M),
                         path_reward_scale=config['path_reward_scale'],world_size=1000.,start=start,
                         scene=(goal,circles,scene['attempts']),stop_on_ground_arrival=False)
                     previous=[env.env.drones[i].position.copy() for i in range(3)]

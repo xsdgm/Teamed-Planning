@@ -25,17 +25,36 @@ A kilometer-scale multi-robot forest simulation environment designed for reinfor
 ## 📁 Project Files
 
 ```
-simple_multi_robot_sim/
-├── env.py                  # Core environment class (Gym-like interface)
-├── robots.py               # Robot definitions
-├── obstacles.py            # Obstacles
-├── utils.py                # Utility functions
-├── renderer_pygame.py      # Pygame renderer (with zoom/pan)
-├── forest_generator.py     # Forest scene generator
-├── mission_demo.py         # Cooperative forest navigation
-├── km_scale_demo.py        # 10km scene demo
-└── requirements.txt
+scripts/
+├── simulator/                 # 39 runtime Python modules
+│   ├── env.py                 # Environment, collision checks and RelayChannel
+│   ├── robots.py              # Ground robot and drone dynamics
+│   ├── obstacles.py           # Obstacle definitions and forest generation
+│   ├── renderer_pygame.py     # Interactive renderer
+│   ├── navigation_metrics.py  # Route metrics and CoGraph update credit
+│   ├── scenarios.py           # Small deterministic scenes
+│   ├── large_world_scenarios.py # Large training/evaluation scenes
+│   ├── train_mappo.py         # Training entry point
+│   ├── mappo_experiment.py    # Shared experiment implementation
+│   ├── mission_demo.py        # Cooperative forest navigation
+│   ├── km_scale_demo.py       # 10km scene demo
+│   └── ...                   # Specialized training, evaluation and data tools
+└── tests/simulator/           # All 54 simulator regression test modules
 ```
+
+Tests live in [tests/simulator](../tests/simulator); runtime modules contain no
+test fixtures. The consolidation preserves training/evaluation entry points,
+checkpoint schemas and archived runtime sources.
+
+| Former module | Current implementation |
+| --- | --- |
+| `utils.py` | Collision helpers in [env.py](env.py); three unused angle/vector helpers removed |
+| `relay_channel.py` | [env.py](env.py), alongside simulator transport and physics |
+| `forest_generator.py` | [obstacles.py](obstacles.py), alongside obstacle definitions |
+| `cograph_route_reward.py` | [navigation_metrics.py](navigation_metrics.py), alongside route metrics |
+
+The package-level `create_forest_scenario` export is retained. Historical
+experiments that explicitly load frozen snapshots keep their original imports.
 
 ## 🚀 Quick Start
 
@@ -46,13 +65,38 @@ pip install numpy pygame
 
 ### Cooperative Forest Navigation (1km x 1km)
 ```bash
-python mission_demo.py --steps 20000
+# From src/teamed-planning/scripts/
+python -m simulator.mission_demo --steps 20000
 ```
 
 ### Large Scene Demo (10km x 10km, 7 robots)
 ```bash
-python km_scale_demo.py
+python -m simulator.km_scale_demo
 ```
+
+## Regression tests
+
+From `src/teamed-planning/scripts/`, in the project environment with pytest:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+python -m pytest -q tests/simulator \
+  --ignore=tests/simulator/test_wildscenes_perception.py \
+  --ignore=tests/simulator/test_wildscenes_legacy_runtime.py \
+  --ignore=tests/simulator/test_wildscenes_vtemp.py
+```
+
+The following tests deliberately import complete frozen runtimes. Run each in
+its own Python process so current and archived packages cannot be mixed:
+
+```bash
+python -I tests/simulator/test_wildscenes_perception.py
+python -I tests/simulator/test_wildscenes_legacy_runtime.py
+python -I tests/simulator/test_wildscenes_vtemp.py
+```
+
+Test data and configuration paths still resolve against the repository, and
+shared test helpers are imported through `tests.simulator`.
 
 ## ⌨️ Interactive Controls
 
@@ -157,7 +201,7 @@ The renderer includes several optimizations for smooth interaction:
 ## 🌲 Forest Scene Generation
 
 ```python
-from forest_generator import create_forest_scenario
+from simulator.obstacles import create_forest_scenario
 
 # Generate forest
 obstacles = create_forest_scenario(
@@ -179,8 +223,8 @@ env.obstacles = obstacles
 
 ### Example 1: Basic Usage
 ```python
-from env import MultiRobotEnv, EnvConfig
-from forest_generator import create_forest_scenario
+from simulator.env import MultiRobotEnv, EnvConfig
+from simulator.obstacles import create_forest_scenario
 import numpy as np
 
 # Create environment

@@ -9,6 +9,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import numpy as np
 from common.graph_structure import TopologicalGraph
 from ground.ground_main import GroundRobotController
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 from simulator.env import MultiRobotEnv,EnvConfig
 from simulator.scenarios import generate_scene,free_grid
 
@@ -35,7 +36,8 @@ def validate_scene(seed,steps=360,obstacle_count=22):
     rid=env.add_ground_robot(15.,60.,max_speed=1.)
     for position,radius in circles:
         env.add_circle_obstacle(*position,radius)
-    controller=GroundRobotController('ground_0',fusion_interval=5.,max_speed=1.)
+    controller=GroundRobotController('ground_0',fusion_interval=5.,max_speed=1.,
+                                     safety_distance=DEFAULT_GROUND_CLEARANCE_M)
     controller.set_goal(tuple(goal))
     graph=reference_graph(circles)
     packet=dict(drone_id='surveyed_reference',position=[15.,60.,15.],graph=graph.to_message())

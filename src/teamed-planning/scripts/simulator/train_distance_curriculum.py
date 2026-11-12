@@ -101,7 +101,9 @@ def evaluation_job(checkpoint, config, seed, sample, sample_seed, stop_file):
 
 
 def distance_band_summary(band, rows, config):
-    success_metric='map_completed' if config['reward_mode']=='velocity_mapping' else 'goal_reached'
+    remaining_route=config.get('mapping_route_origin','initial')=='vehicle'
+    success_metric=('map_completed' if config['reward_mode']=='velocity_mapping'
+                    and not remaining_route else 'goal_reached')
     summary=dict(**band,n=len(rows),success_metric=success_metric,
         success_rate=float(np.mean([r[success_metric] for r in rows])),
         vehicle_arrival_rate=float(np.mean([r['goal_reached'] for r in rows])),
@@ -112,7 +114,16 @@ def distance_band_summary(band, rows, config):
         mean_episode_steps=float(np.mean([r['episode_steps'] for r in rows])),
         boundary_violations=float(sum(r['out_of_bounds'] for r in rows)),
         boundary_roundoff_count=float(sum(r['boundary_roundoff_count'] for r in rows)))
-    if all('route_new_best_saving_m' in r for r in rows):
+    if remaining_route:
+        connected=[r for r in rows if r['graph_task_connected']]
+        # The current endpoints move: compare updates at the same endpoints,
+        # never aggregate a best route length across different vehicle origins.
+        summary.update(connected_route_count=len(connected),
+            route_reference_kind='current_endpoint_euclidean_lower_bound',
+            mean_route_efficiency_connected=float(np.mean([r['route_efficiency'] for r in connected])) if connected else None,
+            mean_current_route_length_m_connected=float(np.mean([r['current_route_length_m'] for r in connected])) if connected else None,
+            mean_map_update_route_saving_m=float(np.mean([r['route_length_delta_m'] for r in rows])))
+    elif all('route_new_best_saving_m' in r for r in rows):
         connected=[r for r in rows if r['graph_task_connected']]
         summary.update(connected_route_count=len(connected),
             mean_route_efficiency_connected=float(np.mean([r['route_efficiency'] for r in connected])) if connected else None,
@@ -166,7 +177,8 @@ def evaluate_distance_matrix(plan, stage, checkpoint, config, output, workers):
     if stop.exists():
         return False
     by_band=[]
-    success_metric='map_completed' if config['reward_mode']=='velocity_mapping' else 'goal_reached'
+    success_metric=('map_completed' if config['reward_mode']=='velocity_mapping'
+                    and config.get('mapping_route_origin','initial')!='vehicle' else 'goal_reached')
     for band in plan['stages']:
         sample_rows=[r for r in rows if r['band']==band['stage']]
         assert len(sample_rows)==len(plan['settings']['evaluation_seeds'])*plan['settings']['evaluation_samples']

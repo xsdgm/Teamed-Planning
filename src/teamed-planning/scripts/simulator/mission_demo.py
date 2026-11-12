@@ -21,6 +21,7 @@ from simulator.env import MultiRobotEnv, EnvConfig
 from simulator.obstacles import CircleObstacle, RectObstacle
 from drone.drone_main import DroneController
 from ground.ground_main import GroundRobotController
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 
 # Try to import pygame for visualization overlay
 try:
@@ -499,7 +500,8 @@ def run_simulation(max_steps=2000):
             fusion_interval=FUSION_INTERVAL,
             max_speed=15.0,
             waypoint_threshold=10.0,
-            total_drones=num_drones
+            total_drones=num_drones,
+            graph_min_clearance=DEFAULT_GROUND_CLEARANCE_M
             # Map footprint comes from the simulator occupancy map.
         )
         
@@ -526,7 +528,8 @@ def run_simulation(max_steps=2000):
         ground_controller = GroundRobotController(
             robot_id=ground_robot_id,
             max_speed=2.0,  # Slower than drones
-            fusion_interval=FUSION_INTERVAL
+            fusion_interval=FUSION_INTERVAL,
+            safety_distance=DEFAULT_GROUND_CLEARANCE_M
         )
         ground_controller.set_target(ground_robot_target_positions[i])
         ground_robot_controllers[ground_robot_id] = ground_controller

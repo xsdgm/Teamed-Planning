@@ -15,6 +15,7 @@ from scipy.ndimage import label
 from simulator.large_world_scenarios import (ORIGINAL_ACTIVE_DENSITY, raster_free, reference_route,
     reference_geometry_clear, reference_polyline_length)
 from ground.task_planner import drones_to_cover
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 
 # Vehicle team layout around the start (m); the nine-drone serpentine formation
 # occupies up to 45 m beside it, so the start keeps START_MARGIN from the edge.
@@ -34,7 +35,8 @@ def sample_distance(rng, distance_range, sampling):
 
 def generate_cograph_scene(seed, target_count_range=(2, 8), distance_range=(100., 400.),
                            distance_sampling='annulus_area', vehicle_count=3, world=1000.,
-                           density=ORIGINAL_ACTIVE_DENSITY, single_task=False, num_drones=9):
+                           density=ORIGINAL_ACTIVE_DENSITY, single_task=False, num_drones=9,
+                           ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M):
     """Targets at independent random distances/headings from the team start."""
     low, high = target_count_range
     if not (type(low) is int and type(high) is int and 1 <= low <= high <= 8):
@@ -74,12 +76,12 @@ def generate_cograph_scene(seed, target_count_range=(2, 8), distance_range=(100.
         root = components[int(start[1]), int(start[0])]
         if not root or any(components[int(p[1]), int(p[0])] != root for p in [*vehicles, *goals]):
             continue
-        reference = raster_free(circles, world, 1.5+math.sqrt(.5))
+        reference = raster_free(circles, world, ground_safety_distance+math.sqrt(.5))
         try:
             routes = [reference_route(reference, start, goal) for goal in goals]
         except ValueError:
             continue
-        if not all(reference_geometry_clear(circles, start, goal, route['points'], world)
+        if not all(reference_geometry_clear(circles, start, goal, route['points'], world, ground_safety_distance)
                    for goal, route in zip(goals, routes)):
             continue
         scene = dict(seed=int(seed), world=world, start=start.tolist(),
@@ -89,7 +91,9 @@ def generate_cograph_scene(seed, target_count_range=(2, 8), distance_range=(100.
             reference_lengths=[route['length'] for route in routes],
             reference_polyline_lengths=[reference_polyline_length(start, goal, route['points'])
                                         for goal, route in zip(goals, routes)],
-            reference_geometry_validated=True)
+            reference_geometry_validated=True,
+            reference_clearance_m=ground_safety_distance+math.sqrt(.5),
+            reference_geometric_clearance_m=ground_safety_distance)
         if single_task:
             scene.update(single_task=True, task_drones=int(drones_to_cover(start, goals)))
         return scene

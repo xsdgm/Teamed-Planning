@@ -33,6 +33,7 @@ import torch
 from drone.mappo import ActorCritic, GLOBAL_FEATURES
 from drone.velocity_mappo import VelocityActorCritic
 from simulator.mappo_experiment import Experiment, SafetyTermination, update
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 from simulator.ppo_batch import update_batch
 from simulator.surprise_reward import TaskMapEncoder, transition, SurpriseReward
 from simulator.large_world_scenarios import generate_training_scene
@@ -51,6 +52,9 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     entropy_early=.03,entropy_late=.005,communication_mode='chain',safety_filter='cbf',
     spacing_penalty_weight=0.,intervention_weight=0.,moving_ground=True,
     reward_mode='cadmm_exploration',ground_speed=1.,path_reward_scale=100.,
+    # One obstacle clearance (m) for UAV graphs, UGV local planning and fusion bridges.
+    # All versions default to 1 m; enclosed-state escape retains its 0.5 m margin.
+    ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M,
     reward_schedule='fixed',exploration_weight=.6,entropy_coefficient=.01,
     world_size=120.,task_distances=[350,550,750],task_distance_range=None,budget_multiplier=3.,budget_extra=240,
     min_episode_steps=600,map_stability_steps=30,safety_failure_penalty=10.,
@@ -74,6 +78,9 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     path_quality_weight=0.,map_quality_reward=0.,
     # velocity_mapping: the start->goal map term stops once route quality pays.
     mapping_reward_until_connected=False,
+    # v9 evaluates both delivered maps at the same current vehicle position and
+    # rolling target. Missing fields retain the fixed-start v3-v8 contract.
+    mapping_route_origin='initial',
     # velocity_mapping: penalty on the least CBF feasibility margin (m/s), and an
     # improvement phase after the first stable map (+100 then); it ends at
     # map_target_quality or after map_improvement_steps without a better route
@@ -118,14 +125,25 @@ DEFAULTS = dict(episodes=2000, steps=240, seed=42, learning_rate=3e-4,
     # backbone links within vehicle_keep_range (m, 3D, inside the drones' CBF
     # edge) and yields to other vehicles (ground/vehicle_motion.py); 'free' is the
     # first v2 run's unfiltered drive.
-    vehicle_motion='free',vehicle_keep_range=88.)
+    vehicle_motion='free',vehicle_keep_range=88.,
+    # CoGraph v2: compare delivered maps at the same current vehicle positions.
+    # Omitted fields preserve historical checkpoints and reward trajectories.
+    cograph_route_reward='legacy',
+    # v10: local UAV confidence over an independent a-b survey corridor.
+    survey_a=None,survey_b=None,survey_vehicle_start=None,survey_half_width=12.,
+    survey_resolution=2.,survey_start_offset_range=[20.,80.],survey_anchor_probability=.25,
+    survey_stationary_probability=.5,survey_confidence_weight=100.,
+    survey_cell_confidence=.8,survey_target_confidence=.85,survey_target_coverage=.9,
+    # v11: choose an actual A->B distance band once per scene seed before
+    # feasibility resampling. None retains the unrestricted legacy sampler.
+    route_ab_distance_bands=None)
 
 # cograph_v2 is v1 plus the learned per-drone target choice (drone/cograph_v2_mappo.py).
 COGRAPH_ARCHITECTURES=('cograph_v1','cograph_v2')
 # The drones' CBF keeps a link below comm range minus its margin (95 - 0.25 m).
 COGRAPH_LINK_EDGE_M=94.75
-COOPERATIVE_ARCHITECTURES=('gat_cooperative_v7','gat_relay_attention_v8')+COGRAPH_ARCHITECTURES
-RELAY_ARCHITECTURES=('gat_relay_attention_v8',)+COGRAPH_ARCHITECTURES
+COOPERATIVE_ARCHITECTURES=('gat_cooperative_v7','gat_relay_attention_v8','gat_survey_v10','gat_route_ab_v11')+COGRAPH_ARCHITECTURES
+RELAY_ARCHITECTURES=('gat_relay_attention_v8','gat_survey_v10','gat_route_ab_v11')+COGRAPH_ARCHITECTURES
 GRAPH_ARCHITECTURES=('gat_map_v1',)+COOPERATIVE_ARCHITECTURES
 
 OPTIMIZER_CONFIG_FIELDS={'rollout_mode','ppo_target_kl','ppo_max_kl','ppo_max_backtracks',
@@ -133,6 +151,10 @@ OPTIMIZER_CONFIG_FIELDS={'rollout_mode','ppo_target_kl','ppo_max_kl','ppo_max_ba
 
 
 def optimizer_config_changes(previous, current, allow_upgrade=False):
+    # A checkpoint without this field predates the shared 1 m default. Do not
+    # silently change its physical contract when resuming under newer code.
+    previous = dict(previous)
+    previous.setdefault('ground_safety_distance', 1.5)
     previous,current=validate_config(previous),validate_config(current)
     changes={k:dict(before=previous[k],after=current[k]) for k in current if previous[k]!=current[k]}
     if changes and (not allow_upgrade or not set(changes)<=OPTIMIZER_CONFIG_FIELDS):
@@ -156,6 +178,28 @@ def validate_config(config):
     if unknown:
         raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
     config = dict(DEFAULTS, **config)
+    if config['policy_architecture']=='gat_route_ab_v11':
+        from simulator.route_ab_experiment import validate_route_ab_config
+        validate_route_ab_config(config)
+    elif config['policy_architecture']=='gat_survey_v10':
+        from simulator.survey_experiment import validate_survey_config
+        validate_survey_config(config)
+    elif any(config[key]!=DEFAULTS[key] for key in DEFAULTS if key.startswith('survey_')):
+        raise ValueError('survey_* settings require gat_survey_v10')
+    if config['policy_architecture'] != 'gat_route_ab_v11' and config['route_ab_distance_bands'] is not None:
+        raise ValueError('route_ab_distance_bands requires gat_route_ab_v11')
+    clearance=config['ground_safety_distance']
+    if (isinstance(clearance,bool) or not isinstance(clearance,(int,float))
+            or not np.isfinite(clearance) or clearance<=0):
+        raise ValueError('ground_safety_distance must be positive and finite')
+    if config['cograph_route_reward'] not in ('legacy','paired_current'):
+        raise ValueError('cograph_route_reward must be legacy or paired_current')
+    if config['cograph_route_reward']=='paired_current' and (
+            config['policy_architecture']!='cograph_v2' or config['vehicle_planner']!='decentralized'):
+        raise ValueError('Paired current-route reward requires cograph_v2 with decentralized vehicles')
+    if config['mapping_route_origin'] not in ('initial','vehicle'):
+        raise ValueError('mapping_route_origin must be initial or vehicle')
+    remaining_route=config['mapping_route_origin']=='vehicle'
     if config['policy_architecture'] not in ('mlp',)+GRAPH_ARCHITECTURES:
         raise ValueError('Unknown policy_architecture')
     if config['policy_architecture'] in GRAPH_ARCHITECTURES and (config['action_mode']!='velocity'
@@ -207,8 +251,8 @@ def validate_config(config):
     if config['action_mode'] not in ('candidate', 'velocity'):
         raise ValueError('action_mode must be candidate or velocity')
     if config['action_mode']=='velocity':
-        if config['exploration_candidates'] != 0 or config['subgoal_radius'] is not None:
-            raise ValueError('Velocity v3 uses no candidates or intermediate subgoals')
+        if config['exploration_candidates'] != 0 or (config['subgoal_radius'] is not None and not remaining_route):
+            raise ValueError('Velocity policies use no candidates; rolling subgoals require the v9 remaining-route contract')
         if any(d > config['max_task_distance'] for d in config['task_distances']):
             raise ValueError('Velocity task distance exceeds max_task_distance')
     if config['environment_version'] != ENVIRONMENT_VERSION:
@@ -310,8 +354,10 @@ def validate_config(config):
         raise ValueError('fusion_bridge_distance must be 0 (off) up to the 15 m drone edge length')
     if config['spacing_penalty_weight']<0 or config['intervention_weight']<0:
         raise ValueError('Safety penalty weights must be nonnegative')
-    if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
+    if config['moving_ground'] is not True or config['reward_mode'] not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping','local_survey'):
         raise ValueError('Invalid ground mode or reward mode')
+    if config['reward_mode']=='local_survey' and config['policy_architecture']!='gat_survey_v10':
+        raise ValueError('local_survey requires the survey policy')
     if config['reward_mode']=='cadmm_exploration' and not config['moving_ground']:
         raise ValueError('CADMM reward requires the ground map receiver/controller')
     if not 0 < config['ground_speed'] <= 2 or not np.isfinite(config['path_reward_scale']) or config['path_reward_scale']<=0:
@@ -349,8 +395,10 @@ def validate_config(config):
     if (isinstance(config['subgoal_arrival'],bool) or not isinstance(config['subgoal_arrival'],(int,float))
             or not 0<config['subgoal_arrival']<(config['subgoal_radius'] or np.inf)):
         raise ValueError('subgoal_arrival must be positive and below subgoal_radius')
-    if config['termination'] not in ('map','arrival'):
-        raise ValueError('termination must be map or arrival')
+    if config['termination'] not in ('map','arrival','survey'):
+        raise ValueError('termination must be map, arrival or survey')
+    if config['termination']=='survey' and config['policy_architecture']!='gat_survey_v10':
+        raise ValueError('survey termination requires the survey policy')
     if config['termination']=='arrival' and config['world_size']!=1000.:
         raise ValueError('Arrival termination is defined for the 1000m world')
     if not np.isfinite(config['arrival_reward']) or config['arrival_reward']<0:
@@ -363,7 +411,7 @@ def validate_config(config):
             raise ValueError(f'{name} must be finite and nonnegative')
     if type(config['ground_stationary']) is not bool:
         raise ValueError('ground_stationary must be bool')
-    if config['ground_stationary'] and (config['termination']!='map' or config['subgoal_radius'] is not None):
+    if config['ground_stationary'] and (config['termination'] not in ('map','survey') or config['subgoal_radius'] is not None):
         raise ValueError('A stationary vehicle requires map termination and no subgoals')
     if config['map_success_reward'] and config['world_size']!=1000.:
         raise ValueError('map_success_reward uses the 1000m reference route')
@@ -377,11 +425,21 @@ def validate_config(config):
     for name in ('chain_risk_weight','chain_outward_weight','chain_missing_weight'):
         if not np.isfinite(config[name]) or config[name]<0:
             raise ValueError(f'{name} must be finite and nonnegative')
-    if config['reward_mode']=='velocity_mapping':
+    if remaining_route:
+        if (config['reward_mode']!='velocity_mapping' or config['action_mode']!='velocity'
+                or config['world_size']!=1000. or config['termination']!='arrival'
+                or config['ground_stationary']
+                or config['policy_architecture'] in COGRAPH_ARCHITECTURES):
+            raise ValueError('v9 remaining-route mapping requires a moving vehicle, '
+                             'velocity_mapping and arrival termination in the 1000m world')
+        if (config['map_success_reward'] or config['map_quality_reward']
+                or config['map_improvement_steps'] or config['surprise_weight']):
+            raise ValueError('v9 has no fixed-start map completion, improvement or surprise rewards')
+    elif config['reward_mode']=='velocity_mapping':
         if (config['action_mode']!='velocity' or config['world_size']!=1000.
                 or config['termination']!='map' or config['arrival_reward']!=0.
                 or config['subgoal_radius'] is not None):
-            raise ValueError('Velocity mapping trains only map completion, with no arrival reward or subgoals')
+            raise ValueError('Initial-origin velocity mapping trains only map completion, with no arrival reward or subgoals')
     elif config['path_quality_weight'] or config['map_quality_reward']:
         raise ValueError('Physical route quality rewards require velocity_mapping')
     if type(config['mapping_reward_until_connected']) is not bool:
@@ -396,7 +454,7 @@ def validate_config(config):
         raise ValueError('map_improvement_steps must be a nonnegative integer')
     if not 0<config['map_target_quality']<=1:
         raise ValueError('map_target_quality must be in (0, 1]')
-    if (config['cbf_margin_weight'] or config['map_improvement_steps']) and config['reward_mode']!='velocity_mapping':
+    if (config['cbf_margin_weight'] or config['map_improvement_steps']) and config['reward_mode'] not in ('velocity_mapping','local_survey'):
         raise ValueError('CBF margin and map improvement are velocity_mapping terms')
     if config['cbf_margin_weight']:
         # A permanent worst case of every per-step penalty (intervention <= 4)
@@ -409,11 +467,12 @@ def validate_config(config):
         raise ValueError('Map improvement requires path_quality_weight and no map_quality_reward')
     if not np.isfinite(config['frontier_progress_weight']) or config['frontier_progress_weight']<0:
         raise ValueError('frontier_progress_weight must be finite and nonnegative')
+    completion_reward=config['arrival_reward'] if remaining_route else config['map_success_reward']
     if config['frontier_progress_weight'] and (config['reward_mode']!='velocity_mapping'
-            or config['frontier_progress_weight']>=config['map_success_reward']):
-        # Progress pays at most its weight per episode; finishing the map must
-        # stay worth more than any partial push toward the goal.
-        raise ValueError('Frontier progress requires velocity_mapping and a weight below map_success_reward')
+            or config['frontier_progress_weight']>=completion_reward):
+        # Legacy progress is best-so-far per episode; v9 is a signed within-step
+        # map change at frozen endpoints, with arrival as its completion event.
+        raise ValueError('Frontier progress requires velocity_mapping and a weight below the completion reward')
     for name in ('surprise_weight','surprise_weight_final','surprise_clip',
                  'surprise_episode_budget','surprise_learning_rate'):
         value=config[name]
@@ -448,6 +507,10 @@ def critic_features(config):
 def feature_version(config):
     """Feature contract: 1 candidate, 2/5 velocity MLP, 4/6 map GAT, 7 cooperative GAT, 8 relay attention,
     9 CoGraph v1 (v8 plus target tokens), 10 CoGraph v2 (graph-reach tokens, target choice)."""
+    if config['policy_architecture']=='gat_route_ab_v11':
+        return 12
+    if config['policy_architecture']=='gat_survey_v10':
+        return 11
     if config['policy_architecture']=='cograph_v2':
         return 10
     if config['policy_architecture']=='cograph_v1':
@@ -465,6 +528,12 @@ def feature_version(config):
 
 
 def make_model(config):
+    if config['policy_architecture']=='gat_route_ab_v11':
+        from drone.survey_mappo import RouteABActorCritic
+        return RouteABActorCritic(GLOBAL_FEATURES,config['actor_input_version'],config['relay_attention'])
+    if config['policy_architecture']=='gat_survey_v10':
+        from drone.survey_mappo import SurveyActorCritic
+        return SurveyActorCritic(GLOBAL_FEATURES,config['actor_input_version'],config['relay_attention'])
     if config['policy_architecture']=='cograph_v2':
         from drone.cograph_v2_mappo import CoGraphV2ActorCritic
         return CoGraphV2ActorCritic(critic_features(config),config['actor_input_version'],config['relay_attention'])
@@ -493,6 +562,14 @@ def optimizer_contract(config):
 
 
 def reward_contract(config):
+    if config['policy_architecture']=='gat_route_ab_v11':
+        # r2: feasible scene certificates, clearance-aware endpoint joins,
+        # signed handover potential and independent fresh vehicle observations.
+        return 'uav_fixed_ab_route_with_vehicle_backbone_v11_r2'
+    if config['policy_architecture']=='gat_survey_v10':
+        return 'uav_local_ab_confidence_with_vehicle_backbone_v10'
+    if config.get('mapping_route_origin','initial')=='vehicle':
+        return 'uav_remaining_route_mapping_v9'
     if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
         # v8 terms per target, averaged over targets; success = every target connected.
         bridged='_bridged' if config['fusion_bridge_distance'] else ''
@@ -504,7 +581,8 @@ def reward_contract(config):
                 +('_single_task' if config['scene_regime']=='single_task' else '')
                 +('_decentralized_vehicles' if config['vehicle_planner']=='decentralized' else '')
                 +('_tree_budget' if config['budget_reference']=='tree' else '')
-                +('_vehicle_link_keeping' if config['vehicle_motion']=='link_keeping' else '')+bridged)
+                +('_vehicle_link_keeping' if config['vehicle_motion']=='link_keeping' else '')+bridged
+                +('_paired_current_route' if config.get('cograph_route_reward','legacy')=='paired_current' else ''))
     # v8 changes observations/transport only; its reward is v7's unchanged.
     if config['policy_architecture'] in COOPERATIVE_ARCHITECTURES:
         # Bridging changes which delivered maps count as connected (map success).
@@ -544,17 +622,25 @@ def append_json(path, value):
 
 
 def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, stop=None):
+    if config['policy_architecture']=='gat_route_ab_v11':
+        from simulator.route_ab_experiment import run_route_ab_episode
+        return run_route_ab_episode(model,config,scene_seed,schedule,stochastic,progress,stop)
+    if config['policy_architecture']=='gat_survey_v10':
+        from simulator.survey_experiment import run_survey_episode
+        return run_survey_episode(model,config,scene_seed,schedule,stochastic,progress,stop)
     if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
         from simulator.cograph_experiment import run_cograph_episode
         return run_cograph_episode(model,config,scene_seed,schedule,stochastic,progress,stop)
     large=config['world_size']==1000.
     scene=(generate_training_scene(scene_seed,config['task_distances'],
                                   distance_range=config['task_distance_range'],
-                                  distance_sampling=config['distance_sampling']) if large else None)
+                                  distance_sampling=config['distance_sampling'],
+                                  ground_safety_distance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M)) if large else None)
     options={} if scene is None else dict(world_size=1000.,start=scene['start'],
         scene=(scene['goal'],scene['circles'],scene['attempts']),stop_on_ground_arrival=False)
     reference_length=(scene.get('reference_polyline_length',scene['reference_length']) if scene else None)
-    if config['reward_mode']=='velocity_mapping':
+    remaining_route=config.get('mapping_route_origin','initial')=='vehicle'
+    if config['reward_mode']=='velocity_mapping' and not remaining_route:
         options['route_reference_length']=reference_length
     requested_budget=config['steps'] if scene is None else max(config['min_episode_steps'],
         math.ceil(config['budget_multiplier']*scene['reference_length']+config['budget_extra']))
@@ -567,6 +653,7 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             spacing_penalty_weight=config['spacing_penalty_weight'],intervention_weight=config['intervention_weight'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
+            ground_safety_distance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M),
             subgoal_radius=config['subgoal_radius'],subgoal_arrival=config['subgoal_arrival'],
             route_reward_weight=config['route_reward_weight'],time_penalty=config['time_penalty'],
             ground_stationary=config['ground_stationary'],
@@ -574,6 +661,7 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             chain_outward_weight=config['chain_outward_weight'],chain_missing_weight=config['chain_missing_weight'],
             path_quality_weight=config['path_quality_weight'],
             mapping_until_connected=config['mapping_reward_until_connected'],
+            mapping_route_origin=config.get('mapping_route_origin','initial'),
             cbf_margin_weight=config['cbf_margin_weight'],cbf_margin_scale=config['cbf_margin_scale'],
             frontier_progress_weight=config['frontier_progress_weight'],
             chain_ground_range=config['chain_ground_range'],
@@ -603,7 +691,8 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                     if not large:raise
                     # The proposed joint action transitions to an absorbing failure
                     # without executing infeasible velocities or relaxing safety.
-                    samples=exc.samples;reward=-config['safety_failure_penalty']
+                    samples=exc.samples
+                    reward=-config['safety_failure_penalty']
                     rollout.append((*[np.array([sample[k] for sample in samples]) for k in range(4)],reward,state))
                     if encoder is not None:surprise_transitions.append(None)
                     reason='cbf_infeasible';break
@@ -622,6 +711,9 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                 mapped=bool(env.trace[-1]['graph_task_connected'])
                 if config['reward_mode']=='velocity_mapping':
                     mapped=mapped and bool(env.trace[-1]['chain_links_available']) and env.trace[-1]['chain_max_distance_ratio']<=1.
+                if remaining_route and env.trace[-1].get('route_target_changed',0.):
+                    # A newly selected rolling target has its own stability clock.
+                    stable=0
                 stable=stable+1 if mapped else 0
                 if progress is not None and (frame%25==0 or frame+1==budget):
                     progress(dict(step=frame+1,budget=budget,scene_seed=scene_seed,
@@ -665,19 +757,27 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
                         rollout[-1]=(*head,reward+config['arrival_reward'],state)
                     break
             summary=env.summary()
-            if reason=='cbf_infeasible':summary['reward']-=config['safety_failure_penalty']
-            if reason=='vehicle_arrival' and large:summary['reward']+=config['arrival_reward']
+            if reason=='cbf_infeasible':
+                summary['reward']-=config['safety_failure_penalty']
+            if reason=='vehicle_arrival' and large:
+                summary['reward']+=config['arrival_reward']
             if reason=='map_connected' or milestone>=0:summary['reward']+=bonus+quality_bonus
             if config['reward_mode']=='velocity_mapping':
                 summary.update(uav_reward=summary['reward'],
                     map_completion_bonus=bonus,map_quality_bonus=quality_bonus,
-                    route_reference_length_m=reference_length,
                     safety_failure_cost=config['safety_failure_penalty'] if reason=='cbf_infeasible' else 0.)
+                if remaining_route:
+                    # The initial feasible reference remains an episode audit;
+                    # it must never be divided by a shorter remaining route.
+                    summary['initial_route_reference_length_m']=reference_length
+                else:
+                    summary['route_reference_length_m']=reference_length
             if large:
                 length=summary['graph_task_path_length']
                 efficiency_reference=reference_length if config['reward_mode']=='velocity_mapping' else scene['reference_length']
-                summary['route_efficiency']=(min(1.,efficiency_reference/length)
-                                             if summary['graph_task_connected'] and length>0 else 0.)
+                summary['route_efficiency']=(summary['route_quality'] if remaining_route else
+                    (min(1.,efficiency_reference/length)
+                     if summary['graph_task_connected'] and length>0 else 0.))
             if improve:
                 summary.update(map_completion_step=float(milestone+1 if milestone>=0 else -1),
                     map_optimal=float(reason=='map_optimal'),map_plateau=float(reason=='map_plateau'),
@@ -721,15 +821,42 @@ def validation(model, config):
 def score_validation(records, config):
     averages={key:float(np.mean([row[key] for row in records]))
               for key in records[0] if key not in ('seed','sample')}
+    if config['policy_architecture']=='gat_route_ab_v11':
+        unsafe = np.mean([bool(r['safety_terminated'] or r['survey_disconnected_steps']
+            or r['collisions'] or r['ground_collisions'] or r['out_of_bounds']) for r in records])
+        return dict(score=float(1000.*averages['route_completed']+20.*averages['route_efficiency']
+            -10000.*unsafe-averages['episode_steps']/config['steps']),
+            means=averages, scenes=records, success_metric='route_completed',
+            selection_contract='fixed_ab_route_and_real_vehicle_connectivity_v11')
+    if config['policy_architecture']=='gat_survey_v10':
+        unsafe=sum(bool(r['collisions'] or r['ground_collisions'] or r.get('out_of_bounds',0.)
+                        or r.get('survey_disconnected_steps',0.) or r.get('safety_terminated',0.)) for r in records)
+        groups={}
+        for anchored in (True,False):
+            for stationary in (True,False):
+                key=('anchored' if anchored else 'independent')+('_stationary' if stationary else '_moving')
+                rows=[r for r in records if bool(r['survey_a_equals_initial_c'])==anchored
+                      and bool(r['survey_vehicle_stationary'])==stationary]
+                group=dict(count=len(rows))
+                for metric in ('survey_completed','survey_confidence','survey_coverage','safety_terminated'):
+                    group[metric]=float(np.mean([r[metric] for r in rows])) if rows else None
+                group['disconnected_rate']=float(np.mean([bool(r.get('survey_disconnected_steps',0.))
+                                                         for r in rows])) if rows else None
+                groups[key]=group
+        return dict(score=float(-10000.*unsafe+1000.*averages['survey_completed']
+                        +100.*averages['survey_confidence']+10.*averages['survey_coverage']
+                        -averages['episode_steps']/config['steps']),
+                    means=averages,scenes=records,groups=groups,success_metric='survey_completed',
+                    selection_contract='local_ab_confidence_and_vehicle_connectivity_v10')
     # Select navigation graphs by connectivity, time, efficiency and safety;
     # with arrival termination, by vehicle arrival and its time instead.
-    if config['reward_mode']=='velocity_mapping':
+    if config['termination']=='arrival':
+        success=averages['goal_reached']
+        delays=[r['episode_steps'] if r['goal_reached'] else config['steps'] for r in records]
+    elif config['reward_mode']=='velocity_mapping':
         success=averages['map_completed']
         delays=[r.get('map_completion_step',r['episode_steps']) if r['map_completed'] else config['steps']
                 for r in records]
-    elif config['termination']=='arrival':
-        success=averages['goal_reached']
-        delays=[r['episode_steps'] if r['goal_reached'] else config['steps'] for r in records]
     else:
         success=averages['graph_task_connected']
         delays=[r['graph_first_connection_step'] if r['graph_first_connection_step']>=0
@@ -738,15 +865,27 @@ def score_validation(records, config):
         -.1*averages['graph_task_path_ratio']+.001*averages['reward'] \
         -10000*averages['collisions'] \
         -10*averages['chain_link_violation']
-    if config['reward_mode']!='velocity_mapping':
+    if config['reward_mode']!='velocity_mapping' or config['termination']=='arrival':
         score-=10000*averages['ground_collisions']
-    else:
+    if config['reward_mode']=='velocity_mapping':
         score+=20.*averages.get('route_efficiency',0.)
     if config['world_size']==1000.:
         score-=1000*averages['safety_terminated']
     return dict(score=score,means=averages,scenes=records,
-        success_metric='map_completed' if config['reward_mode']=='velocity_mapping' else
-                       ('goal_reached' if config['termination']=='arrival' else 'graph_task_connected'))
+        success_metric=('goal_reached' if config['termination']=='arrival' else
+            ('map_completed' if config['reward_mode']=='velocity_mapping' else 'graph_task_connected')))
+
+
+def validate_resume_reward_contract(saved, config):
+    """Do not mix old v11 optimizer/history with the repaired task contract.
+
+    Loading actor weights into a new run remains a separate supported action.
+    Other architectures retain their existing resume compatibility checks.
+    """
+    if (config['policy_architecture'] == 'gat_route_ab_v11'
+            and saved.get('reward_contract') != reward_contract(config)):
+        raise ValueError('V11 scene/observation/reward contract changed; start a new run '
+                         '(weights-only initialization is supported), not an old-run resume')
 
 
 def _worker_init():
@@ -764,13 +903,16 @@ def _rollout_task(kind, state, config, scene_seed, sample_seed, schedule, output
     Validation samples actions exactly like training, from its fixed sample seed.
     """
     tic=time.monotonic()
-    torch.manual_seed(sample_seed)
     model=ActorCritic.from_state_dict(state)
     model.train(kind=='train')
     output=Path(output)
     def progress(value):
         atomic_json(output/'running'/f'{tag}.json',dict(task=tag,
             updated_utc=datetime.now(timezone.utc).isoformat(),**value))
+    # Reconstruction initializes layers before loading the frozen weights and
+    # consumes RNG. Seed after it so serial and worker rollouts draw the same
+    # action stream for the same sample seed.
+    torch.manual_seed(sample_seed)
     rollout,summary=run_episode(model,config,scene_seed,schedule,True,
         progress=progress,stop=lambda:(output/'STOP').exists())
     return (rollout if kind=='train' else None),summary,time.monotonic()-tic
@@ -782,14 +924,41 @@ def _terminate(pool):
 
 
 def episode_line(completed, config, summary, loss, ppo):
+    if config['policy_architecture']=='gat_route_ab_v11':
+        return (f'episode {completed}/{config["episodes"]} route_done={summary["route_completed"]:.0f} '
+            f'route_quality={summary["route_quality"]:.3f} '
+            f'mapping_reward={summary["mapping_reward"]:.3f} '
+            f'quality_reward={summary["path_quality_reward"]:.3f} '
+            f'frontier_reward={summary["frontier_progress_reward"]:.3f} '
+            f'reward={summary["reward"]:.3f} steps={summary["episode_steps"]:.0f} '
+            f'safety_stop={summary["safety_terminated"]:.0f} loss={loss:.4f} '
+            f'kl={ppo["approx_kl"]:.6f}')
+    if config['policy_architecture']=='gat_survey_v10':
+        return (f'episode {completed}/{config["episodes"]} survey_done={summary["survey_completed"]:.0f} '
+            f'confidence={summary["survey_confidence"]:.3f} coverage={summary["survey_coverage"]:.3f} '
+            f'reward={summary["reward"]:.3f} steps={summary["episode_steps"]:.0f} '
+            f'safety_stop={summary["safety_terminated"]:.0f} loss={loss:.4f} '
+            f'kl={ppo["approx_kl"]:.6f} entropy={ppo["entropy"]:.3f}')
+    if config.get('mapping_route_origin','initial')=='vehicle':
+        completion=f'arrived={summary.get("goal_reached",0.):.0f}'
+        route_change=f'route_delta_m={summary.get("route_length_delta_m",0.):.1f}'
+        frontier=summary.get('frontier_progress',0.)
+    elif config.get('cograph_route_reward','legacy')=='paired_current':
+        completion=f'map_done={summary.get("map_completed",0.):.0f}'
+        route_change=f'route_delta_m={summary.get("route_length_delta_m",0.):.1f}'
+        frontier=summary.get('frontier_progress',0.)
+    else:
+        completion=f'map_done={summary.get("map_completed",0.):.0f}'
+        route_change=f'route_saved_m={summary.get("route_new_best_saving_m",0.):.1f}'
+        frontier=summary.get('frontier_best_progress',0.)
     return (f'episode {completed}/{config["episodes"]} '
         f'beta={summary["reward_beta"]:.3f} eta={summary["reward_eta"]:.3f} '
         f'confidence={summary["confidence_area"]:.1f} '
         f'task_share={summary["task_share"]:.3f} '
-        f'map_done={summary.get("map_completed",0.):.0f} '
+        f'{completion} '
         f'route_quality={summary.get("route_efficiency",0.):.3f} '
-        f'route_saved_m={summary.get("route_new_best_saving_m",0.):.1f} '
-        f'frontier={summary.get("frontier_best_progress",0.):.2f} '
+        f'{route_change} '
+        f'frontier={frontier:.2f} '
         f'chain_cost={sum(summary.get(k,0.) for k in ("chain_risk_cost","chain_outward_cost","chain_missing_cost")):.3f} '
         f'ground_m={summary.get("ground_distance",0.):.1f} '
         f'goal_remaining={summary.get("ground_goal_distance",0.):.1f} '
@@ -824,7 +993,14 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
         path=Path(config['init_checkpoint']).resolve()
         initial=torch.load(path,map_location='cpu',weights_only=True)
         warm=None
-        if (config['policy_architecture'] in COGRAPH_ARCHITECTURES
+        if (config['policy_architecture'] in ('gat_survey_v10','gat_route_ab_v11')
+                and initial.get('policy_architecture')=='gat_relay_attention_v8'):
+            if (initial.get('reward_contract')!='uav_remaining_route_mapping_v9'
+                    or initial['config'].get('mapping_route_origin')!='vehicle'
+                    or initial['config'].get('relay_attention')!=config['relay_attention']):
+                raise ValueError('Survey warm start requires a compatible v9 checkpoint')
+            warm=model.warm_start_actor(initial['model'])
+        elif (config['policy_architecture'] in COGRAPH_ARCHITECTURES
                 and initial.get('policy_architecture')=='gat_relay_attention_v8'):
             # Cross-architecture warm start: shared v8 modules, fresh target attention
             # (and, for v2, the target selector at its nearest-unconnected prior).
@@ -858,6 +1034,7 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
     joint_steps=0;optimizer_batches=0;upgrade_changes={}
     if resume:
         saved=torch.load(latest,map_location='cpu',weights_only=True)
+        validate_resume_reward_contract(saved, config)
         if saved.get('critic_global_features',0)!=critic_features(config) or saved.get('policy_mode')!='sample':
             raise ValueError('Checkpoint predates the global-state critic and sampled validation; '
                              'start a separate training run')
@@ -931,6 +1108,8 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
             exploration_candidates=config['exploration_candidates'],world_bounds=[0.,0.,config['world_size'],config['world_size']],
             communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
+            mapping_route_origin=config['mapping_route_origin'],
+            cograph_route_reward=config['cograph_route_reward'],
             environment_version=ENVIRONMENT_VERSION,
             reward_contract=reward_contract(config),
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],

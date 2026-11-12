@@ -8,8 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from .ab_contract import ACTION_CONTRACT, ALGORITHM
-from .ab_environment import ACTIONS, CHANNELS, FEATURES, SIDE
+from .ab_environment import ACTION_CONTRACT, ALGORITHM, ACTIONS, CHANNELS, FEATURES, SIDE
 from .ab_model import WorldModel, sequence_loss
 from .models import make_model
 
@@ -25,6 +24,7 @@ def atomic_json(path, document):
 
 def load_episodes(root):
     splits, seeds, geometries, manifest = {'train': [], 'val': []}, set(), {}, []
+    terrain_regions = []
     for split in splits:
         for path in sorted(Path(root).glob(f'{split}_*.npz')):
             with np.load(path, allow_pickle=False) as source:
@@ -37,6 +37,17 @@ def load_episodes(root):
             if seed in seeds or (geometry in geometries and geometries[geometry] != split):
                 raise ValueError('Duplicate seed or physical geometry across dataset splits')
             seeds.add(seed); geometries[geometry] = split
+            if 'terrain_region_id' in episode:
+                source_sha = str(episode['terrain_source_sha256'].item())
+                origin = np.asarray(episode['terrain_origin_xy'], float)
+                world = float(episode['terrain_world_m'])
+                if origin.shape != (2,) or not np.isfinite(origin).all() or not np.isfinite(world) or world <= 0:
+                    raise ValueError('Invalid terrain region metadata')
+                for old_split, old_sha, old_origin, old_world in terrain_regions:
+                    if old_split != split and source_sha == old_sha and (
+                            np.minimum(origin+world, old_origin+old_world) > np.maximum(origin, old_origin)).all():
+                        raise ValueError('WildScenes terrain regions overlap across dataset splits')
+                terrain_regions.append((split, source_sha, origin, world))
             n = len(episode['actions'])
             if not n:
                 raise ValueError('Empty episode')

@@ -50,7 +50,11 @@ class GlobalPlanner:
         self.using_graph = False
         self.waiting_at_frontier = False
         self.start_connection_idx = None
+        # Only these deliberately introduced graph connectors may be
+        # approached using fresh local sensing. They are not surveyed edges.
+        self.observed_connection_indices = set()
         self.entry_validator = None
+        self.connection_validator = None
 
     def _entry_node(self, start_pos, graph):
         """Choose the nearest entry that local observations allow approaching."""
@@ -61,9 +65,46 @@ class GlobalPlanner:
              for node, data in graph.graph.nodes(data=True)),
             key=lambda item: (item[1], str(item[0])))
         for node, distance in candidates:
-            if self.entry_validator(graph.get_node_position(node)):
+            position=graph.get_node_position(node)
+            if (self.entry_validator(position) and (self.connection_validator is None
+                    or self.connection_validator(start_pos,position))):
                 return node, distance
         return None
+
+    def _route_entry_node(self, start_pos, goal_node_id, graph):
+        """Choose a nearby admissible entry by its remaining graph route.
+
+        The closest vertex can be the end of a long branch leading behind the
+        vehicle. Joining that branch and walking back to its junction is not
+        cheaper than approaching a slightly more distant, locally admissible
+        entry. Keep the nearest approach as a fallback; distant vertices never
+        become unobserved shortcuts merely because they are close to the goal.
+        """
+        nearest = self._entry_node(start_pos, graph)
+        if nearest is None or self.entry_validator is None or nearest[1] > 15.:
+            return nearest
+        costs = nx.single_source_dijkstra_path_length(graph.graph, goal_node_id, weight='weight')
+        current_cost = nearest[1] + costs.get(nearest[0], float('inf'))
+        direction = np.asarray(graph.get_node_position(goal_node_id)) - start_pos
+        length = float(np.linalg.norm(direction))
+        nearest_delta = np.asarray(graph.get_node_position(nearest[0])) - start_pos
+        # A small optimistic connector saving is not a reason to disturb a
+        # healthy forward entry. Target the observed regression: approaching
+        # a rear branch and then retracing it to its junction.
+        if (np.isfinite(current_cost) and (length < 1e-9 or
+                float(nearest_delta @ direction / length) >= -.5)):
+            return nearest
+        candidates = []
+        for node, cost in costs.items():
+            position = graph.get_node_position(node)
+            distance = float(np.linalg.norm(np.asarray(position) - start_pos))
+            if distance <= 15. and distance + cost < current_cost - 2.:
+                candidates.append((distance + cost, distance, str(node), node, position))
+        for _, distance, _, node, position in sorted(candidates):
+            if (self.entry_validator(position) and (self.connection_validator is None
+                    or self.connection_validator(start_pos, position))):
+                return node, distance
+        return nearest
         
     def plan_path(self, start_pos: Tuple[float, float],
                  goal_pos: Tuple[float, float],
@@ -82,6 +123,7 @@ class GlobalPlanner:
             List of (x, y) waypoints, or None if no path found
         """
         self.start_connection_idx = None
+        self.observed_connection_indices = set()
         # Decide strategy: graph-based or direct
         if graph is not None and len(graph) > 0 and self.should_use_graph(start_pos, goal_pos, graph):
             # Use graph-based planning
@@ -105,6 +147,7 @@ class GlobalPlanner:
         waypoints = self.generate_direct_waypoints(start_pos, goal_pos)
         self.using_graph = False
         self.start_connection_idx = None
+        self.observed_connection_indices = set(range(len(waypoints)))
         self.waiting_at_frontier = False
         self.current_path = waypoints
         self.current_waypoint_idx = 0
@@ -225,9 +268,12 @@ class GlobalPlanner:
             print(f"[Robot {self.robot_id}] Cannot find nodes near start/goal")
             return None
         
-        start_node_id, start_dist = start_node
         goal_node_id, goal_dist = goal_node
-        
+        start_node = self._route_entry_node(start_pos, goal_node_id, graph)
+        if start_node is None:
+            return None
+        start_node_id, start_dist = start_node
+
         # Try to find path using A*
         node_path = graph.get_path(start_node_id, goal_node_id)
         
@@ -240,10 +286,11 @@ class GlobalPlanner:
             for node_id in node_path:
                 pos = graph.get_node_position(node_id)
                 prev = waypoints[-1]
-                if np.hypot(pos[0] - prev[0], pos[1] - prev[1]) > 0.5:
+                if np.hypot(pos[0] - prev[0], pos[1] - prev[1]) > 1e-9:
                     waypoints.append(pos)
                     if node_id == node_path[0]:
                         self.start_connection_idx = len(waypoints) - 1
+                        self.observed_connection_indices.add(len(waypoints) - 1)
 
             last = waypoints[-1]
             if np.hypot(goal_pos[0] - last[0], goal_pos[1] - last[1]) > 0.5:
@@ -462,6 +509,7 @@ class GlobalPlanner:
         self.using_graph = False
         self.waiting_at_frontier = False
         self.start_connection_idx = None
+        self.observed_connection_indices = set()
     
     # ========== Multi-Component Planning Methods ==========
     
@@ -740,6 +788,9 @@ class GlobalPlanner:
             
             for node_id in sorted(comp['nodes'], key=str):
                 node_pos = graph.get_node_position(node_id)
+                if (self.connection_validator is not None
+                        and not self.connection_validator(current_pos,node_pos)):
+                    continue
                 if (not entered and self.entry_validator is not None
                         and not self.entry_validator(node_pos)):
                     continue
@@ -776,10 +827,12 @@ class GlobalPlanner:
                     min_exit_dist = dist
                     exit_node_id = node_id
             
-            # Add waypoint for entry (if not too close to current pos)
+            # Keep even a nearby entry: dropping it can turn the following
+            # genuine graph edge into an unlabelled, unverified shortcut.
             entry_pos = graph.get_node_position(entry_node_id)
-            if min_entry_dist > 1.0:  # Only add if > 1m away
+            if min_entry_dist > 1e-9:
                 waypoints.append(entry_pos)
+                self.observed_connection_indices.add(len(waypoints) - 1)
                 if not entered:
                     self.start_connection_idx = len(waypoints) - 1
             entered = True
@@ -799,10 +852,9 @@ class GlobalPlanner:
                         if node_pos is not None:
                             waypoints.append(node_pos)
                 except (nx.NetworkXNoPath, nx.NodeNotFound, nx.exception.NetworkXError):
-                    # No path within component — fall back to direct exit node
-                    exit_pos = graph.get_node_position(exit_node_id)
-                    if exit_pos is not None:
-                        waypoints.append(exit_pos)
+                    # A failed graph search is not evidence for an internal
+                    # straight connection. Let the caller replan instead.
+                    return None
             
             # Update current position to exit
             current_pos = graph.get_node_position(exit_node_id)

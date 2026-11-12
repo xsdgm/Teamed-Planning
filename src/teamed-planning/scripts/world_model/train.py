@@ -447,7 +447,7 @@ def _train(dataset_dir, output, *, device, epochs, batch_size, sequence_length, 
     datasets = {split: EpisodeWindowDataset(values, sequence_length) for split, values in episodes.items()}
     statistics = {split: split_statistics(values) for split, values in episodes.items()}
     sources = {name: digest(Path(__file__).with_name(name))
-               for name in ('train.py', 'model.py', 'rssm.py', 'models.py', 'data.py', 'runtime.py', 'vtmp2.py', 'reconnaissance.py')}
+               for name in ('train.py', 'model.py', 'models.py', 'data.py', 'runtime.py', 'vtmp2.py')}
     config = dict(algorithm=ALGORITHM, schema_version=manifest['schema_version'], device=str(device),
                   action_contract=manifest['action_contract'],
                   observed_action_purposes=manifest['observed_action_purposes'],

@@ -4,6 +4,7 @@ import math
 import numpy as np
 from scipy.ndimage import label
 from scipy.spatial import cKDTree
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 
 ORIGINAL_ACTIVE_DENSITY=22./(80.*80.)
 
@@ -54,7 +55,7 @@ def reference_route(free,start,goal,resolution=1.):
 
 
 def generate_large_scene(seed,distances=(100.,250.,500.,750.),world=1000.,density=ORIGINAL_ACTIVE_DENSITY,
-                         start=None, heading=0., ground_safety_distance=1.5):
+                         start=None, heading=0., ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M):
     rng=np.random.default_rng(seed)
     start=np.array([30.,world/2.]) if start is None else np.asarray(start,dtype=float)
     direction=np.array([np.cos(heading),np.sin(heading)])
@@ -85,7 +86,7 @@ def generate_large_scene(seed,distances=(100.,250.,500.,750.),world=1000.,densit
 
 
 class CircleGeometry:
-    def __init__(self,circles,world=1000.,clearance=1.5):
+    def __init__(self,circles,world=1000.,clearance=DEFAULT_GROUND_CLEARANCE_M):
         self.world=world;self.clearance=clearance
         self.positions=np.asarray([p for p,r in circles]);self.radii=np.asarray([r for p,r in circles])
         self.tree=cKDTree(self.positions) if len(circles) else None
@@ -102,7 +103,8 @@ class CircleGeometry:
         return bool((np.linalg.norm(relative-t[:,None]*delta,axis=1)>self.radii[ids]+self.clearance).all())
 
 
-def reference_geometry_clear(circles, start, goal, points, world=1000., clearance=1.5):
+def reference_geometry_clear(circles, start, goal, points, world=1000.,
+                             clearance=DEFAULT_GROUND_CLEARANCE_M):
     geometry = CircleGeometry(circles, world=world, clearance=clearance)
     path = [start, *points, goal]
     return all(geometry.clear(a, b) for a, b in zip(path, path[1:]))
@@ -115,7 +117,7 @@ def reference_polyline_length(start, goal, points):
 
 
 def generate_training_scene(seed, distances=(350,550,750), world=1000., distance_range=None,
-                            distance_sampling='linear', ground_safety_distance=1.5):
+                            distance_sampling='linear', ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M):
     """Random task pose, same obstacle density; truth used only at setup."""
     rng=np.random.default_rng(seed ^ 0x5A17)
     if distance_sampling not in ('linear', 'annulus_area'):

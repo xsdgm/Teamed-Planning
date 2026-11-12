@@ -1,4 +1,5 @@
 {
+  "ground_safety_distance": 1.0,
   "episodes": 2000,
   "steps": 240,
   "seed": 42,

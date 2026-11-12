@@ -18,7 +18,12 @@ class GraphFusion:
     """
     Fuses topological graphs from multiple sources into a unified graph.
     
-    Version 1: Simple spatial merging with distance-based thresholding
+    Preserve received path geometry; coalesce only identical positions.
+
+    Nearby navigation samples are not necessarily the same physical landmark.
+    Moving or snapping their endpoints invalidates the source edge's clearance
+    check. Distinct positions therefore remain distinct nodes. Connections
+    between them require the received-evidence check in _bridge_components.
     Future versions will add:
     - Probabilistic merging with covariance tracking
     - Mahalanobis distance for node association
@@ -32,14 +37,14 @@ class GraphFusion:
         
         Args:
             robot_id: ID of the ground robot
-            merge_threshold: Distance threshold for merging nodes (meters)
-                           Nodes closer than this are considered the same location
+            merge_threshold: Retained for caller compatibility. Proximity alone
+                           no longer authorizes merging navigation samples.
         """
         self.robot_id = robot_id
         self.merge_threshold = merge_threshold
         self.unified_graph = TopologicalGraph(drone_id=f"{robot_id}_unified")
         self.source_graphs = {}  # {drone_id: TopologicalGraph}
-        self._merge_buckets = {}
+        self._position_nodes = {}
         # Optional component bridging (off unless both are set): nodes of
         # different components within bridge_distance (m) are joined when
         # bridge_check(a, b) confirms the segment from delivered observations.
@@ -69,21 +74,21 @@ class GraphFusion:
         """
         # Create new unified graph
         self.unified_graph = TopologicalGraph(drone_id=f"{self.robot_id}_unified")
-        self._merge_buckets = {}
+        self._position_nodes = {}
         
         # Track which nodes have been added
         # Maps (drone_id, original_node_id) -> unified_node_id
         node_mapping = {}
         
-        # Maps unified_node_id -> list of (drone_id, original_node_id)
-        unified_to_sources = {}
-        
-        # Add all nodes from all graphs, merging close ones
+        # Source edges certify their original coordinates, not an average of
+        # nearby samples. Exact-coordinate deduplication is geometry preserving
+        # and also makes relayed copies idempotent.
         for drone_id, graph in self.source_graphs.items():
             for node_id, node_data in graph.graph.nodes(data=True):
                 position = node_data['position']
                 
-                # Find if there's already a nearby node in unified graph
+                # Only co-located samples can share a vertex without adding
+                # an unobserved connection or changing incident edge geometry.
                 merged_node_id = self._find_merge_candidate(position)
                 
                 if merged_node_id is None:
@@ -93,21 +98,15 @@ class GraphFusion:
                     # Use attributes from this node
                     attributes = {k: v for k, v in node_data.items() if k != 'position'}
                     self.unified_graph.add_node(unified_node_id, position, attributes)
-                    self._merge_buckets.setdefault(self._merge_cell(position), []).append(unified_node_id)
+                    self._position_nodes[tuple(position)] = unified_node_id
                     
                     # Track mapping
                     node_mapping[(drone_id, node_id)] = unified_node_id
-                    unified_to_sources[unified_node_id] = [(drone_id, node_id)]
                 else:
                     # Merge with existing node
                     node_mapping[(drone_id, node_id)] = merged_node_id
-                    unified_to_sources[merged_node_id].append((drone_id, node_id))
                     existing = self.unified_graph.graph.nodes[merged_node_id]
                     existing.update(TopologicalGraph.merge_observation_attributes(existing, node_data))
-                    
-                    # Update position as weighted average
-                    self._update_merged_node_position(merged_node_id, position,
-                                                     unified_to_sources[merged_node_id])
         
         # Add edges from all source graphs
         for drone_id, graph in self.source_graphs.items():
@@ -171,63 +170,8 @@ class GraphFusion:
                 components.union(a, b)
 
     def _find_merge_candidate(self, position: Tuple[float, float]) -> Optional[str]:
-        """
-        Find a node in the unified graph that should be merged with this position.
-        
-        Args:
-            position: (x, y) position to check
-            
-        Returns:
-            Node ID of merge candidate, or None if no candidate found
-        """
-        if len(self.unified_graph) == 0:
-            return None
-        
-        # Rebuilding a KD-tree after every inserted/averaged node is quadratic.
-        # A threshold-sized spatial grid finds exactly the same nearby merge
-        # candidates while supporting incremental position updates.
-        cx, cy = self._merge_cell(position)
-        best_node, best_distance = None, float('inf')
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for node_id in self._merge_buckets.get((cx + dx, cy + dy), []):
-                    distance = float(np.linalg.norm(np.asarray(position) -
-                                                   self.unified_graph.get_node_position(node_id)))
-                    if distance <= self.merge_threshold and distance < best_distance:
-                        best_node, best_distance = node_id, distance
-        return best_node
-
-    def _merge_cell(self, position):
-        size = self.merge_threshold if self.merge_threshold > 0 else 1.
-        return tuple(int(np.floor(value / size)) for value in position[:2])
-    
-    def _update_merged_node_position(self, node_id: str, new_position: Tuple[float, float],
-                                     source_nodes: List[Tuple[str, str]]):
-        """
-        Update position of a merged node as weighted average.
-        
-        Args:
-            node_id: Unified node ID
-            new_position: New position to incorporate
-            source_nodes: List of (drone_id, original_node_id) that contribute to this node
-        """
-        # For now, simple average (can be weighted by confidence later)
-        current_pos = self.unified_graph.get_node_position(node_id)
-        
-        # Average with new position
-        num_sources = len(source_nodes)
-        avg_x = (current_pos[0] * (num_sources - 1) + new_position[0]) / num_sources
-        avg_y = (current_pos[1] * (num_sources - 1) + new_position[1]) / num_sources
-        
-        # Update node position
-        self.unified_graph.graph.nodes[node_id]['position'] = (avg_x, avg_y)
-        old_cell, new_cell = self._merge_cell(current_pos), self._merge_cell((avg_x, avg_y))
-        if old_cell != new_cell:
-            self._merge_buckets[old_cell].remove(node_id)
-            self._merge_buckets.setdefault(new_cell, []).append(node_id)
-        
-        # Invalidate spatial index
-        self.unified_graph._spatial_index_valid = False
+        """Return an exact geometric duplicate, never a proximity match."""
+        return self._position_nodes.get(tuple(position))
     
     def get_unified_graph(self) -> TopologicalGraph:
         """

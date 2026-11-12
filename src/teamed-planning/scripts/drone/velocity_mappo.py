@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Independent, Normal
-from drone.chain_state import ChainState
+from drone.communication import ChainState
 from drone.drone_navigator import DroneNavigator
 from drone.mappo import GLOBAL_FEATURES, legal_observation
 
@@ -135,13 +135,18 @@ class VelocityNavigator(DroneNavigator):
         state[:4] = [(p[0]-xmin)/1000., (xmax-p[0])/1000.,
                      (p[1]-ymin)/1000., (ymax-p[1])/1000.]
         task = self.chain.task()
+        # Preserve multi-target task selection when present; a goal-less
+        # vehicle still supplies a fresh received communication anchor.
+        vehicle = task if task is not None else self.chain.vehicle_state()
+        if vehicle is not None:
+            ground = np.asarray(vehicle['position'][:2])
+            state[6:8] = (ground-p[:2])/95.
+            state[11] = np.linalg.norm(p-np.r_[ground, 0.])/95.
         if task is not None:
-            ground = np.asarray(task['position'][:2])
             goal = np.asarray(task['target'][:2])
-            state[4:6], state[6:8] = (goal-p[:2])/350., (ground-p[:2])/95.
+            state[4:6] = (goal-p[:2])/350.
             state[8:10] = (goal-ground)/350.
             state[10] = 1.
-            state[11] = np.linalg.norm(p-np.r_[ground, 0.])/95.
         # Role features and two chain endpoints, never a fleet-sized one-hot
         # or an ID-dependent policy. The actor shape is identical for any N.
         state[12] = float(self.chain.predecessor == '__ground__')

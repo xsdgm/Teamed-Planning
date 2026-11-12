@@ -1,6 +1,6 @@
 """
-Local Planner for Ground Robots
-Handles local obstacle avoidance and generates velocity commands
+Local perception and planning for ground robots
+Converts occupancy maps to semantic maps, avoids obstacles and generates velocity commands
 """
 
 import numpy as np
@@ -13,6 +13,86 @@ from scipy.ndimage import binary_dilation, distance_transform_edt
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from drone.semantic_segmentation import TerrainType
+from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
+from ground.observed_grid import escape_waypoint
+
+
+class LocalPerception:
+    """
+    Processes local sensor data (occupancy map) into semantic representation.
+
+    Ground robots observe their local environment (e.g., 8m radius with LiDAR)
+    and convert it to semantic maps for obstacle avoidance.
+    """
+
+    def __init__(self, robot_id: str, resolution: float = 0.5):
+        """
+        Initialize local perception module.
+
+        Args:
+            robot_id: Unique identifier for this robot
+            resolution: Map resolution in meters per pixel
+        """
+        self.robot_id = robot_id
+        self.resolution = resolution
+
+        # Terrain traversability costs (for future use)
+        self.terrain_costs = {
+            TerrainType.UNKNOWN: 1.0,
+            TerrainType.TRAVERSABLE: 1.0,
+            TerrainType.OBSTACLE: float('inf'),
+            TerrainType.DIFFICULT: 2.5,
+            TerrainType.WATER: float('inf'),
+            TerrainType.CLEARNING: 0.5
+        }
+
+    def process_occupancy_map(self, occupancy_map: np.ndarray) -> np.ndarray:
+        """
+        Transform binary occupancy map to semantic map.
+
+        Adapts raw sensor data (occupancy grid) to semantic representation.
+        In simulation: transforms binary 0/1 map.
+        In real-world: would integrate LiDAR point clouds and camera data.
+
+        Args:
+            occupancy_map: Binary occupancy grid (0=free, 1=occupied)
+
+        Returns:
+            semantic_map: Map with TerrainType values (TRAVERSABLE or OBSTACLE)
+        """
+        # Simple binary classification: occupied → obstacle, free → traversable
+        semantic_map = np.where(
+            occupancy_map == 1,
+            TerrainType.OBSTACLE.value,
+            TerrainType.TRAVERSABLE.value
+        ).astype(np.uint8)
+
+        return semantic_map
+
+    def get_terrain_cost(self, terrain_type: TerrainType) -> float:
+        """
+        Get traversability cost for a terrain type.
+
+        Args:
+            terrain_type: Terrain type enum
+
+        Returns:
+            Cost value (higher = harder to traverse, inf = impassable)
+        """
+        return self.terrain_costs.get(terrain_type, 1.0)
+
+    def is_traversable(self, terrain_type: TerrainType) -> bool:
+        """
+        Check if terrain type is traversable.
+
+        Args:
+            terrain_type: Terrain type enum
+
+        Returns:
+            True if traversable (cost < infinity)
+        """
+        cost = self.get_terrain_cost(terrain_type)
+        return cost < float('inf')
 
 
 class LocalPlanner:
@@ -24,7 +104,7 @@ class LocalPlanner:
     """
     
     def __init__(self, robot_id: str, max_linear_vel: float = 1.0,
-                 max_angular_vel: float = 1.0, safety_distance: float = 1.5,
+                 max_angular_vel: float = 1.0, safety_distance: float = DEFAULT_GROUND_CLEARANCE_M,
                  escape_distance: float = 0.5):
         """
         Initialize local planner.
@@ -44,7 +124,26 @@ class LocalPlanner:
         self.escape_distance = escape_distance
 
     def observed_connection_waypoint(self, current_pos, target, semantic_map,
-                                     resolution):
+                                     resolution, allow_escape=False):
+        """Use normal clearance or the controller's explicit recovery margin."""
+        waypoint = self._observed_connection_waypoint(
+            current_pos, target, semantic_map, resolution,
+            min(self.escape_distance,self.safety_distance) if allow_escape else self.safety_distance)
+        def executable(point):
+            # The velocity controller treats distances below 0.1m as arrived.
+            # A fine-grid cell centre inside that tolerance is not progress
+            # toward a distant target and must not hide a local deadlock.
+            return point is not None and (np.linalg.norm(np.asarray(point)-current_pos)>=.1
+                                          or np.linalg.norm(np.asarray(target)-current_pos)<.1)
+        if not executable(waypoint):
+            waypoint=None
+        if waypoint is None and allow_escape:
+            waypoint = escape_waypoint(current_pos, target, semantic_map, resolution,
+                                       min(self.escape_distance, self.safety_distance))
+        return waypoint if executable(waypoint) else None
+
+    def _observed_connection_waypoint(self, current_pos, target, semantic_map,
+                                      resolution, distance):
         """Return a short collision-free step toward a navigation target.
 
         Only explicitly observed, traversable cells may be used. A distant
@@ -52,7 +151,7 @@ class LocalPlanner:
         this method does not grant permission to traverse other graph gaps.
         """
         height, width = semantic_map.shape
-        blocked, radius = self.observed_blocked_cells(semantic_map, resolution)
+        blocked, radius = self.observed_blocked_cells(semantic_map, resolution, distance=distance)
         start = (height // 2, width // 2)
         if blocked[start]:
             if semantic_map[start] not in (TerrainType.TRAVERSABLE.value,

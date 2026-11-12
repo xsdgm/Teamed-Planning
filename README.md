@@ -135,14 +135,21 @@ src/
 │   │   │   ├── drone_navigator.py     # Mission phases
 │   │   │   ├── drone_local_planner.py # Step-wise path following
 │   │   │   ├── skeleton_graph_builder.py
-│   │   │   ├── graph_broadcaster.py
+│   │   │   ├── communication.py       # Chain state, backbone geometry, relay cache
+│   │   │   ├── local_mapping.py       # Mapping views and temporal evidence
+│   │   │   ├── cbf_safety.py          # Independent and joint safety filters
 │   │   │   └── semantic_segmentation.py  # Stub (replace with real model)
 │   │   ├── ground/
 │   │   │   ├── ground_main.py    # GroundRobotController
 │   │   │   ├── global_planner.py # A* on fused topological graph
-│   │   │   ├── local_planner.py  # Reactive obstacle avoidance
+│   │   │   ├── local_planner.py  # Local perception and obstacle avoidance
 │   │   │   ├── graph_fusion.py   # Merge graphs from multiple drones
-│   │   │   └── graph_receiver.py
+│   │   │   ├── observed_grid.py  # Observed route memory and escape geometry
+│   │   │   ├── subgoal_manager.py # Rolling relay subgoals
+│   │   │   ├── task_planner.py   # Coverage, travel costs and vehicle claims
+│   │   │   ├── vehicle_motion.py # Link keeping and vehicle avoidance
+│   │   │   ├── ros_ground_node.py
+│   │   │   └── ros_gcs_node.py
 │   │   ├── common/
 │   │   │   ├── graph_structure.py   # TopologicalGraph (NetworkX + KD-tree)
 │   │   │   └── message_definitions.py

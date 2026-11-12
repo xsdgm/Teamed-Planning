@@ -35,30 +35,81 @@ multi_robot_navigation/
 │   └── message_definitions.py      # Communication protocol
 │
 ├── drone/                           # Drone-side code
-│   ├── perception/
-│   │   └── semantic_segmentation.py  # Semantic map processing
-│   ├── mapping/
-│   │   ├── skeleton_extractor.py     # Extract topology from maps
-│   │   └── topological_graph_builder.py  # Build graphs
-│   ├── communication/
-│   │   └── graph_broadcaster.py      # Broadcast graphs to robots
-│   └── drone_main.py                 # Main drone controller
+│   ├── __init__.py                  # Public controller/perception exports
+│   ├── drone_main.py                # Controller and graph broadcasts
+│   ├── drone_navigator.py           # CADMM waypoint navigation
+│   ├── drone_local_planner.py       # ROS/PX4 waypoint tracking
+│   ├── semantic_segmentation.py     # Semantic map processing and inference
+│   ├── local_mapping.py             # Mapping views and temporal EvidenceGrid
+│   ├── skeleton_graph_builder.py    # Build topology from semantic maps
+│   ├── communication.py             # Chain state, local backbone, relay cache
+│   ├── cbf_safety.py                # Independent and synchronous joint CBF
+│   ├── mappo.py                     # Candidate policy and checkpoint dispatch
+│   ├── velocity_mappo.py            # Continuous-velocity policy
+│   ├── graph_attention_mappo.py     # Map graph attention
+│   ├── cooperative_mappo.py         # V7 cooperative policy
+│   ├── relay_attention_mappo.py     # V8/V9 relay attention
+│   ├── cograph_mappo.py             # CoGraph V1 multi-target policy
+│   ├── cograph_v2_mappo.py          # CoGraph V2 target selector
+│   ├── survey_mappo.py              # V10 survey and V11 fixed-route policies
+│   ├── ros_drone_node.py            # ROS flight/control entry point
+│   ├── ros_seg_node.py              # ROS segmentation entry point
+│   └── models/download_models.sh    # Segmentation model preparation
 │
-├── ground_robot/                    # Ground robot code
-│   ├── communication/
-│   │   └── graph_receiver.py        # Receive graphs from drones
-│   ├── mapping/
-│   │   ├── graph_fusion.py          # Merge multi-drone graphs
-│   │   └── uncertainty_handler.py   # Placeholder for future uncertainty
-│   ├── planning/
-│   │   ├── global_planner.py        # Topological path planning
-│   │   ├── local_planner.py         # Obstacle avoidance
-│   │   └── hierarchical_planner.py  # Coordinate global + local
-│   └── robot_main.py                # Main robot controller
+├── ground/                          # Ground robot code
+│   ├── __init__.py                  # Public controller/planning exports
+│   ├── ground_main.py               # Controller, graph reception and navigation
+│   ├── graph_fusion.py              # Fuse received drone graphs
+│   ├── global_planner.py            # Topological path and graph-entry planning
+│   ├── local_planner.py             # Local perception, avoidance and velocity control
+│   ├── observed_grid.py             # Observed route memory and continuous escape checks
+│   ├── subgoal_manager.py           # Rolling relay subgoals and recovery
+│   ├── task_planner.py              # Multi-target coverage, costs and vehicle claims
+│   ├── vehicle_motion.py            # Vehicle link keeping and collision avoidance
+│   ├── ros_ground_node.py           # ROS ground-controller entry point
+│   └── ros_gcs_node.py              # ROS ground-control station
 │
 └── example_integration.py           # Integration example
 
 ```
+
+### Drone module consolidation
+
+The drone package has 19 Python modules. Shared implementations are grouped by
+responsibility; policy variants remain separate where their architectures differ.
+
+| Former module | Current implementation |
+| --- | --- |
+| `chain_state.py`, `local_backbone.py`, `relay_cache.py` | [communication.py](drone/communication.py) |
+| `coordinated_safety.py` | [cbf_safety.py](drone/cbf_safety.py), alongside the independent filter |
+| `evidence_grid.py` | [local_mapping.py](drone/local_mapping.py) |
+| `route_ab_mappo.py` | [survey_mappo.py](drone/survey_mappo.py), alongside its survey-policy base |
+| `graph_broadcaster.py` | Removed: the controller already sends dictionary broadcasts directly |
+
+`GraphBroadcaster` and `RobotDetector` were unused and are no longer package
+exports. [DroneController](drone/drone_main.py) owns graph transmission and reports
+the actual last graph-broadcast time in `get_state()`. State-dictionary checkpoint
+schemas, policy parameters and ROS launch entry points are unchanged.
+Archived experiment runtimes retain their original source layout; workers that
+explicitly load those snapshots continue to use their historical imports.
+
+### Ground module consolidation
+
+The ground package has 11 Python modules. Global routing, rolling subgoals,
+vehicle motion and the two ROS entry points retain their existing boundaries.
+
+| Former module | Current implementation |
+| --- | --- |
+| `local_perception.py` | [local_planner.py](ground/local_planner.py), alongside local avoidance |
+| `observed_escape.py` | [observed_grid.py](ground/observed_grid.py), alongside observed route memory |
+| `vehicle_claims.py` | [task_planner.py](ground/task_planner.py), alongside coverage and travel estimates |
+| `graph_receiver.py` | Removed: [GroundRobotController](ground/ground_main.py) already receives and deserializes dictionary broadcasts directly |
+
+`LocalPerception` remains available from `ground` and `ground.local_planner`.
+The unused `GraphReceiver` export and controller instance are removed; actual
+reception statistics, fusion throttling, reset behavior and navigation are
+unchanged. The current candidate evaluator copies the merged modules, while
+archived evaluation modes keep their original dependency layout.
 
 ## Key Components
 
@@ -80,10 +131,11 @@ multi_robot_navigation/
 - Simple message passing in V1 (will be replaced with ROS topics)
 
 ### 4. Graph Fusion
-- **V1 (Current)**: Simple spatial merging
-  - Nodes within 2m threshold are merged
-  - Positions averaged when merging
-  - Edges from all source graphs included
+- **Current**: Preserve observed path geometry
+  - Only nodes at identical coordinates are coalesced; observation evidence is deduplicated
+  - Distinct source endpoints and their edge geometry are retained
+  - Nearby components connect only through separately checked, received free-space evidence
+  - Proximity alone never authorizes an edge or a change to a certified segment
 - **Future**: Probabilistic merging with covariance tracking
 
 ### 5. Hierarchical Planning
@@ -93,6 +145,23 @@ multi_robot_navigation/
 - **Local Planner**: Reactive obstacle avoidance
   - Uses local semantic map from robot sensors
   - Simple proportional controller for velocity commands
+
+All 2D MAPPO/CoGraph versions and VTemp evaluators default to
+`ground_safety_distance=1.0` metres for drone navigation graphs, vehicle local
+planning and checked fusion bridges. The shared default is defined in
+`common/navigation_config.py`; the enclosed-vehicle escape margin remains `0.5`.
+WildScenes evaluators accept `--ground-safety-distance` (also `--safety-clearance`)
+and record the actual planner, graph and bridge values in their signed results,
+including when loading archived runtimes. New reference tasks must have a
+continuously verified route at the normal 1 metre clearance; the escape margin
+does not qualify an otherwise infeasible task.
+
+ROS nodes and configuration are unchanged. Their shared controller constructor
+defaults remain 1.5 metres for the ground vehicle and 3 metres for graph clearance;
+2D entry points explicitly pass their own 1 metre setting. Existing frozen runs
+retain their original source and configuration. An old training checkpoint without
+the field is interpreted as historical 1.5 metres for resume compatibility, so
+resuming it silently under 1 metre is rejected; use a new run to change the setting.
 
 ## Installation
 
@@ -149,26 +218,28 @@ action = drone.get_action(observation, target_position=(tx, ty, tz))
 #### Ground Robot Integration
 
 ```python
-from ground_robot.robot_main import RobotController
+from ground.ground_main import GroundRobotController
 
 # Initialize robot
-robot = RobotController(robot_id="robot_0")
+robot = GroundRobotController(robot_id="robot_0")
 
 # Set goal
 robot.set_goal((goal_x, goal_y))
 
 # In your simulation loop:
 observation = {
-    'position': (x, y),  # Robot position
-    'heading': theta,  # Heading in radians
-    'semantic_map': local_map,  # Local semantic map (optional)
-    'resolution': 0.5,  # Map resolution
-    'received_messages': messages  # List of GraphBroadcastMessage
+    'self': {'position': (x, y), 'orientation': theta},
+    'occupancy_map': occupancy_map,  # Binary local sensor grid: 0=free, 1=occupied
+    'map_resolution': 0.5,  # metres per pixel
+    'neighbors': neighbors,  # Received neighbours, including drone broadcast dictionaries
+    'full_state': {'time': simulation_time},
+    'time_step': dt,
 }
 
 action = robot.get_action(observation)
 # action contains:
-# - 'movement': (linear_vel, angular_vel)
+# - 'motion': (linear_vel, angular_vel)
+# - 'broadcast': robot position, current target and remaining path
 ```
 
 ### Semantic Map Format
@@ -224,7 +295,7 @@ DroneController(
 )
 
 # Robot
-RobotController(
+GroundRobotController(
     robot_id="robot_0",
     merge_threshold=2.0,  # meters (for graph fusion)
     max_linear_vel=1.0,  # m/s
@@ -234,30 +305,31 @@ RobotController(
 
 ## Testing
 
-Basic tests can be found in `tests/` directory:
-
-```bash
-python tests/test_graph_building.py
-python tests/test_graph_fusion.py
-```
+Simulator regressions live in [tests/simulator](tests/simulator), alongside
+[ground tests](tests/ground), [drone tests](tests/drone) and
+[world-model tests](tests/world_model). See the
+[simulator test commands](simulator/README.md#regression-tests) for the regular
+suite and the separately executed frozen-runtime checks.
 
 ## Communication Protocol
 
-Messages are defined in `common/message_definitions.py`:
+Controllers exchange dictionaries through the simulator's received neighbour
+broadcasts. Drone packets contain `drone_id`, `position`, `graph` and `timestamp`;
+ground packets contain `robot_id`, `position`, `target`, `planned_path` and
+`timestamp`. The ground controller deserializes received graphs and applies its
+per-drone fusion interval directly.
 
-- **GraphBroadcastMessage**: Contains serialized graph + metadata
-- **SimpleMessageBroker**: Basic pub-sub for simulation (will be replaced with ROS)
-
-For ROS integration, replace `SimpleMessageBroker` with ROS topics:
-- `/drone_*/graph`: Graph broadcasts
-- `/robot_*/status`: Robot status updates
+[ros_drone_node.py](drone/ros_drone_node.py) and
+[ros_ground_node.py](ground/ros_ground_node.py) adapt these interfaces to ROS
+topics. Legacy message definitions remain in
+[message_definitions.py](common/message_definitions.py).
 
 ## Troubleshooting
 
 ### Graphs not being received
 - Check broadcast range (default 100m)
 - Verify robots are within drone's detection range
-- Check message broker is properly routing messages
+- Check that received drone neighbours carry a broadcast dictionary with graph data
 
 ### Planning failures
 - Ensure graph has sufficient nodes (check skeleton extraction)
@@ -272,7 +344,7 @@ For ROS integration, replace `SimpleMessageBroker` with ROS topics:
 ## Future Extensions
 
 ### Uncertainty Handling
-See `ground_robot/mapping/uncertainty_handler.py` for placeholder implementation.
+See the uncertainty helpers in [graph_fusion.py](ground/graph_fusion.py).
 
 When adding uncertainty:
 1. Modify `TopologicalGraph` to store node covariances

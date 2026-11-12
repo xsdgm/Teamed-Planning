@@ -7,10 +7,10 @@ import unittest
 import numpy as np
 import torch
 
-from world_model.ab_environment import SurveyNavigationEnv
-from world_model.ab_mapping import MappingConfig, ProxyMapper, make_task, task_valid
+from world_model.ab_environment import (
+    SurveyNavigationEnv, MappingConfig, ProxyMapper, make_task, task_valid, ReceivedMap,
+)
 from world_model.ab_model import WorldModel
-from world_model.ab_navigation import ReceivedMap
 from world_model.ab_pipeline import collect_episode
 from world_model.ab_planner import ModelPlanner, candidates
 from world_model.ab_training import Windows, load_episodes, load_model, train

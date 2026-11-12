@@ -8,17 +8,17 @@ import time
 import sys
 import os
 import copy
+from collections import deque
 from scipy.spatial import cKDTree
 from typing import Dict, Tuple, Optional
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ground.local_perception import LocalPerception
-from ground.graph_receiver import GraphReceiver
 from ground.graph_fusion import GraphFusion
 from ground.global_planner import GlobalPlanner
-from ground.local_planner import LocalPlanner
+from ground.local_planner import LocalPerception, LocalPlanner
+from ground.observed_grid import ObservedGrid
 from ground.subgoal_manager import SubgoalManager
 from common.graph_structure import TopologicalGraph
 from common.timing import PerformanceTimer
@@ -88,8 +88,6 @@ class GroundRobotController:
             resolution=resolution
         )
         
-        self.graph_receiver = GraphReceiver(robot_id=robot_id)
-        
         self.graph_fusion = GraphFusion(
             robot_id=robot_id,
             merge_threshold=merge_threshold
@@ -145,10 +143,29 @@ class GroundRobotController:
         # Store last semantic map for visualization (debug)
         self._last_semantic_map = None
         self._last_semantic_map_position = None
+        self._local_progress_position = None
+        self._local_progress_time = None
+        self._allow_local_escape = False
+        self._local_escape_origin = None
+        self._local_route_goal = None
+        self._local_route_best = float('inf')
+        self._local_route_progress_time = None
+        self._local_route_progress_position = None
+        self._failed_local_connections = []
+        self._last_connector_recovery_time = float('-inf')
         self._observed_obstacles = set()
         self._obstacle_tree = None
         self._obstacle_filter_cache = None
         self._last_route_review = float('-inf')
+        self._terminal_map = None
+        self._terminal_recovery = False
+        self._motion_history = deque()
+        self._motion_distance = 0.
+        self._route_loop = False
+        self._route_map = None
+        self._route_recovery = False
+        self._local_waypoint_context = None
+        self._local_waypoint_cache = {}
     
     def set_goal(self, goal_pos: Tuple[float, float]):
         """
@@ -157,6 +174,11 @@ class GroundRobotController:
         Args:
             goal_pos: (x, y) goal position
         """
+        if self.final_goal is None or tuple(goal_pos) != tuple(self.final_goal):
+            self._terminal_map = None
+            self._terminal_recovery = False
+            self._route_map = None
+            self._route_recovery = False
         self.final_goal = goal_pos
         if self.subgoal_radius:
             # The first get_action selects the first subgoal.
@@ -171,6 +193,8 @@ class GroundRobotController:
     def _drive_to(self, goal_pos):
         self.global_planner.clear_path()
         self.goal_position = goal_pos
+        if self.final_goal is None or tuple(goal_pos) != tuple(self.final_goal):
+            self._terminal_recovery = False
         print(f"[{self.robot_id}] Goal set to {goal_pos}")
 
     def stop(self):
@@ -178,6 +202,8 @@ class GroundRobotController:
         self.goal_position = None
         self.final_goal = None
         self.subgoals = None
+        self._terminal_map = None
+        self._terminal_recovery = False
 
     def _filter_observed_obstacles(self, graph, semantic_map):
         """Retain static obstacle evidence in world coordinates across fusions.
@@ -242,6 +268,26 @@ class GroundRobotController:
         """
         self.set_goal(target_pos)
     
+    def _local_waypoint(self, current_pos, target, semantic_map, resolution):
+        # Graph entry searches revisit thousands of identical targets while
+        # the vehicle waits at a raster pocket. This calculation is purely a
+        # function of these inputs; retain exact results until any changes.
+        # Compare contents, not array identity: sensors may reuse a buffer.
+        context=(tuple(current_pos),resolution,self._allow_local_escape,
+                 self.local_planner.safety_distance,self.local_planner.escape_distance,
+                 semantic_map.shape,semantic_map.dtype.str,semantic_map.tobytes())
+        if context != self._local_waypoint_context:
+            self._local_waypoint_context=context
+            self._local_waypoint_cache.clear()
+        key=tuple(target)
+        if key not in self._local_waypoint_cache:
+            if len(self._local_waypoint_cache)>=32768:
+                self._local_waypoint_cache.pop(next(iter(self._local_waypoint_cache)))
+            self._local_waypoint_cache[key]=self.local_planner.observed_connection_waypoint(
+                current_pos, target, semantic_map, resolution,
+                allow_escape=self._allow_local_escape)
+        return self._local_waypoint_cache[key]
+
     def _parse_simulator_observation(self, sim_obs: Dict) -> Dict:
         """
         Parse simulator observation into standardized format.
@@ -263,7 +309,7 @@ class GroundRobotController:
         heading = sim_obs['self'].get('orientation', 0.0)  # radians
         
         # Extract occupancy map
-        occupancy_map = sim_obs.get('occupancy_map')
+        occupancy_map = sim_obs.get('navigation_map', sim_obs.get('occupancy_map'))
         if occupancy_map is None:
             raise ValueError(f"[{self.robot_id}] No occupancy map in simulator observation!")
         
@@ -399,6 +445,10 @@ class GroundRobotController:
                 - 'broadcast': None (ground robots don't broadcast yet)
         """
         current_time = simulator_obs.get('full_state', {}).get('time', time.time())
+        # An external startup/survey hold is not a failed navigation command.
+        # Keep perception, fusion and planning active, but do not spend the
+        # no-progress allowance before the caller permits physical movement.
+        motion_held = bool(simulator_obs.get('motion_held', False))
         if self.subgoals is not None:
             # Uses the position and graph before this cycle's fusion.
             target, changed = self.subgoals.update(
@@ -411,8 +461,78 @@ class GroundRobotController:
             parsed_obs = self._parse_simulator_observation(simulator_obs)
             self.position = parsed_obs['position']
             self.heading = parsed_obs['heading']
-            self.resolution = simulator_obs.get('map_resolution', self.resolution)
+            self.resolution = simulator_obs.get('navigation_resolution',
+                                                simulator_obs.get('map_resolution', self.resolution))
             self.local_perception.resolution = self.resolution
+            if (self._local_progress_position is None or
+                    np.linalg.norm(np.asarray(self.position)-self._local_progress_position)>.5 or
+                    current_time < self._local_progress_time):
+                self._local_progress_position=np.asarray(self.position).copy()
+                self._local_progress_time=current_time
+            route_goal=None if self.goal_position is None else tuple(self.goal_position)
+            if route_goal is None or self._local_route_goal is None:
+                # Waiting for a survey (or having no mission) is intentional,
+                # not a navigation failure that should reduce clearance.
+                self._local_progress_position=np.asarray(self.position).copy()
+                self._local_progress_time=current_time
+                self._allow_local_escape=False
+                self._local_escape_origin=None
+            route_distance=(float('inf') if route_goal is None else
+                            np.linalg.norm(np.asarray(route_goal)-self.position))
+            if (route_goal!=self._local_route_goal or self._local_route_progress_time is None
+                    or current_time<self._local_route_progress_time):
+                self._route_recovery = False
+                self._motion_history.clear()
+                self._motion_distance = 0.
+                self._local_route_goal=route_goal
+                self._local_route_best=route_distance
+                self._local_route_progress_time=current_time
+                self._local_route_progress_position=np.asarray(self.position).copy()
+            elif route_distance<self._local_route_best-.5:
+                self._local_route_best=route_distance
+                self._local_route_progress_time=current_time
+                self._local_route_progress_position=np.asarray(self.position).copy()
+            # A loop can be far from the position at which the best goal
+            # distance was recorded. Track revisits along the actual recent
+            # trajectory instead of testing only distance from that old pose.
+            if motion_held:
+                self._local_progress_position = np.asarray(self.position).copy()
+                self._local_progress_time = current_time
+                self._local_route_progress_position = np.asarray(self.position).copy()
+                self._local_route_progress_time = current_time
+                self._motion_history.clear()
+                self._motion_distance = 0.
+            point = np.asarray(self.position).copy()
+            history = self._motion_history
+            if history:
+                self._motion_distance += float(np.linalg.norm(point-history[-1][1]))
+            history.append((current_time, point, self._motion_distance))
+            while history and current_time-history[0][0] > 120.:
+                history.popleft()
+            self._route_loop = (route_goal is not None
+                and current_time-self._local_route_progress_time >= 30.
+                and any(current_time-t >= 15. and self._motion_distance-distance >= 8.
+                        and np.linalg.norm(point-p) <= 1. for t,p,distance in history))
+            stalled=(current_time-self._local_progress_time>=10. or
+                     (current_time-self._local_route_progress_time>=30.
+                      and np.linalg.norm(np.asarray(self.position)-self._local_route_progress_position)<5.)
+                     or self._route_loop)
+            if route_goal is not None and not self._allow_local_escape and stalled:
+                self._allow_local_escape=True
+                self._local_escape_origin=np.asarray(self.position).copy()
+            self._failed_local_connections=[item for item in self._failed_local_connections if item[2]>current_time]
+            waypoint=self.global_planner.get_current_waypoint()
+            if (waypoint is not None and current_time-self._local_route_progress_time>=30.
+                    and current_time-self._last_connector_recovery_time>=30.
+                    and stalled
+                    and np.linalg.norm(np.asarray(waypoint)-self.position)>1.):
+                # Remember a failed *local approach*, not a failed final goal.
+                # Retry from another entry; the restriction expires and does
+                # not forbid reaching the same node from a different side.
+                self._failed_local_connections.append((np.asarray(self.position).copy(),
+                    np.asarray(waypoint).copy(),current_time+60.))
+                self._last_connector_recovery_time=current_time
+                self.global_planner.clear_path()
         
         # Step 2: Process local perception (occupancy → semantic)
         with self.timer.measure("local_perception"):
@@ -437,6 +557,21 @@ class GroundRobotController:
         blocked_cells, _ = self.local_planner.observed_blocked_cells(
             semantic_map, self.resolution, include_boundary=False)
         height, width = semantic_map.shape
+        # Keep recovery active through the narrow passage. A tiny successful
+        # step is not enough to restore the larger margin and turn back again.
+        if (self._allow_local_escape and not self._terminal_recovery and not self._route_recovery
+                and not blocked_cells[height//2,width//2]
+                and current_time-self._local_progress_time<10.
+                and np.linalg.norm(np.asarray(self.position)-self._local_escape_origin)>=2.):
+            self._allow_local_escape=False
+            self._local_escape_origin=None
+        if self._allow_local_escape:
+            # Graph pruning, connector selection and the executed short step
+            # must use the same recovery clearance. Otherwise every graph
+            # update can reject the escape route and send the car back.
+            blocked_cells, _ = self.local_planner.observed_blocked_cells(
+                semantic_map,self.resolution,include_boundary=False,
+                distance=min(self.local_planner.escape_distance,self.local_planner.safety_distance))
         if semantic_map[height // 2, width // 2] in (1, 3, 5):
             blocked_cells[height // 2, width // 2] = False
 
@@ -468,12 +603,23 @@ class GroundRobotController:
             ys = np.clip(np.floor(points[:, 1] / self.resolution + height / 2.).astype(int), 0, height - 1)
             return bool(np.any(blocked_cells[ys, xs]))
 
+        def connection_allowed(first,second):
+            return not any(np.linalg.norm(np.asarray(first)-start)<5.
+                           and np.linalg.norm(np.asarray(second)-end)<3.
+                           for start,end,_ in self._failed_local_connections)
+
+        self.global_planner.connection_validator=connection_allowed
+
         if planning_graph is not None:
             blocked_nodes = [node for node, data in planning_graph.graph.nodes(data=True)
                              if locally_blocked(data['position'])]
             blocked_edges = [(first, second) for first, second in planning_graph.graph.edges()
                              if locally_blocked_segment(planning_graph.get_node_position(first),
-                                                        planning_graph.get_node_position(second))]
+                                                        planning_graph.get_node_position(second))
+                             or not connection_allowed(planning_graph.get_node_position(first),
+                                                       planning_graph.get_node_position(second))
+                             or not connection_allowed(planning_graph.get_node_position(second),
+                                                       planning_graph.get_node_position(first))]
             if blocked_nodes or blocked_edges:
                 planning_graph = copy.copy(planning_graph)
                 planning_graph.graph = planning_graph.graph.copy()
@@ -482,7 +628,7 @@ class GroundRobotController:
                 planning_graph._spatial_index_valid = False
         old_waypoint = self.global_planner.get_current_waypoint()
         self.global_planner.entry_validator = lambda target: (
-            self.local_planner.observed_connection_waypoint(
+            self._local_waypoint(
                 self.position, target, semantic_map, self.resolution) is not None)
         # A blocked straight connector can have a valid local detour. Keep
         # that destination while executing the detour instead of repeatedly
@@ -490,14 +636,74 @@ class GroundRobotController:
         route_blocked = (old_waypoint is not None and
                          (locally_blocked(old_waypoint) or
                           (locally_blocked_segment(self.position, old_waypoint) and
-                           self.local_planner.observed_connection_waypoint(
+                           self._local_waypoint(
                                self.position, old_waypoint, semantic_map, self.resolution) is None)))
 
         # Step 4: Global planning
         current_waypoint = None
         local_route_used = False
-        
-        if self.goal_position is not None:
+        terminal_waypoint = None
+        # A stalled connector outside the terminal area also needs a way to
+        # leave the pocket. Retain only locally observed free space in a
+        # bounded moving window; explore a reachable frontier, including one
+        # initially away from the goal. Healthy graph navigation stays active.
+        outside_terminal = (self.final_goal is None or
+            np.linalg.norm(np.asarray(self.position)-self.final_goal)>25.)
+        if self.goal_position is not None and outside_terminal:
+            # A relay target can still be replaced by its manager. The final
+            # goal cannot: use the existing stall detector promptly there,
+            # before small raster movements reset a 30s stationary timer.
+            final_target=(self.final_goal is not None and
+                np.linalg.norm(np.asarray(self.goal_position)-self.final_goal)<1e-6)
+            blocked_long = (current_time-self._local_progress_time >= 30. or
+                (final_target and stalled and current_time-self._local_route_progress_time >= 30.))
+            if (self._route_loop or blocked_long) and not self._route_recovery:
+                self._route_recovery = True
+            # Keep this recovery until the current relay target changes (or
+            # terminal recovery takes over). A few metres of improvement do
+            # not make the old graph connector executable: handing back early
+            # sent the vehicle straight back into the same observed pocket.
+            if self._route_recovery:
+                if self._route_map is None:
+                    self._route_map = ObservedGrid(self.goal_position, center=self.position,
+                                                  world_bounds=self.world_bounds)
+                memory=self._route_map
+                memory.recenter(self.position)
+                if not np.allclose(memory.goal,self.goal_position,rtol=0,atol=1e-9):
+                    memory.goal=np.asarray(self.goal_position,float)
+                    memory.frontier=None
+                memory.observe(self.position,semantic_map,self.resolution)
+                target=memory.waypoint(self.position,min(self.local_planner.escape_distance,
+                                                       self.local_planner.safety_distance))
+                # An inflated memory cell can temporarily have no discrete
+                # exit even when a continuous observed escape exists. Keep
+                # recovery's destination instead of reinstating the failed
+                # aerial connector while the local raster origin moves.
+                if target is None:
+                    target=memory.frontier if memory.frontier is not None else memory.goal
+                terminal_waypoint=self._local_waypoint(self.position,target,semantic_map,self.resolution)
+        else:
+            self._route_recovery=False
+        if (self.goal_position is not None and self.final_goal is not None
+                and np.linalg.norm(np.asarray(self.goal_position)-self.final_goal) < 1e-6
+                and (self._terminal_map is not None or
+                     np.linalg.norm(np.asarray(self.position)-self.final_goal) <= 25.)):
+            if self._terminal_map is None:
+                self._terminal_map = ObservedGrid(self.final_goal, world_bounds=self.world_bounds)
+            self._terminal_map.observe(self.position, semantic_map, self.resolution)
+            # Keep healthy graph navigation. Accumulated free-space search
+            # takes over only after the existing local stall detector fires.
+            self._terminal_recovery |= self._allow_local_escape
+            clearance = (min(self.local_planner.escape_distance, self.local_planner.safety_distance)
+                         if self._allow_local_escape else self.local_planner.safety_distance)
+            target = (self._terminal_map.waypoint(self.position, clearance)
+                      if self._terminal_recovery else None)
+            if target is not None:
+                terminal_waypoint = self._local_waypoint(
+                    self.position, target, semantic_map, self.resolution)
+
+        if (self.goal_position is not None and terminal_waypoint is None
+                and not self._route_recovery):
             with self.timer.measure("global_planning"):
                 needs_replan = False
                 
@@ -538,6 +744,7 @@ class GroundRobotController:
                         direct_waypoint_distance=self.global_planner.direct_waypoint_distance,
                         graph_preference_threshold=self.global_planner.graph_preference_threshold)
                     candidate.entry_validator = self.global_planner.entry_validator
+                    candidate.connection_validator = self.global_planner.connection_validator
                     proposed = candidate.plan_path(self.position, self.goal_position, planning_graph)
                     remaining = [self.position] + (self.global_planner.get_remaining_path() or [])
                     old_cost = self.global_planner._compute_path_length(remaining)
@@ -547,6 +754,7 @@ class GroundRobotController:
                         self.global_planner.current_path = candidate.current_path
                         self.global_planner.current_waypoint_idx = 0
                         self.global_planner.start_connection_idx = candidate.start_connection_idx
+                        self.global_planner.observed_connection_indices = set(candidate.observed_connection_indices)
                         self.global_planner.using_graph = True
                         self.global_planner.advance_waypoint(self.position, self.waypoint_threshold)
                 
@@ -591,16 +799,19 @@ class GroundRobotController:
                         # The artificial START -> first graph node connector
                         # has no graph evidence yet. Local sensing can support
                         # a short approach to that node, without authorizing
-                        # internal graph gaps. A final goal connector can also
-                        # advance incrementally inside observed free space.
+                        # internal graph edges. Explicit inter-component gaps
+                        # and the final connector have the same local-sensing
+                        # requirement, checked again on every control cycle.
                         is_entry = (self.global_planner.using_graph
                                     and self.global_planner.start_connection_idx is not None
                                     and self.global_planner.current_waypoint_idx
                                     == self.global_planner.start_connection_idx)
+                        is_connector = (self.global_planner.current_waypoint_idx in
+                                        self.global_planner.observed_connection_indices)
                         current_waypoint = (
-                            self.local_planner.observed_connection_waypoint(
+                            self._local_waypoint(
                                 self.position, current_waypoint, semantic_map, self.resolution)
-                            if (is_entry or (self.goal_position is not None and
+                            if (is_entry or is_connector or (self.goal_position is not None and
                                 np.linalg.norm(np.asarray(current_waypoint) - self.goal_position) < 1e-6))
                             else None)
                         self.global_planner.waiting_at_frontier = current_waypoint is None
@@ -609,11 +820,24 @@ class GroundRobotController:
                         self.global_planner.waiting_at_frontier = False
 
                 if current_waypoint is not None and not local_route_used:
-                    current_waypoint = self.local_planner.observed_connection_waypoint(
+                    current_waypoint = self._local_waypoint(
                         self.position, current_waypoint, semantic_map, self.resolution)
                     local_route_used = current_waypoint is not None
                     self.global_planner.waiting_at_frontier = current_waypoint is None
         
+        if terminal_waypoint is not None:
+            current_waypoint = terminal_waypoint
+            local_route_used = True
+            # Preserve the actually executed observed route for visualization
+            # and broadcasts instead of advertising a stale graph connector.
+            self.global_planner.current_path = [tuple(self.position), terminal_waypoint]
+            self.global_planner.goal_position = self.goal_position
+            self.global_planner.current_waypoint_idx = 1
+            self.global_planner.start_connection_idx = None
+            self.global_planner.using_graph = False
+            self.global_planner.observed_connection_indices = {1}
+            self.global_planner.waiting_at_frontier = False
+
         # Step 5: Local planning (compute velocity command)
         with self.timer.measure("local_planning"):
             if current_waypoint is None:
@@ -642,6 +866,9 @@ class GroundRobotController:
                     if abs(heading_error) > 0.25:
                         velocity_cmd = (0., velocity_cmd[1])
         
+        if motion_held:
+            velocity_cmd = (0., 0.)
+
         # Step 6: Return action with broadcast (for drone coordination)
         return {
             'motion': velocity_cmd,
@@ -708,6 +935,13 @@ class GroundRobotController:
         self.last_fusion_per_drone.clear()
         self._last_cooldown_print.clear()
         self._last_route_review = float('-inf')
+        self._terminal_map = None
+        self._terminal_recovery = False
+        self._motion_history.clear()
+        self._motion_distance = 0.
+        self._route_loop = False
+        self._route_map = None
+        self._route_recovery = False
         self.global_planner.entry_validator = None
         self._observed_obstacles.clear()
         self._obstacle_tree = None
