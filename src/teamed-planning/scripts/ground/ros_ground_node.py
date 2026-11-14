@@ -49,8 +49,12 @@ class GroundROSNode:
         # world_bounds = [min_x, min_y, max_x, max_y] of the surveyed area.
         self.subgoal_radius = float(rospy.get_param('~subgoal_radius', 0.0)) or None
         self.subgoal_arrival = float(rospy.get_param('~subgoal_arrival', 25.0))
+        self.sitl_v9 = rospy.get_param('~sitl_v9', False)
         bounds = rospy.get_param('~world_bounds', None)
         self.world_bounds = tuple(float(v) for v in bounds) if bounds else None
+        if self.sitl_v9:
+            from drone.xtdrone_v9 import WORLD_BOUNDS
+            self.world_bounds = WORLD_BOUNDS
 
         # libgazebo_ros_diff_drive with legacyMode=false initialises its odom
         # frame at the Gazebo world origin, so /ground_0/odom already carries
@@ -70,6 +74,7 @@ class GroundROSNode:
         # Drone graph buffers
         self.drone_graphs = {}         # {drone_id: TopologicalGraph}
         self.last_graph_times = {}
+        self.drone_status = {}
 
         # ── Algorithm ──────────────────────────────────────────────────
         self.controller = GroundRobotController(
@@ -80,6 +85,8 @@ class GroundROSNode:
             subgoal_radius=self.subgoal_radius,
             subgoal_arrival=self.subgoal_arrival,
             world_bounds=self.world_bounds,
+            safety_distance=1. if self.sitl_v9 else 1.5,
+            fusion_interval=5. if self.sitl_v9 else 20.,
         )
 
         # ── Publishers ─────────────────────────────────────────────────
@@ -106,6 +113,9 @@ class GroundROSNode:
             rospy.Subscriber(
                 f"/{did}/graph_broadcast", TopologicalGraphMsg,
                 self._drone_graph_cb, callback_args=did)
+            if self.sitl_v9:
+                rospy.Subscriber(f'/{did}/status', RobotStatus,
+                                 self._drone_status_cb, callback_args=did, queue_size=1)
 
         # ── Timers ─────────────────────────────────────────────────────
         self._ctrl_timer = rospy.Timer(
@@ -137,8 +147,16 @@ class GroundROSNode:
     def _goal_cb(self, msg):
         gx = msg.pose.position.x
         gy = msg.pose.position.y
+        if self.sitl_v9:
+            xmin, ymin, xmax, ymax = self.world_bounds
+            if not (xmin <= gx <= xmax and ymin <= gy <= ymax):
+                rospy.logwarn(f'[{self.robot_id}] Goal outside the v9 SITL world bounds')
+                return
         rospy.loginfo(f"[{self.robot_id}] New goal: ({gx:.2f}, {gy:.2f})")
         self.controller.set_goal((gx, gy))
+
+    def _drone_status_cb(self, msg, drone_id):
+        self.drone_status[drone_id] = msg
 
     def _command_cb(self, msg):
         tgt = msg.target_robot_id
@@ -249,6 +267,20 @@ class GroundROSNode:
             return
 
         try:
+            if self.sitl_v9:
+                now = rospy.Time.now()
+                if (self.last_odom_time is None or not 0 <= (now - self.last_odom_time).to_sec() <= .5
+                        or self.current_pointcloud is None
+                        or not 0 <= (now - self.current_pointcloud.header.stamp).to_sec() <= 2.):
+                    self.cmd_vel_pub.publish(Twist())
+                    return
+                final_goal = self.controller.final_goal
+                if final_goal is not None and np.linalg.norm(
+                        np.asarray(self.current_position_map) - final_goal) <= 2.:
+                    rospy.loginfo(f'[{self.robot_id}] VTemp final goal reached')
+                    self.controller.stop()
+                    self.cmd_vel_pub.publish(Twist())
+                    return
             obs = self._build_observation()
             result = self.controller.get_action(obs)
 
@@ -308,14 +340,23 @@ class GroundROSNode:
         neighbors = []
         now = rospy.Time.now()
 
-        for did, graph in self.drone_graphs.items():
+        for did, graph in self.drone_graphs.copy().items():
             lt = self.last_graph_times.get(did)
             if lt and (now - lt).to_sec() < self.comm_timeout:
+                position = [0., 0., 0.]
+                if self.sitl_v9:
+                    from drone.xtdrone_v9 import radio_delta
+                    status = self.drone_status.get(did)
+                    if status is None or not status.comm_ok or (now - status.header.stamp).to_sec() > 1.:
+                        continue
+                    position = [status.position_x, status.position_y, status.position_z]
+                    if radio_delta((*pos_map, 0.), position) is None:
+                        continue
                 neighbors.append({
                     'type': 'drone',
                     'broadcast': {
                         'drone_id': did,
-                        'position': [0.0, 0.0, 0.0],  # drone position unknown here
+                        'position': position,
                         'graph': graph.to_message(),
                     },
                 })
@@ -332,6 +373,7 @@ class GroundROSNode:
             },
             'occupancy_map': occupancy_map,
             'neighbors': neighbors,
+            'full_state': {'time': now.to_sec()},
         }
 
     # ════════════════════════ Mission broadcast ══════════════════════
@@ -341,6 +383,9 @@ class GroundROSNode:
         m.header.stamp = rospy.Time.now()
         m.robot_id = self.robot_id
         pos_map = self.current_position_map
+        if self.sitl_v9 and (pos_map is None or self.last_odom_time is None
+                             or not 0 <= (m.header.stamp - self.last_odom_time).to_sec() <= .5):
+            return
         if pos_map:
             m.position_x, m.position_y = pos_map  # map frame for drones to use
         if self.controller.goal_position:

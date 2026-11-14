@@ -18,6 +18,7 @@
   <arg name="num_drones"     default="3"/>
   <arg name="num_ground"     default="1"/>
   <arg name="vehicle"        default="iris"/>
+  <arg name="sitl_v9_checkpoint" default=""/>
   <arg name="seg_model_path"
        default="$(find teamed_planning)/scripts/drone/models/segformer_b0_ade/model.onnx"/>
 
@@ -38,6 +39,7 @@
     <param name="num_ground_robots" value="$(arg num_ground)"/>
     <param name="spawn_x"           value="$(arg spawn_x)"/>
     <param name="spawn_y"           value="$(arg spawn_y)"/>
+    <param name="sitl_v9_checkpoint" value="$(arg sitl_v9_checkpoint)" type="str"/>
 
     <!-- MAVROS services (XTDrone naming) -->
     <param name="arming_service"    value="/$(arg vehicle)_$(arg drone_num)/mavros/cmd/arming"/>

@@ -1,0 +1,15 @@
+services:
+  planning:
+    image: teamedplanning-ad:v9-sitl
+    build:
+      context: docker/planning
+      dockerfile: v9.Dockerfile
+    volumes:
+      - type: bind
+        source: ${V9_CHECKPOINT:?Set V9_CHECKPOINT to the original best576 best.pt}
+        target: /opt/v9-checkpoint/best.pt
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      PYTHONPATH: /opt/v9-python:/home/dcist/.local/lib/python3.8/site-packages

@@ -6,15 +6,16 @@ Single node per drone — sole MAVROS publisher.
 """
 
 import rospy
+import json
 import numpy as np
 import traceback
 import threading
 from enum import Enum
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from mavros_msgs.srv import CommandBool, SetMode, ParamSet
 from mavros_msgs.msg import ParamValue
 
@@ -57,6 +58,7 @@ class DroneROSNode:
         self.comm_timeout = rospy.get_param('~comm_timeout', 10.0)
         self.algorithm_rate = rospy.get_param('~algorithm_rate', 10.0)
         self.control_rate = rospy.get_param('~control_rate', 50.0)
+        self.sitl_checkpoint = rospy.get_param('~sitl_v9_checkpoint', '')
         self.num_drones = rospy.get_param('~num_drones', 3)
         self.num_ground_robots = rospy.get_param('~num_ground_robots', 1)
 
@@ -66,6 +68,9 @@ class DroneROSNode:
         base_height = float(rospy.get_param('~takeoff_height', 5.0))
         stagger     = float(rospy.get_param('~takeoff_height_stagger', 3.0))
         self.takeoff_height = base_height + drone_num * stagger
+        self.sitl_sensor_stamp = None
+        self.sitl_relay_packets = {}
+        self.peer_status_stamps = {}
 
         # Spawn position in Gazebo world (≈ map frame origin per drone).
         # MAVROS local_position/odom has its origin at the drone's home (spawn)
@@ -83,6 +88,7 @@ class DroneROSNode:
         self.home_position = None        # MAVROS local frame
         self.current_position = None     # MAVROS local frame (used for flight control)
         self.current_orientation = None
+        self.current_velocity = None
         self.current_target = None       # map frame (from algorithm)
         self.hover_position_local = None # local frame, frozen on entering HOVERING
         self.last_odom_time = None
@@ -102,14 +108,21 @@ class DroneROSNode:
         self.last_mission_times = {}
 
         # ── Algorithm ───────────────────────────────────────────────────
-        self.controller = DroneController(
-            drone_id=self.drone_id,
-            communication_range=self.communication_range,
-            max_speed=self.max_speed,
-            total_drones=self.num_drones,
-            navigation_algorithm=rospy.get_param('~navigation_algorithm', 'cadmm'),
-            mappo_checkpoint=rospy.get_param('~mappo_checkpoint', None),
-        )
+        if self.sitl_checkpoint:
+            from drone.xtdrone_v9 import FLIGHT_HEIGHT, MAX_SPEED, RADIO_RANGE, make_controller
+            self.takeoff_height = FLIGHT_HEIGHT
+            self.max_speed = MAX_SPEED
+            self.communication_range = RADIO_RANGE
+            self.controller = make_controller(self.drone_id, self.sitl_checkpoint)
+        else:
+            self.controller = DroneController(
+                drone_id=self.drone_id,
+                communication_range=self.communication_range,
+                max_speed=self.max_speed,
+                total_drones=self.num_drones,
+                navigation_algorithm=rospy.get_param('~navigation_algorithm', 'cadmm'),
+                mappo_checkpoint=rospy.get_param('~mappo_checkpoint', None),
+            )
         self.local_planner = DroneLocalPlanner(
             max_speed=self.max_speed,
             step_distance=self.max_speed / self.control_rate,
@@ -120,11 +133,15 @@ class DroneROSNode:
         # frames so transient misclassifications are filtered out before the
         # graph builder sees the map.
         _ev_world_size = float(rospy.get_param('~ev_world_size', 300.0))
-        _ev_origin     = -_ev_world_size / 2.0
+        _ev_origin = (-_ev_world_size / 2.0,) * 2
+        if self.sitl_checkpoint:
+            from drone.xtdrone_v9 import WORLD_BOUNDS
+            _ev_origin = WORLD_BOUNDS[:2]
+            _ev_world_size = WORLD_BOUNDS[2] - WORLD_BOUNDS[0]
         self._evidence_grid = EvidenceGrid(
             resolution=self.controller.resolution,
             world_size=_ev_world_size,
-            origin=(_ev_origin, _ev_origin),
+            origin=_ev_origin,
         )
         # Lock protects evidence_grid between _seg_occ_cb (subscriber thread)
         # and _build_observation (timer thread).
@@ -136,6 +153,9 @@ class DroneROSNode:
         # ── Publishers ──────────────────────────────────────────────────
         self.setpoint_pub = rospy.Publisher(
             'mavros_setpoint', PoseStamped, queue_size=10)
+        if self.sitl_checkpoint:
+            self.planned_velocity_pub = rospy.Publisher('v9_planned_velocity', TwistStamped, queue_size=1)
+            self.relay_pub = rospy.Publisher('v9_relay', String, queue_size=1)
         self.graph_pub = rospy.Publisher(
             'graph_broadcast', TopologicalGraphMsg, queue_size=1)
         # Debug: smoothed occupancy grid (evidence grid result) in world frame.
@@ -169,6 +189,9 @@ class DroneROSNode:
                 rospy.Subscriber(
                     f"/{did}/proposed_waypoint", PoseStamped,
                     self._drone_waypoint_cb, callback_args=did)
+                if self.sitl_checkpoint:
+                    rospy.Subscriber(f'/{did}/v9_relay', String,
+                                     self._sitl_relay_cb, callback_args=did, queue_size=1)
 
         for i in range(self.num_ground_robots):
             rid = f"ground_{i}"
@@ -232,6 +255,11 @@ class DroneROSNode:
         self.current_position = (p.x, p.y, p.z)
         o = msg.pose.pose.orientation
         self.current_orientation = (o.x, o.y, o.z, o.w)
+        if self.sitl_checkpoint:
+            from tf.transformations import quaternion_matrix
+            linear = msg.twist.twist.linear
+            self.current_velocity = quaternion_matrix(self.current_orientation)[:3, :3] @ (
+                linear.x, linear.y, linear.z)
         self.last_odom_time = rospy.Time.now()
         if self.home_position is None:
             self.home_position = self.current_position
@@ -265,6 +293,7 @@ class DroneROSNode:
                 self._seg_aspect = occ_h / occ_w
             with self._ev_lock:
                 self._evidence_grid.update(occ, bounds)
+                self.sitl_sensor_stamp = msg.header.stamp
         except Exception as e:
             rospy.logwarn_throttle(5.0, f"[{self.drone_id}] seg_occ decode error: {e}")
 
@@ -275,7 +304,10 @@ class DroneROSNode:
         cmd = msg.command.upper()
         rospy.loginfo(f"[{self.drone_id}] Command: {cmd}")
         if cmd == "TAKEOFF":
-            self._handle_takeoff(msg.param1 if msg.param1 > 0 else self.takeoff_height)
+            height = self.takeoff_height
+            if not self.sitl_checkpoint and msg.param1 > 0:
+                height = msg.param1
+            self._handle_takeoff(height)
         elif cmd == "LAND":
             self._transition(FlightState.LANDING)
         elif cmd == "RTH":
@@ -299,7 +331,7 @@ class DroneROSNode:
             'position': (msg.position_x, msg.position_y),
             'target': (msg.target_x, msg.target_y) if msg.has_target else None,
         }
-        self.last_mission_times[robot_id] = rospy.Time.now()
+        self.last_mission_times[robot_id] = msg.header.stamp if self.sitl_checkpoint else rospy.Time.now()
 
     def _planned_path_cb(self, msg, robot_id):
         """Store the ground robot's latest planned path as (x, y) waypoints."""
@@ -312,6 +344,27 @@ class DroneROSNode:
         """Store another drone's map-frame position from its status topic."""
         self.other_drone_positions[drone_id] = (
             msg.position_x, msg.position_y, msg.position_z)
+        if msg.comm_ok:
+            self.peer_status_stamps[drone_id] = msg.header.stamp
+        else:
+            self.peer_status_stamps.pop(drone_id, None)
+
+    def _sitl_relay_cb(self, msg, drone_id):
+        received = rospy.Time.now()
+        position = self.current_position_map
+        peer = self.other_drone_positions.get(drone_id)
+        seen = self.peer_status_stamps.get(drone_id)
+        if (position is not None and peer is not None and seen is not None
+                and 0 <= (received - seen).to_sec() <= 1.
+                and np.linalg.norm(np.subtract(peer, position)) <= self.communication_range):
+            try:
+                envelope = json.loads(msg.data)
+            except ValueError:
+                rospy.logwarn_throttle(5., f'[{self.drone_id}] Invalid v9 relay JSON from {drone_id}')
+                return
+            if isinstance(envelope, list) and all(
+                    isinstance(entry, dict) and entry.get('sender_id') == drone_id for entry in envelope):
+                self.sitl_relay_packets[drone_id] = (received, envelope)
 
     def _drone_waypoint_cb(self, msg, drone_id):
         """Store another drone's proposed waypoint for C-ADMM consensus."""
@@ -329,6 +382,9 @@ class DroneROSNode:
         # drift in the odom topic doesn't cause the drone to keep climbing.
         if new_state == FlightState.HOVERING and self.current_position is not None:
             self.hover_position_local = self.current_position
+            if self.sitl_checkpoint:
+                x, y, _ = self.hover_position_local
+                self.hover_position_local = (x, y, self.takeoff_height)
             rospy.loginfo(f"[{self.drone_id}] Hover locked at local "
                           f"z={self.hover_position_local[2]:.2f} m")
         rospy.loginfo(f"[{self.drone_id}] {old.value} -> {new_state.value}")
@@ -409,7 +465,7 @@ class DroneROSNode:
         if self.flight_state == FlightState.TAKING_OFF:
             tgt = (self.home_position[0],
                    self.home_position[1],
-                   self.home_position[2] + self.takeoff_height)
+                   self.takeoff_height if self.sitl_checkpoint else self.home_position[2] + self.takeoff_height)
             pos = self.local_planner.compute(self.current_position, tgt)
             if abs(self.current_position[2] - tgt[2]) < 0.3:
                 self._transition(FlightState.HOVERING)
@@ -508,7 +564,23 @@ class DroneROSNode:
             return
         try:
             obs = self._build_observation()
-            result = self.controller.get_action(obs, mode='real')
+            if self.sitl_checkpoint:
+                result = self.controller.get_action(obs, mode='sim')
+                velocity = result['motion']
+                if (not obs['sensor_valid'] or not np.isfinite(velocity).all()
+                        or abs(self.current_position[2] - self.takeoff_height) > 1.
+                        or self.controller.safety_stats.get('infeasible', True)):
+                    rospy.logwarn_throttle(5., f'[{self.drone_id}] v9 plan unavailable: perception, altitude, or CBF')
+                else:
+                    planned = TwistStamped()
+                    planned.header.stamp = rospy.Time.from_sec(obs['full_state']['time'])
+                    planned.header.frame_id = 'map'
+                    planned.twist.linear.x, planned.twist.linear.y = map(float, velocity[:2])
+                    self.planned_velocity_pub.publish(planned)
+                self.relay_pub.publish(String(data=json.dumps(
+                    self.controller.relay.outgoing(obs['full_state']['time']))))
+            else:
+                result = self.controller.get_action(obs, mode='real')
             self.current_target = result.get('target_waypoint')
 
             if self.current_target is not None:
@@ -547,7 +619,7 @@ class DroneROSNode:
         neighbors = []
         now = rospy.Time.now()
 
-        for did, graph in self.other_drone_graphs.items():
+        for did, graph in self.other_drone_graphs.copy().items():
             lt = self.last_graph_times.get(did)
             if lt and (now - lt).to_sec() < self.comm_timeout:
                 real_pos = self.other_drone_positions.get(did)
@@ -562,7 +634,7 @@ class DroneROSNode:
                     },
                 })
 
-        for rid, mission in self.ground_robot_missions.items():
+        for rid, mission in self.ground_robot_missions.copy().items():
             lt = self.last_mission_times.get(rid)
             if lt and (now - lt).to_sec() < self.comm_timeout:
                 neighbors.append({
@@ -579,7 +651,7 @@ class DroneROSNode:
         # ── Read smoothed occupancy from the evidence grid ───────────────
         # seg_node runs inference and calls evidence_grid.update() via _seg_occ_cb.
         # Here we only read the latest smoothed result — takes < 1 ms.
-        fallback_h, fallback_w = self._altitude_map_size()
+        fallback_h, fallback_w = (12, 12) if self.sitl_checkpoint else self._altitude_map_size()
         res    = self.controller.resolution
         half_x = fallback_h * res / 2.0   # rows → world X span
         half_y = fallback_w * res / 2.0   # cols → world Y span
@@ -611,7 +683,7 @@ class DroneROSNode:
         except Exception:
             pass
 
-        return {
+        obs = {
             'self': {
                 'position': np.array([pos_map[0], pos_map[1]]),
                 'height': pos_map[2],
@@ -622,6 +694,51 @@ class DroneROSNode:
             'neighbors': neighbors,
             'neighbor_waypoints': dict(self.other_drone_waypoints),
         }
+        if self.sitl_checkpoint:
+            self._add_sitl_observation(obs, pos_map, now)
+        return obs
+
+    def _add_sitl_observation(self, obs, position, now):
+        from drone.communication import make_entry
+        from drone.xtdrone_v9 import radio_delta
+
+        stamp = now.to_sec()
+        envelopes = []
+        neighbors = []
+        for drone_id, peer in self.other_drone_positions.copy().items():
+            seen = self.peer_status_stamps.get(drone_id)
+            delta = radio_delta(position, peer)
+            if seen is None or not 0 <= (now - seen).to_sec() <= 1. or delta is None:
+                continue
+            broadcast = {'drone_id': drone_id, 'position': list(peer)}
+            graph, seen = self.other_drone_graphs.get(drone_id), self.last_graph_times.get(drone_id)
+            if graph is not None and seen is not None and (now - seen).to_sec() <= self.comm_timeout:
+                broadcast['graph'] = graph.to_message()
+            neighbors.append(dict(id=int(drone_id.rsplit('_', 1)[1]), type='drone',
+                                  broadcast=broadcast, relative_position=delta))
+            packet = self.sitl_relay_packets.pop(drone_id, None)
+            if packet is not None and (now - packet[0]).to_sec() <= 1.:
+                envelopes.append(packet[1])
+
+        for robot_id, mission in self.ground_robot_missions.copy().items():
+            seen = self.last_mission_times.get(robot_id)
+            ground = (*mission['position'], 0.)
+            delta = radio_delta(position, ground)
+            if seen is None or not 0 <= (now - seen).to_sec() <= 2. or delta is None:
+                continue
+            broadcast = dict(mission, robot_id=robot_id, timestamp=seen.to_sec())
+            neighbors.append(dict(type='diff_drive', broadcast=broadcast, relative_position=delta))
+            envelopes.append([make_entry(robot_id, 0, seen.to_nsec(), seen.to_sec(),
+                                         'vehicle_state', ground, goal=mission['target'])])
+
+        sensor_stamp = self.sitl_sensor_stamp
+        obs['self']['velocity'] = self.current_velocity
+        obs.update(neighbors=neighbors, neighbor_waypoints={}, relay_envelopes=envelopes,
+                   relay_vehicle_missions=True,
+                   full_state={'time': stamp}, time_step=1. / self.algorithm_rate,
+                   sensor_valid=(sensor_stamp is not None
+                                 and 0 <= (now - sensor_stamp).to_sec() <= 2.
+                                 and 0 <= (now - self.last_odom_time).to_sec() <= .5))
 
     def _altitude_map_size(self) -> tuple:
         """Compute occupancy map (height, width) in pixels from altitude and HFOV.

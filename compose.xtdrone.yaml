@@ -3,7 +3,6 @@ services:
     image: xtdrone_ad:v4
     container_name: xtdrone-ad
     entrypoint: ["/bin/bash", "/opt/wslg/start.sh"]
-    gpus: all
     devices:
       - /dev/dxg:/dev/dxg
     volumes:
@@ -23,6 +22,7 @@ services:
     environment:
       DISPLAY: ":0"
       NUM_DRONES: "3"
+      PLANNING_MODE: "${PLANNING_MODE:-default}"
       LD_LIBRARY_PATH: /usr/lib/wsl/lib
       GALLIUM_DRIVER: d3d12
       MESA_D3D12_DEFAULT_ADAPTER_NAME: NVIDIA
@@ -42,7 +42,6 @@ services:
     image: teamedplanning-ad:v1
     container_name: teamedplanning-ad
     user: "0"
-    gpus: all
     devices:
       - /dev/dxg:/dev/dxg
     init: true
@@ -71,6 +70,7 @@ services:
         bind:
           create_host_path: false
     environment:
+      PLANNING_MODE: "${PLANNING_MODE:-default}"
       ROS_MASTER_URI: http://127.0.0.1:11311
       ROS_IP: 127.0.0.1
       PYTHONPATH: /home/dcist/.local/lib/python3.8/site-packages

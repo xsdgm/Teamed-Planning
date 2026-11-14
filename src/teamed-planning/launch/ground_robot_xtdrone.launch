@@ -11,6 +11,7 @@
 <launch>
   <arg name="robot_id"   default="ground_0"/>
   <arg name="num_drones" default="3"/>
+  <arg name="sitl_v9" default="false"/>
   <!-- Relay subgoals for goals beyond the drone chain (m); 0 disables -->
   <arg name="subgoal_radius" default="0.0"/>
   <arg name="subgoal_arrival" default="25.0"/>
@@ -36,6 +37,7 @@
     <param name="num_drones" value="$(arg num_drones)"/>
     <param name="subgoal_radius" value="$(arg subgoal_radius)"/>
     <param name="subgoal_arrival" value="$(arg subgoal_arrival)"/>
+    <param name="sitl_v9" value="$(arg sitl_v9)" type="bool"/>
     <!-- Optional surveyed bounds for subgoals: <rosparam param="world_bounds">[0, 0, 1000, 1000]</rosparam> -->
     <!-- spawn_offset = 0: diff_drive odom is already in world/map frame -->
     <param name="spawn_x"    value="0.0"/>

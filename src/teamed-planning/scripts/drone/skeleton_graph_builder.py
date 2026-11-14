@@ -346,7 +346,7 @@ class SkeletonGraphBuilder:
         
         # Extract skeleton using medial axis
         # This gives us paths that maximize clearance from obstacles
-        skeleton = skeletonize(traversable_mask)
+        skeleton = skeletonize(np.ascontiguousarray(traversable_mask))
         
         # Filter skeleton by minimum clearance FIRST (before cleaning)
         # This removes skeleton pixels too close to obstacles

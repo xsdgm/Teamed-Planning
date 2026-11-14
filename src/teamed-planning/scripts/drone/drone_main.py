@@ -486,6 +486,19 @@ class DroneController:
             self.relay.originate(current_time, 'drone_state', self.position,
                                  simulator_obs['self'].get('velocity'))
             nav_obs['relay'] = self.relay.tokens(current_time)
+            if simulator_obs.get('relay_vehicle_missions'):
+                # ROS graphs and relay envelopes travel on separate topics.
+                # Use only received vehicle records for relayed task features.
+                for robot_id, entry in self.relay.cache.items():
+                    if entry['payload_type'] != 'vehicle_state':
+                        continue
+                    state = entry['state']
+                    task = nav_obs['ground_robots'].get(robot_id)
+                    source_time = entry['source_stamp']
+                    if source_time is not None and (task is None or source_time > task['source_time']):
+                        nav_obs['ground_robots'][robot_id] = dict(
+                            position=state['position'], target=state['goal'],
+                            source_time=source_time, direct=False)
         
         # Step 6: Compute navigation target
         with self.timer.measure("navigation"):

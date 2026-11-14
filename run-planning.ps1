@@ -3,13 +3,28 @@ param(
     [ValidateSet('start', 'stop', 'status', 'logs', 'takeoff', 'land', 'navigate', 'rviz')]
     [string]$Command = 'start',
     [Parameter(Position=1)][double]$X,
-    [Parameter(Position=2)][double]$Y
+    [Parameter(Position=2)][double]$Y,
+    [string]$VTempCheckpoint
 )
 $ErrorActionPreference = 'Stop'
+$priorPlanningMode = $env:PLANNING_MODE
+$priorV9Checkpoint = $env:V9_CHECKPOINT
 Push-Location $PSScriptRoot
 try {
     switch ($Command) {
         'start' {
+            $composeArgs = @('-f', 'compose.xtdrone.yaml')
+            $env:PLANNING_MODE = 'default'
+            if ($VTempCheckpoint) {
+                $checkpoint = Get-Item -LiteralPath $VTempCheckpoint
+                $expectedHash = '7AC3AEDCC3876902773B2241F60E839EB3E3B5630DDEB3C8BE660421F2C24198'
+                if ((Get-FileHash -LiteralPath $checkpoint.FullName).Hash -ne $expectedHash) {
+                    throw 'Expected the original v9 best576 best.pt checkpoint.'
+                }
+                $env:V9_CHECKPOINT = $checkpoint.FullName
+                $env:PLANNING_MODE = 'v9-vtemp'
+                $composeArgs += @('-f', 'docker/planning/v9.compose.yaml')
+            }
             docker image inspect xtdrone_ad:v4 teamedplanning-ad:v1 *> $null
             if ($LASTEXITCODE -ne 0) {
                 $archive = Join-Path $PSScriptRoot 'docker/teamedplanning-docker-images-2026-10-10.tar.gz'
@@ -18,7 +33,11 @@ try {
                 docker load --input $archive
                 if ($LASTEXITCODE -ne 0) { throw 'Failed to restore Docker images.' }
             }
-            docker compose -f compose.xtdrone.yaml --profile planning up -d --wait --wait-timeout 420
+            if ($VTempCheckpoint) {
+                docker compose @composeArgs --profile planning build planning
+                if ($LASTEXITCODE -ne 0) { throw 'Failed to build the v9 planning image.' }
+            }
+            docker compose @composeArgs --profile planning up -d --wait --wait-timeout 420
             if ($LASTEXITCODE -eq 0) {
                 Write-Host 'Simulation and planning ready. Gazebo uses the NVIDIA GPU in a WSLg desktop window.'
             }
@@ -40,4 +59,8 @@ try {
         }
     }
     if ($LASTEXITCODE -ne 0) { throw "Docker command failed (exit $LASTEXITCODE)." }
-} finally { Pop-Location }
+} finally {
+    $env:PLANNING_MODE = $priorPlanningMode
+    $env:V9_CHECKPOINT = $priorV9Checkpoint
+    Pop-Location
+}

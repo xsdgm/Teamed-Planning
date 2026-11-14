@@ -21,4 +21,4 @@ comm_timeout: 10.0
 algorithm_rate: 10.0
 control_rate: 50.0
 navigation_algorithm: cadmm  # cadmm | cadmm_controlled | greedy | mappo
-mappo_checkpoint: null     # required when navigation_algorithm is mappo
+mappo_checkpoint: ""       # required when navigation_algorithm is mappo
