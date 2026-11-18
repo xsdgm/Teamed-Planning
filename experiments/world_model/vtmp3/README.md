@@ -15,7 +15,7 @@ vtmp3 的高层输出是两个世界坐标点 A、B。无人机后端负责探�
 
 模型的公共 RSSM 实现在 [models.py](../../../src/teamed-planning/scripts/world_model/models.py)，单目标版本 `model.py` 与两点任务版本 `ab_model.py` 继承同一个基础类；动作是 `[ax, ay, bx, by]/1000`。选点通过模型评分实现，不把 bootstrap 启发式采集器称为学习策略，也不声称模型直接回归坐标。当前规划器使用 **一个宏任务的预测视野**；训练包含默认四段自由推演损失，验证另外报告 1/2/4 段误差。多段预测训练不等于已经实现长期最优选区。
 
-任务契约、代理建图与已接收地图导航集中在 [ab_environment.py](../../../src/teamed-planning/scripts/world_model/ab_environment.py)；原 `ab_contract.py`、`ab_mapping.py` 和 `ab_navigation.py` 的调用已迁移到该模块。
+任务契约、代理建图与已接收地图导航集中在 [ab_environment.py](../../../src/teamed-planning/scripts/world_model/survey/ab_environment.py)；原 `ab_contract.py`、`ab_mapping.py` 和 `ab_navigation.py` 的调用已迁移到该模块。
 
 ## 与 v11-2 对齐的接口
 
@@ -99,7 +99,7 @@ cd src/teamed-planning/scripts
 ## WildScenes 简化场景训练
 
 统一入口支持 `--config src/teamed-planning/config/algorithm/world_model_vtmp3_wildscenes.json`。
-它仍使用 vtmp3 的公共模型和 A—B 训练流程，由 `world_model/ab_wildscenes.py` 适配场景；
+它仍使用 vtmp3 的公共模型和 A—B 训练流程，由 `world_model/survey/ab_wildscenes.py` 适配场景；
 测试位于 `tests/world_model/vtmp3/test_wildscenes.py`。
 
 场景来源为已导出的 `artifacts/wildscenes-legacy2d-20261106/scenes/K-01-r025.json` 和 `V-01.json`。

@@ -27,10 +27,8 @@ def record(**overrides):
 
 
 class TrainingV9Tests(unittest.TestCase):
-    def test_mixed_distance_config_and_legacy_default_are_separate(self):
-        v8, v9 = config('v8'), config('v9')
-        self.assertEqual(v8['mapping_route_origin'], 'initial')
-        self.assertEqual(reward_contract(v8), 'uav_mapping_route_quality_and_backbone_v7_surprise')
+    def test_mixed_distance_config_uses_arrival_reward(self):
+        v9 = config('v9')
         self.assertEqual(reward_contract(v9), 'uav_remaining_route_mapping_v9')
         self.assertEqual(v9['task_distance_range'], [100., 400.])
         self.assertEqual(v9['task_distances'], [])
@@ -51,13 +49,11 @@ class TrainingV9Tests(unittest.TestCase):
                           {'map_improvement_steps': 150}, {'surprise_weight': .05}):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 validate_config(dict(v9, **overrides))
-        with self.assertRaises(ValueError):
-            validate_config(dict(config('v8'), subgoal_radius=200.))
 
     def test_reward_change_is_not_an_optimizer_resume_upgrade(self):
         for upgrade in (False, True):
             with self.subTest(upgrade=upgrade), self.assertRaises(ValueError):
-                optimizer_config_changes(config('v8'), config('v9'), allow_upgrade=upgrade)
+                optimizer_config_changes(config('v9'), dict(config('v9'), arrival_reward=101.), allow_upgrade=upgrade)
 
     def test_checkpoint_selection_requires_arrival_and_vehicle_safety(self):
         v9 = config('v9')
@@ -67,8 +63,6 @@ class TrainingV9Tests(unittest.TestCase):
         self.assertEqual(arrived['success_metric'], 'goal_reached')
         self.assertGreater(arrived['score'], mapped['score'])
         self.assertGreater(mapped['score'], collided['score'])
-        self.assertEqual(score_validation([record(map_completed=1.)], config('v8'))['success_metric'],
-                         'map_completed')
 
     def test_progress_line_uses_signed_remaining_route_and_arrival(self):
         summary=dict(reward_beta=1., reward_eta=0., confidence_area=12., task_share=.5,
@@ -80,10 +74,6 @@ class TrainingV9Tests(unittest.TestCase):
             self.assertIn(text,v9_line)
         self.assertNotIn('map_done=',v9_line)
         self.assertNotIn('route_saved_m=',v9_line)
-        v8_line=episode_line(1,config('v8'),summary,0.,ppo)
-        for text in ('map_done=0 ', 'route_saved_m=7.0 ', 'frontier=0.90 '):
-            self.assertIn(text,v8_line)
-        self.assertNotIn('route_delta_m=',v8_line)
 
     def test_rollout_uses_arrival_and_preserves_remaining_reference(self):
         """A complete map at frame 1 must keep running until vehicle frame 3."""

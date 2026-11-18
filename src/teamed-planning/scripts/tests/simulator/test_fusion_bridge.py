@@ -15,7 +15,7 @@ from simulator.train_mappo import validate_config, reward_contract, run_episode,
 
 
 def config():
-    return json.loads((Path(__file__).resolve().parents[3]/'config/algorithm/mappo_training_v8.json').read_text())
+    return json.loads((Path(__file__).resolve().parents[3]/'config/algorithm/mappo_training_v9.json').read_text())
 
 
 def chain(name, points):
@@ -84,11 +84,10 @@ class BridgeTests(unittest.TestCase):
 
 
 class BridgeConfigTests(unittest.TestCase):
-    def test_default_off_bounds_and_contract_label(self):
+    def test_bridge_bounds_and_v9_route_contract(self):
         c = validate_config(config())
-        self.assertEqual(c['fusion_bridge_distance'], 0.)
-        self.assertFalse(reward_contract(c).endswith('_bridged'))
-        self.assertTrue(reward_contract(validate_config(dict(c, fusion_bridge_distance=15.))).endswith('_bridged'))
+        self.assertEqual(c['fusion_bridge_distance'], 15.)
+        self.assertEqual(reward_contract(c), 'uav_remaining_route_mapping_v9')
         for bad in (-1., 15.5, True, 'x'):
             with self.assertRaises(ValueError):
                 validate_config(dict(c, fusion_bridge_distance=bad))

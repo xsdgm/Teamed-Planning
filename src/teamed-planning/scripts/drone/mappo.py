@@ -1,5 +1,4 @@
 """Shared candidate actor and legal-observation centralized critic (CPU capable)."""
-from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
@@ -60,15 +59,11 @@ class ActorCritic(nn.Module):
         if 'gat_actor.0.relay.mode' in state:
             from drone.relay_attention_mappo import RelayActorCritic
             return RelayActorCritic.from_state_dict(state)
-        if 'gat_actor.0.peer_key.weight' in state:
-            from drone.cooperative_mappo import CooperativeActorCritic
-            return CooperativeActorCritic.from_state_dict(state)
         if 'gat_actor.1.weight' in state:
             from drone.graph_attention_mappo import GraphAttentionActorCritic
             return GraphAttentionActorCritic.from_state_dict(state)
-        if 'velocity_actor.0.weight' in state:
-            from drone.velocity_mappo import VelocityActorCritic
-            return VelocityActorCritic.from_state_dict(state)
+        if 'actor.0.weight' not in state:
+            raise ValueError('Unrecognized MAPPO checkpoint architecture')
         model = cls(global_features=state['critic.0.weight'].shape[1]-FEATURES)
         model.load_state_dict(state)
         return model
@@ -87,14 +82,13 @@ class ActorCritic(nn.Module):
 
 
 class CandidateNavigator(DroneNavigator):
-    """Controlled baselines and MAPPO share candidate generation and screening.
+    """Controlled greedy and C-ADMM baselines share candidate generation and screening.
 
     First experiment uses direct upload, not an inferred relay chain. Swept
     separation uses received previous proposals and a bounded one-second motion.
     Missing expected neighbors forces hold, rather than assuming connectivity.
     """
-    def __init__(self, *args, model=None, algorithm='mappo', checkpoint=None,
-                 deterministic=None, max_speed=6., decision_dt=1.,
+    def __init__(self, *args, algorithm='greedy', max_speed=6., decision_dt=1.,
                  exploration_candidates=0, world_bounds=None,
                  communication_mode=None, fleet_ids=None,
                  chain_ground_range=None, chain_link_range=None, **kwargs):
@@ -106,32 +100,11 @@ class CandidateNavigator(DroneNavigator):
         self.exploration_candidates = int(exploration_candidates)
         self.world_bounds = world_bounds
         self.communication_mode=communication_mode or 'direct'
-        self.checkpoint_safety_filter='legacy'
-        self.model = model
-        policy_mode = 'argmax'
-        if checkpoint:
-            saved = torch.load(Path(checkpoint), map_location='cpu', weights_only=True)
-            if saved.get('feature_version') != 1:
-                raise ValueError('Unsupported MAPPO checkpoint feature version')
-            self.model = ActorCritic.from_state_dict(saved['model'])
-            # Act as the checkpoint was validated; older checkpoints used argmax.
-            policy_mode = saved.get('policy_mode', 'argmax')
-            self.fov_radius = float(saved.get('fov_radius', 12.))
-            self.exploration_candidates = int(saved.get('exploration_candidates', 0))
-            self.world_bounds = saved.get('world_bounds', world_bounds)
-            self.communication_mode=communication_mode or saved.get('communication_mode','direct')
-            self.checkpoint_safety_filter=saved.get('safety_filter','legacy')
-            if chain_ground_range is None:
-                self.chain_ground_range = saved.get('chain_ground_range')
-            if chain_link_range is None:
-                self.chain_link_range = saved.get('chain_link_range')
-            self.model.eval()
+        if algorithm not in ('greedy', 'cadmm_controlled'):
+            raise ValueError(f'Unknown candidate planning algorithm: {algorithm}')
         if not 0 <= self.exploration_candidates <= 20:
             raise ValueError('exploration_candidates must be between 0 and 20')
-        if policy_mode not in ('argmax', 'sample'):
-            raise ValueError('policy_mode must be argmax or sample')
         self.algorithm = algorithm
-        self.deterministic = policy_mode == 'argmax' if deterministic is None else bool(deterministic)
         self.max_speed, self.decision_dt = max_speed, decision_dt
         self.last_sample = None
         self.fallbacks = 0
@@ -238,34 +211,19 @@ class CandidateNavigator(DroneNavigator):
         x, mask, candidates, obs = self.encode(current_position, observation_data)
         if mask.sum() == 1:
             self.fallbacks += 1
-        xt, mt = torch.from_numpy(x), torch.from_numpy(mask)
-        with torch.no_grad():
-            if self.algorithm == 'mappo' and self.model is not None:
-                try:
-                    dist = self.model.distribution(xt, mt)
-                    a = dist.logits.argmax() if self.deterministic else dist.sample()
-                    index, logp = int(a), float(dist.log_prob(a))
-                except (RuntimeError, ValueError):
-                    index, logp = 0, 0.
-                    self.fallbacks += 1
-            elif self.algorithm == 'cadmm_controlled':
-                # ADMM iterations use the identical received neighbor proposals.
-                valid = [w for i, w in enumerate(candidates) if mask[i]]
-                target = self._admm_select(valid, obs['graph'], self.ground_robot_position,
-                    self.ground_robot_target, obs['neighbor_waypoints'],
-                    {k: tuple(v['position']) for k,v in obs['nearby_drones'].items()}, current_position,
-                    fixed_candidates=True
-                    ) if mask.sum() > 1 and obs['graph'] is not None else candidates[0]
-                index = min((i for i in range(len(candidates)) if mask[i]),
-                            key=lambda i: np.linalg.norm(np.asarray(candidates[i])-target))
-                logp = 0.
-            elif self.algorithm == 'greedy':
-                scores = (1-x[:,6]) - .2*x[:,2] - .1*x[:,5] - .2*x[:,9]
-                index, logp = int(np.where(mask, scores, -1e9).argmax()), 0.
-            else:
-                index, logp = 0, 0.
-                self.fallbacks += 1
-        self.last_sample = (x, mask, index, logp)
+        if self.algorithm == 'cadmm_controlled':
+            valid = [w for i, w in enumerate(candidates) if mask[i]]
+            target = self._admm_select(valid, obs['graph'], self.ground_robot_position,
+                self.ground_robot_target, obs['neighbor_waypoints'],
+                {k: tuple(v['position']) for k,v in obs['nearby_drones'].items()}, current_position,
+                fixed_candidates=True
+                ) if mask.sum() > 1 and obs['graph'] is not None else candidates[0]
+            index = min((i for i in range(len(candidates)) if mask[i]),
+                        key=lambda i: np.linalg.norm(np.asarray(candidates[i])-target))
+        else:
+            scores = (1-x[:,6]) - .2*x[:,2] - .1*x[:,5] - .2*x[:,9]
+            index = int(np.where(mask, scores, -1e9).argmax())
+        self.last_sample = (x, mask, index, 0.)
         self._current_target = tuple(candidates[index])
         if self.communication_mode=='chain' and self._recovery_target is not None:
             self._current_target=self._recovery_target

@@ -15,7 +15,8 @@ from drone.communication import ChainState
 from drone.cooperative_mappo import CooperativeNavigator
 from drone.drone_main import DroneController
 from drone.survey_mappo import RouteABActorCritic, survey_features
-from drone.velocity_mappo import VelocityActorCritic, VelocityNavigator
+from drone.graph_attention_mappo import GraphAttentionActorCritic
+from drone.velocity_mappo import VelocityNavigator
 
 
 def observation(now=5., stamp=5., target=(180., 50.), x=30., direct=True):
@@ -137,7 +138,7 @@ class VehicleFeatureTests(unittest.TestCase):
     def test_legacy_target_present_prefix_retains_values_for_both_input_versions(self):
         for version in (1, 2):
             nav = VelocityNavigator('drone_0', total_drones=3,
-                model=VelocityActorCritic(input_version=version))
+                model=GraphAttentionActorCritic(input_version=version))
             nav.cbf_margin_source = lambda: None
             features, _ = nav.encode([50., 50., 15.], observation())
             expected = [130./350., 0., -20./95., 0., 150./350., 0., 1., 25./95.]

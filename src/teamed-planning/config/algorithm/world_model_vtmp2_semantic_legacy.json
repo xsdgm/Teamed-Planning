@@ -1,0 +1,20 @@
+{
+  "algorithm": "vtmp2",
+  "model_architecture": "semantic_completion_vtmp2",
+  "parameters": {
+    "source_root": "../../../../artifacts/wildscenes-v9-20261106/raw/WildScenes3d",
+    "v9_checkpoint": "../../../../artifacts/mappo-v9-mixed100to400-no-subgoal-800ep-20261105-153146/best.pt",
+    "train_sequence": "K-01",
+    "val_sequence": "V-01",
+    "resolution": 2,
+    "side": 128,
+    "samples_per_epoch": 1024,
+    "validation_masks": 4,
+    "workers": 0,
+    "epochs": 100,
+    "device": "cuda",
+    "batch_size": 8,
+    "hidden": 24,
+    "members": 3
+  }
+}

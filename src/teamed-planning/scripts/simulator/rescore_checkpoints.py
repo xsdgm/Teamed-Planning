@@ -1,7 +1,7 @@
 """Re-score saved MAPPO checkpoints with the current validation protocol.
 
 Uses the validation seeds, sample count and score of a training config
-(default: the 1000 m config), sampling actions like training. --policy argmax
+(default: the run configuration), sampling actions like training. --policy argmax
 measures deterministic deployment instead. One JSON line per checkpoint.
 
 Example:
@@ -23,16 +23,12 @@ from drone.mappo import ActorCritic
 from simulator.train_mappo import (_worker_init, fixed_schedule, run_episode, score_validation,
                                    validate_config, validation_runs)
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[2]/'config'/'algorithm'/'mappo_training_1000m.json'
-
 
 def _episode(path, seed, sample_seed, stochastic, protocol):
     saved=torch.load(path,map_location='cpu',weights_only=True)
     config=dict(validate_config(saved['config']),**protocol)
-    # Seed before building, as in-training validation (_rollout_task) does:
-    # initialization consumes the stream, so rescores reproduce those runs.
-    torch.manual_seed(sample_seed)
     model=ActorCritic.from_state_dict(saved['model']);model.eval()
+    torch.manual_seed(sample_seed)
     _,summary=run_episode(model,config,seed,fixed_schedule(config,config['episodes']-1),stochastic)
     return summary
 
@@ -40,9 +36,9 @@ def _episode(path, seed, sample_seed, stochastic, protocol):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--run',type=Path,required=True)
-    parser.add_argument('--checkpoints',nargs='*',help='file names in --run; default episode_*.pt and latest.pt')
+    parser.add_argument('--checkpoints',nargs='*',help='file names in --run; default to episode snapshots and latest.pt, or best.pt when latest is absent')
     parser.add_argument('--every',type=int,default=1,help='keep episode_*.pt whose episode is a multiple')
-    parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG,help='source of the validation protocol')
+    parser.add_argument('--config',type=Path,help='validation protocol override (default: the run configuration)')
     parser.add_argument('--samples',type=int,help='override validation_samples')
     parser.add_argument('--policy',choices=('sample','argmax'),default='sample')
     parser.add_argument('--seeds',type=int,nargs='+',help='override validation_seeds')
@@ -55,7 +51,24 @@ def main():
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--output',type=Path)
     args=parser.parse_args()
-    reference=validate_config(json.loads(args.config.read_text(encoding='utf-8-sig')))
+    if args.every < 1:
+        parser.error('--every must be a positive integer')
+    names = args.checkpoints
+    if not names:
+        names = [p.name for p in sorted(args.run.glob('episode_*.pt'))
+                 if int(p.stem.split('_')[1]) % args.every == 0]
+        for name in ('latest.pt', 'best.pt'):
+            if (args.run/name).is_file():
+                names.append(name)
+                break
+    if not names:
+        parser.error('No checkpoints found in the run directory')
+    config_path = args.config or args.run/'config.json'
+    if args.config or config_path.is_file():
+        settings = json.loads(config_path.read_text(encoding='utf-8-sig'))
+    else:
+        settings = torch.load(args.run/names[0],map_location='cpu',weights_only=True)['config']
+    reference=validate_config(settings)
     protocol=dict(validation_seeds=args.seeds or reference['validation_seeds'],
                   validation_samples=args.samples or reference['validation_samples'])
     # Without overrides each checkpoint keeps its own training protocol.
@@ -67,8 +80,6 @@ def main():
         protocol['chain_ground_range'],protocol['chain_link_range']=args.chain_ranges
     if args.policy=='argmax':
         protocol['validation_samples']=1  # Deterministic runs do not differ.
-    names=args.checkpoints or [p.name for p in sorted(args.run.glob('episode_*.pt'))
-                               if int(p.stem.split('_')[1])%args.every==0]+['latest.pt']
     output=args.output or args.run/f'rescore_{args.policy}.jsonl'
     jobs,configs={},{}
     with ProcessPoolExecutor(args.workers,mp_context=multiprocessing.get_context('spawn'),
@@ -87,13 +98,12 @@ def main():
             report=score_validation(records,configs[name])
             row=dict(checkpoint=name,episode=episode,policy=args.policy,protocol=protocol,
                      finished_utc=datetime.now(timezone.utc).isoformat(),
-                     connected_rate=report['means']['graph_task_connected'],
+                     connected_rate=report['means'].get('graph_task_connected'),
                      safety_rate=report['means']['safety_terminated'],
-                     arrival_rate=report['means']['goal_reached'],**report)
+                     arrival_rate=report['means'].get('goal_reached'),**report)
             stream.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n')
             print(f"{name} episode={episode} score={report['score']:.1f} "
-                  f"connected={row['connected_rate']:.2f} safety={row['safety_rate']:.2f} "
-                  f"arrival={row['arrival_rate']:.2f}",flush=True)
+                  f"success={row['means'][row['success_metric']]:.2f} safety={row['safety_rate']:.2f}",flush=True)
     print(f'{len(jobs)} episodes in {time.monotonic()-tic:.0f}s -> {output}')
 
 

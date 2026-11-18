@@ -1,13 +1,13 @@
 param(
     [string]$Config = '',
-    [string]$Output = 'artifacts/mappo-1000m-20261018',
+    [string]$Output = ('artifacts/mappo-v9-' + (Get-Date -Format yyyyMMdd)),
     [string]$Python = '',
     [int]$Workers = 1,
     [switch]$Resume
 )
 $ErrorActionPreference = 'Stop'
 $taskRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../../..')).Path
-if (-not $Config) { $Config = Join-Path $taskRoot 'src/teamed-planning/config/algorithm/mappo_training_1000m.json' }
+if (-not $Config) { $Config = Join-Path $taskRoot 'src/teamed-planning/config/algorithm/mappo_training_v9.json' }
 $taskConfig = (Resolve-Path -LiteralPath $Config).Path
 if (-not $Python -and $env:CONDA_PREFIX) { $Python = Join-Path $env:CONDA_PREFIX 'python.exe' }
 if (-not $Python) { $Python = Join-Path $env:USERPROFILE '.conda/envs/teamedplanning-2d/python.exe' }

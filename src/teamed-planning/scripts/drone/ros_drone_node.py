@@ -121,7 +121,6 @@ class DroneROSNode:
                 max_speed=self.max_speed,
                 total_drones=self.num_drones,
                 navigation_algorithm=rospy.get_param('~navigation_algorithm', 'cadmm'),
-                mappo_checkpoint=rospy.get_param('~mappo_checkpoint', None),
             )
         self.local_planner = DroneLocalPlanner(
             max_speed=self.max_speed,

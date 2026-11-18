@@ -55,8 +55,8 @@ class CoGraphRewardContractTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'Resume configuration differs'):
                         optimizer_config_changes(before, after, allow_upgrade=upgrade)
 
-    def test_contract_cannot_silently_apply_to_v1_v8_or_v9(self):
-        for name in ('cograph_v1.json', 'mappo_training_v8.json', 'mappo_training_v9.json'):
+    def test_contract_cannot_silently_apply_to_v1_or_v9(self):
+        for name in ('cograph_v1.json', 'mappo_training_v9.json'):
             with self.subTest(name=name):
                 legacy = config(name)
                 self.assertEqual(legacy['cograph_route_reward'], 'legacy')

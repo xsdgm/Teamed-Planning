@@ -75,20 +75,6 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             CBFSafetyFilter().filter([0,0,1],[20,20,15],{},1.)
 
-    def test_checkpoint_preserves_chain_and_cbf_execution_settings(self):
-        artifact_root=Path(__file__).resolve().parents[5]/'artifacts'/'cbf-tests'
-        artifact_root.mkdir(parents=True,exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=artifact_root) as directory:
-            self.assertTrue(Path(directory).resolve().is_relative_to(artifact_root.resolve()))
-            path=Path(directory)/'model.pt'
-            torch.save(dict(model=ActorCritic().state_dict(),feature_version=1,
-                            communication_mode='chain',safety_filter='cbf'),path)
-            controller=DroneController('drone_0',total_drones=3,
-                navigation_algorithm='mappo',mappo_checkpoint=str(path))
-            self.assertEqual(controller.communication_mode,'chain')
-            self.assertEqual(controller.safety_filter,'cbf')
-            with self.assertRaises(NotImplementedError):
-                controller.get_action({},mode='real')
 
     def test_random_joint_steps_preserve_received_chain_and_spacing(self):
         rng=np.random.default_rng(123)

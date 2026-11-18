@@ -45,7 +45,6 @@ class DroneController:
                  total_drones: int = 1,
                  dispatch_interval: float = 1.0,
                  navigation_algorithm: str = 'cadmm',
-                 mappo_checkpoint: Optional[str] = None,
                  communication_mode: Optional[str] = None, safety_filter: Optional[str] = None,
                  graph_min_clearance: float = 3.0):
         """
@@ -105,21 +104,15 @@ class DroneController:
             comm_range=communication_range,
         )
         if navigation_algorithm != 'cadmm':
-            from drone.mappo import CandidateNavigator
-            if navigation_algorithm not in ('mappo', 'greedy', 'cadmm_controlled'):
+            if navigation_algorithm not in ('greedy', 'cadmm_controlled'):
                 raise ValueError(f'Unknown navigation algorithm: {navigation_algorithm}')
-            if navigation_algorithm == 'mappo' and not mappo_checkpoint:
-                raise ValueError('MAPPO requires a trained mappo_checkpoint')
+            from drone.mappo import CandidateNavigator
             self.navigator = CandidateNavigator(
                 drone_id=drone_id, total_drones=total_drones,
                 waypoint_threshold=waypoint_threshold, comm_range=communication_range,
-                algorithm=navigation_algorithm, checkpoint=mappo_checkpoint,
+                algorithm=navigation_algorithm,
                 communication_mode=communication_mode,
                 max_speed=max_speed, decision_dt=dispatch_interval)
-        if communication_mode is None:
-            self.communication_mode=getattr(self.navigator,'communication_mode','direct')
-        if safety_filter is None:
-            self.safety_filter=getattr(self.navigator,'checkpoint_safety_filter','legacy')
         self._chain_state=ChainState(drone_id,total_drones if self.communication_mode=='chain' else 1)
         
         # Performance timer

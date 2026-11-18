@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Independent, Normal
-from drone.velocity_mappo import (VelocityActorCritic, GRAPH_RADIUS, SENSOR_SIZE, STATE_FEATURES,
+from drone.velocity_mappo import (bounded_velocity, GRAPH_RADIUS, SENSOR_SIZE, STATE_FEATURES,
                                   INPUT_VERSIONS)
 
 MAX_FLEET = 16
@@ -134,7 +134,7 @@ class CriticGraphEncoder(nn.Module):
 class GraphAttentionActorCritic(nn.Module):
     action_mode='velocity'
     policy_architecture='gat_map_v1'
-    velocity=staticmethod(VelocityActorCritic.velocity)
+    velocity=staticmethod(bounded_velocity)
 
     def __init__(self,global_features=10,input_version=1):
         super().__init__();self.global_features=int(global_features)

@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
 from common.graph_structure import TopologicalGraph
-from drone.velocity_mappo import VelocityActorCritic
+from drone.graph_attention_mappo import GraphAttentionActorCritic
 from simulator.mappo_experiment import Experiment, navigation_cost
 from simulator.navigation_metrics import task_graph_metrics
 
@@ -23,7 +23,7 @@ class VehicleMappingExperimentTests(unittest.TestCase):
     def experiment(self, detour=False, subgoal_radius=200.):
         torch.manual_seed(19)
         with contextlib.redirect_stdout(io.StringIO()):
-            env = Experiment(10021, VelocityActorCritic(), stochastic=False,
+            env = Experiment(10021, GraphAttentionActorCritic(), stochastic=False,
                 world_size=120., start=(15., 60.), scene=((100., 60.), [], 1),
                 reward_mode='velocity_mapping', mapping_route_origin='vehicle',
                 subgoal_radius=subgoal_radius, path_quality_weight=20., mapping_until_connected=True,

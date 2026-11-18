@@ -188,8 +188,13 @@ class ClaimTests(unittest.TestCase):
 
 class SceneAndConfigTests(unittest.TestCase):
     def test_v1_scenes_unchanged(self):
-        scene = json.dumps(generate_cograph_scene(62011), sort_keys=True).encode()
-        self.assertEqual(hashlib.sha256(scene).hexdigest(),
+        # The frozen v1 reference used 1.5 m clearance and predates the two
+        # explicit clearance fields in the scene manifest.
+        scene = generate_cograph_scene(62011, ground_safety_distance=1.5)
+        self.assertEqual(scene.pop('reference_geometric_clearance_m'), 1.5)
+        self.assertAlmostEqual(scene.pop('reference_clearance_m'), 1.5 + np.sqrt(.5))
+        payload = json.dumps(scene, sort_keys=True).encode()
+        self.assertEqual(hashlib.sha256(payload).hexdigest(),
                          '5cd6078244997556dda5957c8fb6ee64e6e2d5c3ed616a3ddb5e6e4d6d4b28ac')
 
     def test_single_task_scenes_are_covered_from_the_start(self):

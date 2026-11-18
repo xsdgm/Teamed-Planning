@@ -1,4 +1,4 @@
-"""v8: v7 cooperative policy plus age/hop-aware attention over relayed state evidence.
+"""Age/hop-aware relay attention with shared cooperative graph features.
 
 Tokens are this device's own relay cache (drone/communication.py): teammates and
 the vehicle, directly sensed or not, with the ORIGINAL measurement age and the
@@ -9,13 +9,13 @@ then scales the weights WITHOUT renormalising, so "everything is stale" shrinks
 the context instead of remaining a convex combination. Count/reliability
 summaries are exposed explicitly; an empty cache gives a zero context.
 
-One-hop geometry, the RNG backbone and the CBF are exactly v7's. Device IDs
+Device IDs
 only match tokens to currently sensed peers; they are never embedded.
 """
 import numpy as np
 import torch
 from torch import nn
-from drone.cooperative_mappo import (CooperativeActorCritic, CooperativeCriticEncoder, CooperativeEncoder,
+from drone.cooperative_mappo import (CooperativeCriticEncoder, CooperativeEncoder, encode_cooperative_graph,
     RAW_WIDTH as COOPERATIVE_WIDTH, ENCODED_WIDTH as COOPERATIVE_ENCODED)
 from drone.graph_attention_mappo import GraphAttentionActorCritic, MAX_FLEET, prefix_width
 
@@ -114,12 +114,12 @@ class RelayEncoder(CooperativeEncoder):
         tokens = x[..., COOPERATIVE_WIDTH:COOPERATIVE_WIDTH+RELAY_TOKENS*RELAY_FEATURES].reshape(
             *x.shape[:-1], RELAY_TOKENS, RELAY_FEATURES)
         valid = x[..., -RELAY_TOKENS:] > 0
-        # Same query as the v7 peer branch: own state/sensor/map encoding.
+        # Both attention branches query the local state, sensor and map encoding.
         context, stats = self.relay(cooperative[..., :prefix_width(2)+64], tokens, valid)
         return torch.cat((cooperative, context, stats), -1)
 
 
-class RelayActorCritic(CooperativeActorCritic):
+class RelayActorCritic(GraphAttentionActorCritic):
     policy_architecture = 'gat_relay_attention_v8'
 
     def __init__(self, global_features=10, input_version=2, relay_attention='full'):
@@ -127,7 +127,7 @@ class RelayActorCritic(CooperativeActorCritic):
             raise ValueError('v8 requires actor_input_version=2')
         if relay_attention not in MODES:
             raise ValueError(f'relay_attention must be one of {MODES}')
-        GraphAttentionActorCritic.__init__(self, global_features, input_version)
+        super().__init__(global_features, input_version)
         self.feature_version = 8
         self.relay_attention = relay_attention
         self.gat_actor = nn.Sequential(RelayEncoder(relay_attention), nn.Linear(ENCODED_WIDTH, 128), nn.Tanh(),
@@ -147,7 +147,7 @@ class RelayActorCritic(CooperativeActorCritic):
         return model
 
     def encode_graph(self, base, position, observation):
-        cooperative = super().encode_graph(base, position, observation)
+        cooperative = encode_cooperative_graph(base, position, observation, self.prefix)
         tokens = np.zeros((RELAY_TOKENS, RELAY_FEATURES), np.float32)
         valid = np.zeros(RELAY_TOKENS, np.float32)
         p = np.zeros(3)

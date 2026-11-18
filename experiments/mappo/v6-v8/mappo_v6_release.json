@@ -1,0 +1,44 @@
+{
+  "official_version": "v6",
+  "confirmed_date": "2026-10-27",
+  "historical_experiment_version": "v6.2-2",
+  "policy_architecture": "gat_map_v1",
+  "actor_input_version": 2,
+  "checkpoint_feature_version": 6,
+  "experiment_directory": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400",
+  "stage": 1,
+  "completed_episodes": 800,
+  "selected_continuation_checkpoint": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_final.pt",
+  "selection_status": "100-284m only; final provisionally recommended for map completion; safety tradeoff disclosed",
+  "evaluation_directory": "artifacts/v6-best-final-paired-20261027",
+  "checkpoints": {
+    "best": {
+      "episode": 288,
+      "path": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_best.pt",
+      "sha256": "59fbb30470b7c8e175d5b22919b24e83eb244dd842476ca9697df4741f3ad690",
+      "retained": false
+    },
+    "final": {
+      "episode": 800,
+      "path": "artifacts/mappo-v6.2-2-gat-stage1-20261026-150400/stage_01_final.pt",
+      "sha256": "3d546f955f8b2971181806b186bbcb9ea797a69faad27b53ae6d878ffc49a1b3",
+      "retained": true
+    }
+  },
+  "selection_report": "experiments/mappo/v6-v8/mappo_v6_paired_comparison_20261027.md",
+  "continuation_training_started": false,
+  "active_distance_range_m": [
+    100.0,
+    283.8083151964686
+  ],
+  "continuation_through_stage": 1,
+  "excluded_from_selection_distance_bands": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "archived_run_logs": "artifacts/mappo-early-through-v8-logs.tar.gz",
+  "historical_training_config": "src/teamed-planning/config/algorithm/mappo_training_v6.json",
+  "historical_curriculum_config": "src/teamed-planning/config/algorithm/mappo_distance_curriculum.json"
+}

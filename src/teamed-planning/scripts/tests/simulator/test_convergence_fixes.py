@@ -13,7 +13,7 @@ from drone.semantic_segmentation import TerrainType
 from drone.mappo import ActorCritic
 from ground.graph_fusion import GraphFusion
 from simulator.scenarios import generate_scene,scene_feasible
-from simulator.mappo_experiment import navigation_cost,update,Experiment
+from simulator.mappo_experiment import navigation_cost,Experiment
 from simulator.validate_ground_navigation import validate_scene
 
 
@@ -115,20 +115,6 @@ class ConvergenceTests(unittest.TestCase):
             np.testing.assert_array_equal(goal,again[0])
             self.assertTrue(all(np.linalg.norm(goal-p)>r+3.5 for p,r in circles))
 
-    def test_ppo_metrics_are_finite_and_update_parameters(self):
-        torch.manual_seed(42)
-        model=ActorCritic();rollout=[]
-        for i in range(4):
-            x=torch.randn(3,21,12);mask=torch.ones(3,21,dtype=torch.bool)
-            with torch.no_grad():
-                dist=model.distribution(x,mask);a=dist.sample();lp=dist.log_prob(a)
-            rollout.append((x.numpy(),mask.numpy(),a.numpy(),lp.numpy(),float(i)))
-        before=model.actor[0].weight.detach().clone()
-        loss,metrics=update(model,torch.optim.Adam(model.parameters(),lr=3e-4),rollout,return_metrics=True)
-        self.assertTrue(np.isfinite(loss))
-        self.assertTrue(all(np.isfinite(v) for v in metrics.values()))
-        self.assertFalse(torch.equal(before,model.actor[0].weight))
-        self.assertGreaterEqual(metrics['approx_kl'],0.)
 
     def test_packet_outage_is_distinct_from_geometric_connectivity(self):
         with contextlib.redirect_stdout(io.StringIO()):

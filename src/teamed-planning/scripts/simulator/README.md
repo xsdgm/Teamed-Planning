@@ -26,7 +26,7 @@ A kilometer-scale multi-robot forest simulation environment designed for reinfor
 
 ```
 scripts/
-├── simulator/                 # 39 runtime Python modules
+├── simulator/                 # runtime modules
 │   ├── env.py                 # Environment, collision checks and RelayChannel
 │   ├── robots.py              # Ground robot and drone dynamics
 │   ├── obstacles.py           # Obstacle definitions and forest generation
@@ -39,12 +39,11 @@ scripts/
 │   ├── mission_demo.py        # Cooperative forest navigation
 │   ├── km_scale_demo.py       # 10km scene demo
 │   └── ...                   # Specialized training, evaluation and data tools
-└── tests/simulator/           # All 54 simulator regression test modules
+└── tests/simulator/           # Simulator regression tests
 ```
 
 Tests live in [tests/simulator](../tests/simulator); runtime modules contain no
-test fixtures. The consolidation preserves training/evaluation entry points,
-checkpoint schemas and archived runtime sources.
+test fixtures. Frozen evaluation jobs use the archived source trees recorded in their manifests.
 
 | Former module | Current implementation |
 | --- | --- |

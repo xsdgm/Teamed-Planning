@@ -4,8 +4,8 @@
 #   start_mappo_training.sh [--workers N] [--output DIR] [--config FILE] [--python EXE] [--resume]
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-config="$root/src/teamed-planning/config/algorithm/mappo_training_1000m.json"
-output="artifacts/mappo-1000m-$(date +%Y%m%d)"
+config="$root/src/teamed-planning/config/algorithm/mappo_training_v9.json"
+output="artifacts/mappo-v9-$(date +%Y%m%d)"
 python="${CONDA_PREFIX:+$CONDA_PREFIX/bin/python}"
 workers=1
 resume=()

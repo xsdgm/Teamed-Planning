@@ -1,0 +1,25 @@
+{
+  "algorithm": "vtmp2",
+  "model_architecture": "terrain_dynamics_vtmp2",
+  "parameters": {
+    "terrain": "wildscenes_simplified",
+    "wildscenes_manifest": "world_model_vtmp2_km_scenes.json",
+    "train_distance_min": 100,
+    "train_distance_max": 1200,
+    "val_distance_min": 100,
+    "val_distance_max": 400,
+    "eval_distance_min": 1000,
+    "eval_distance_max": 1150,
+    "steps_per_reference_metre": 4,
+    "long_train_fraction": 0.25,
+    "train_scenes": 32,
+    "val_scenes": 8,
+    "workers": 6,
+    "max_steps": 12000,
+    "epochs": 100,
+    "device": "cpu",
+    "batch_size": 16,
+    "hidden": 24,
+    "members": 3
+  }
+}

@@ -187,9 +187,9 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(value['policy_architecture'], 'cograph_v1')
         with self.assertRaises(ValueError):
             validate_config(dict(json.loads(CONFIG.read_text()), target_count_range=[0, 8]))
-        v8 = json.loads((CONFIG.parent/'mappo_training_v8.json').read_text())
+        v9 = json.loads((CONFIG.parent/'mappo_training_v9.json').read_text())
         with self.assertRaises(ValueError):
-            validate_config(dict(v8, target_count_range=[2, 4]))
+            validate_config(dict(v9, target_count_range=[2, 4]))
 
     def test_short_episode_feeds_a_ppo_batch(self):
         value = config(steps=6, min_episode_steps=1, budget_extra=1)

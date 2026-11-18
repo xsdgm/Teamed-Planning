@@ -1,6 +1,6 @@
 """Train/evaluate MAPPO in the existing 2D physics, mapper and controller.
 
-Training entry point: simulator/train_mappo.py; validation: validate_mappo_2d.py
+Training entry point: simulator/train_mappo.py; validation: simulator/train_mappo.py and rescore_checkpoints.py
 No simulator full_state, velocity or obstacle list enters the learner/reward.
 A scalar feasible reference length normalizes legacy fixed-start route quality.
 V9 uses the current endpoints' straight-line lower bound, not an optimality
@@ -12,23 +12,21 @@ from pathlib import Path
 
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import torch
 from drone.drone_main import DroneController
 from drone.drone_navigator import DroneNavigator
-from drone.mappo import ActorCritic, CandidateNavigator
+from drone.mappo import CandidateNavigator
 from drone.velocity_mappo import VelocityNavigator
 from simulator.env import EnvConfig, MultiRobotEnv, RelayChannel
 from ground.ground_main import GroundRobotController
 from simulator.scenarios import generate_scene, ENVIRONMENT_VERSION
 from simulator.navigation_metrics import task_graph_metrics, RouteQualityTracker, vehicle_route_update
-from simulator.ppo_batch import clip_gradients
 from drone.communication import RelayManager
 from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 
 
 COMMUNICATION_RANGE_M = 95.
 FLIGHT_HEIGHT_M = 15.
-COOPERATIVE_ARCHITECTURES = ('gat_cooperative_v7', 'gat_relay_attention_v8', 'gat_survey_v10', 'gat_route_ab_v11')
+COOPERATIVE_ARCHITECTURES = ('gat_relay_attention_v8', 'gat_survey_v10', 'gat_route_ab_v11')
 RELAY_DEFAULTS = dict(relay_loss=0., relay_delay_jitter=0, relay_period=1, relay_capacity=16)
 # Compatibility alias; mapping, bridges and driving share one default.
 BRIDGE_CLEARANCE_M = DEFAULT_GROUND_CLEARANCE_M
@@ -69,21 +67,6 @@ def route_graph_reward(cost_before, cost_after, initial_cost, weight, time_penal
     """
     route=weight*float(cost_before-cost_after)/max(float(initial_cost),1e-8)
     return route-time_penalty, dict(route_reward=route, route_cost=float(cost_after))
-
-
-def velocity_task_reward(cost_before, cost_after, old_seen, seen, task_region,
-                         weight=.2, path_scale=100., time_penalty=.01):
-    """V3 dense map improvement plus newly delivered evidence in the task corridor.
-
-    The corridor is fixed from the episode start to the assigned goal. Revisits
-    and delivery outside that corridor earn no exploration reward. Safety and
-    terminal arrival terms are added by the existing shared execution path.
-    """
-    area = float(np.count_nonzero(seen & ~old_seen & task_region)*4.)
-    path = float(cost_before-cost_after)/path_scale
-    exploration = weight*area/400.
-    return path+exploration-time_penalty, dict(task_exploration_area=area,
-        task_exploration_reward=exploration, time_cost=float(time_penalty))
 
 
 def velocity_mapping_reward(cost_before, cost_after, initial_cost, old_seen, seen,
@@ -231,7 +214,7 @@ class SafetyTermination(RuntimeError):
 
 
 class Experiment:
-    def __init__(self, seed, model, algorithm='mappo', stochastic=False,
+    def __init__(self, seed, model, algorithm=None, stochastic=False,
                  drop=0.,
                  exploration_candidates=5, communication_mode='chain', safety_filter='cbf',
                  spacing_penalty_weight=0., intervention_weight=0., moving_ground=True,
@@ -248,7 +231,7 @@ class Experiment:
                  ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M, coordinated_safety=False):
         if type(num_drones) is not int or num_drones < 2:
             raise ValueError('At least two drones are required for the chain experiment')
-        if reward_mode not in ('cadmm_exploration','route_graph','vehicle_route','velocity_task','velocity_mapping'):
+        if reward_mode not in ('cadmm_exploration','velocity_mapping'):
             raise ValueError('Unsupported reward_mode')
         if mapping_route_origin not in ('initial', 'vehicle'):
             raise ValueError('mapping_route_origin must be initial or vehicle')
@@ -279,15 +262,15 @@ class Experiment:
         architecture = getattr(model, 'policy_architecture', None)
         cooperative = architecture in COOPERATIVE_ARCHITECTURES
         if cooperative != (communication_mode=='backbone'):
-            raise ValueError('v7/v8 cooperative models require backbone communication and vice versa')
+            raise ValueError('Cooperative models require backbone communication and vice versa')
         if cooperative and (drop!=0. or safety_filter!='cbf'):
-            raise ValueError('v7 backbone requires synchronous complete geometry and CBF')
+            raise ValueError('Backbone communication requires synchronous complete geometry and CBF')
         relay = dict(relay_loss=relay_loss,relay_delay_jitter=relay_delay_jitter,
                      relay_period=relay_period,relay_capacity=relay_capacity)
         # v8 delays/drops only relayed state evidence; one-hop geometry, maps
-        # and the CBF keep the v7 synchronous contract.
+        # and the CBF use synchronous neighbor geometry.
         self.relay_channel=(RelayChannel(seed,relay_loss,relay_delay_jitter,relay_period)
-                            if architecture in ('gat_relay_attention_v8','gat_survey_v10', 'gat_route_ab_v11') else None)
+                            if cooperative else None)
         if self.relay_channel is None and relay!=RELAY_DEFAULTS:
             raise ValueError('relay_* settings require the v8 relay attention policy')
         if type(relay_capacity) is not int or relay_capacity<1:
@@ -370,11 +353,11 @@ class Experiment:
                     max_speed=6., world_bounds=bounds)
             elif algorithm != 'cadmm_original':
                 c.navigator = CandidateNavigator(f'drone_{i}', total_drones=num_drones, comm_range=95.,
-                    min_separation=15., fov_radius=12., max_speed=6., model=model,
+                    min_separation=15., fov_radius=12., max_speed=6.,
                     exploration_candidates=exploration_candidates, world_bounds=bounds,
                     communication_mode=communication_mode,
                     chain_ground_range=chain_ground_range, chain_link_range=chain_link_range,
-                    algorithm=algorithm, deterministic=not stochastic)
+                    algorithm=algorithm or 'greedy')
             else:
                 c.navigator.fov_radius = 12.  # Same actual 24m sensor footprint.
             if self.relay_channel is not None:
@@ -409,7 +392,7 @@ class Experiment:
         initial_target=(self.subgoals.target if self.vehicle_route_mapping
                         and self.subgoals is not None else self.goal)
         self.reward_task_region = self.ledger.task_mask(self.start, initial_target)
-        self.algorithm = algorithm
+        self.algorithm = algorithm or ('mappo' if getattr(model, 'action_mode', None) == 'velocity' else 'greedy')
         self.trace = []
         self.first_graph_connection_step = -1
         self._graph_metric_source = None
@@ -640,22 +623,10 @@ class Experiment:
             self._route_cost=navigation_cost(self.ground_controller.unified_graph,self.start,self.goal)
             route_after=self._route_cost
             route_scale=self._initial_route_cost
-        route,route_terms=route_graph_reward(route_before,route_after,route_scale,
+        _,route_terms=route_graph_reward(route_before,route_after,route_scale,
             self.route_reward_weight,self.time_penalty)
         metrics.update(route_terms)
-        if self.reward_mode=='route_graph':
-            reward=route
-        elif self.reward_mode=='vehicle_route':
-            # v2's route reference (vehicle position, same position before and
-            # after this update; no exploration term) with route_graph scaling
-            # and time penalty.
-            reward=self.route_reward_weight*terms['cadmm_gain']/self._initial_route_cost-self.time_penalty
-        elif self.reward_mode=='velocity_task':
-            reward, focused_terms = velocity_task_reward(cost_before, cost_after, old_seen,
-                self.ledger.seen, self.reward_task_region, self.exploration_weight,
-                self.path_reward_scale, self.time_penalty)
-            metrics.update(focused_terms)
-        elif self.reward_mode=='velocity_mapping':
+        if self.reward_mode=='velocity_mapping':
             if self.vehicle_route_mapping:
                 metrics.update(vehicle_terms)
                 # Signed changes also charge a lost route. Reconnection/rebuilds
@@ -864,10 +835,9 @@ class Experiment:
         total['boundary_roundoff_count']=float(sum(t['boundary_roundoff_count'] for t in self.trace))
         for key in ('boundary_roundoff_max_m', 'boundary_violation_max_m'):
             total[key]=float(max((t[key] for t in self.trace), default=0.))
-        if self.reward_mode in ('velocity_task','velocity_mapping'):
+        if self.reward_mode=='velocity_mapping':
             for k in ('task_exploration_area', 'task_exploration_reward', 'time_cost'):
                 total[k] = float(sum(t[k] for t in self.trace))
-        if self.reward_mode=='velocity_mapping':
             total['mapping_reward']=float(sum(t['mapping_reward'] for t in self.trace))
             for key in ('path_quality_reward','first_path_quality_reward','path_shortening_reward',
                         'route_new_best_saving_m','frontier_progress_reward'):
@@ -944,71 +914,3 @@ class Experiment:
         if self.subgoals is not None:
             total.update(self.subgoals.stats())
         return total
-
-
-def update(model, optimizer, rollout, epochs=4, entropy_coef=.01, return_metrics=False,
-           discount=.99, gae_lambda=.95):
-    x = torch.tensor(np.array([s[0] for s in rollout]), dtype=torch.float32)
-    mask = torch.tensor(np.array([s[1] for s in rollout]), dtype=torch.bool)
-    actions = torch.tensor(np.array([s[2] for s in rollout]))
-    old_logp = torch.tensor(np.array([s[3] for s in rollout]), dtype=torch.float32)
-    rewards = torch.tensor([s[4] for s in rollout], dtype=torch.float32)
-    states = None
-    if model.global_features:
-        if len(rollout[0]) < 6:
-            raise ValueError('Rollout lacks the global critic state required by this model')
-        states = torch.tensor(np.array([s[5] for s in rollout]), dtype=torch.float32)
-    with torch.no_grad():
-        values = model.value(x, mask, states)
-        adv = torch.zeros_like(rewards)
-        last = torch.tensor(0.)
-        # Episodes end here: no cross-episode GAE or bootstrapping. A critic
-        # given the remaining budget treats budget exhaustion as a true terminal.
-        for t in reversed(range(len(rollout))):
-            next_v = values[t+1] if t+1 < len(rollout) else 0.
-            last = rewards[t] + discount*next_v - values[t] + discount*gae_lambda*last
-            adv[t] = last
-        returns = adv+values
-        adv = (adv-adv.mean())/adv.std(unbiased=False).clamp_min(1e-6)
-    gradient_norms=[]
-    for _ in range(epochs):
-        dist = model.distribution(x, mask)
-        ratio = (dist.log_prob(actions)-old_logp).exp()
-        actor_loss = -torch.minimum(ratio*adv[:,None], ratio.clamp(.8,1.2)*adv[:,None]).mean()
-        value_loss = (model.value(x, mask, states)-returns).square().mean()
-        loss = actor_loss + .5*value_loss - entropy_coef*dist.entropy().mean()
-        if not torch.isfinite(loss):
-            raise FloatingPointError('Non-finite PPO loss; training halted before optimizer update')
-        optimizer.zero_grad()
-        loss.backward()
-        gradient_norms.append(float(np.hypot(*clip_gradients(model))))
-        optimizer.step()
-    with torch.no_grad():
-        final_dist=model.distribution(x,mask)
-        log_ratio=final_dist.log_prob(actions)-old_logp
-        final_ratio=log_ratio.exp()
-        final_values=model.value(x,mask,states)
-        final_policy=-torch.minimum(final_ratio*adv[:,None],
-            final_ratio.clamp(.8,1.2)*adv[:,None]).mean()
-        counts=mask.sum(-1)
-        continuous = getattr(model, 'action_mode', None) == 'velocity'
-        active=torch.ones_like(counts, dtype=torch.bool) if continuous else counts>1
-        metrics=dict(policy_loss=float(final_policy),
-            value_loss=float((final_values-returns).square().mean()),
-            entropy=float(final_dist.entropy().mean()),
-            approx_kl=float(((final_ratio-1)-log_ratio).mean()),
-            clip_fraction=float(((final_ratio-1).abs()>.2).float().mean()),
-            explained_variance=float(1.-(returns-final_values).var(unbiased=False)/
-                                     returns.var(unbiased=False).clamp_min(1e-8)),
-            gradient_norm=float(np.mean(gradient_norms)),
-            return_mean=float(returns.mean()),return_std=float(returns.std(unbiased=False)),
-            return_min=float(returns.min()),return_max=float(returns.max()),
-            active_decision_fraction=float(active.float().mean()))
-        if continuous:
-            metrics['action_std'] = float(model.log_std.clamp(-5., 1.).exp().mean())
-        else:
-            metrics['normalized_entropy'] = float((final_dist.entropy()/counts.float().log().clamp_min(1e-8))[active].mean()) if active.any() else 0.
-    if not all(np.isfinite(value) for value in metrics.values()):
-        raise FloatingPointError('Non-finite PPO diagnostic; halt before checkpointing')
-    result=float(loss.detach())
-    return (result,metrics) if return_metrics else result

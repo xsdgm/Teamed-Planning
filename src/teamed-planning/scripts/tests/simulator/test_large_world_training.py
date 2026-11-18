@@ -12,7 +12,7 @@ import torch
 from drone.mappo import ActorCritic,GLOBAL_FEATURES
 from simulator.large_world_scenarios import generate_training_scene
 from simulator.mappo_experiment import SafetyTermination
-from simulator.train_mappo import fixed_schedule,run_episode,score_validation,validate_config
+from simulator.train_mappo import make_model,fixed_schedule,run_episode,score_validation,validate_config
 
 
 class LargeTrainingTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class LargeTrainingTests(unittest.TestCase):
         config=self.config();progress=[]
         torch.set_num_threads(1)
         with patch('simulator.train_mappo.generate_training_scene',return_value=self.scene()):
-            rollout,summary=run_episode(ActorCritic(),config,50001,
+            rollout,summary=run_episode(make_model(config),config,50001,
                 fixed_schedule(config,0),True,progress=progress.append)
         self.assertEqual(len(rollout),3)
         # Critic state: elapsed budget fraction, then remaining steps/1000.
@@ -65,10 +65,10 @@ class LargeTrainingTests(unittest.TestCase):
         torch.manual_seed(1)
         with patch('simulator.train_mappo.generate_training_scene',return_value=self.scene()), \
              patch.object(Experiment,'step',fail_second):
-            rollout,summary=run_episode(ActorCritic(),config,50001,fixed_schedule(config,0),True)
+            rollout,summary=run_episode(make_model(config),config,50001,fixed_schedule(config,0),True)
         self.assertEqual(calls,[0])
         self.assertEqual(len(rollout),2)
-        self.assertEqual(rollout[-1][4],-10.)
+        self.assertEqual(rollout[-1][4],-config['safety_failure_penalty'])
         self.assertEqual(len(rollout[-1][5]),GLOBAL_FEATURES)
         self.assertEqual(summary['safety_terminated'],1.)
         self.assertEqual(summary['episode_steps'],1)
@@ -87,26 +87,17 @@ class LargeTrainingTests(unittest.TestCase):
         torch.manual_seed(1)
         with patch('simulator.train_mappo.generate_training_scene',return_value=self.scene()), \
              patch.object(Experiment,'step',arrive_second):
-            rollout,summary=run_episode(ActorCritic(),config,50001,fixed_schedule(config,0),True)
+            rollout,summary=run_episode(make_model(config),config,50001,fixed_schedule(config,0),True)
         self.assertEqual(len(rollout),2)
         self.assertAlmostEqual(rollout[-1][4],rewards[-1]+100.)
         self.assertAlmostEqual(summary['reward'],sum(rewards)+100.)
         self.assertEqual((summary['goal_reached'],summary['budget_exhausted']),(1.,0.))
         self.assertEqual(summary['subgoals_selected'],1.)
 
-    def test_arrival_validation_ranks_vehicle_arrival(self):
-        common=dict(seed=1,sample=0,graph_task_path_ratio=1.,reward=0.,ground_collisions=0.,
-                    collisions=0.,chain_link_violation=0.,safety_terminated=0.,graph_first_connection_step=10.)
-        arrived=[dict(common,goal_reached=1.,graph_task_connected=0.,episode_steps=900)]
-        connected=[dict(common,goal_reached=0.,graph_task_connected=1.,episode_steps=4000)]
-        arrival=validate_config(dict(world_size=1000.,termination='arrival'))
-        graph=validate_config(dict(world_size=1000.))
-        self.assertGreater(score_validation(arrived,arrival)['score'],score_validation(connected,arrival)['score'])
-        self.assertLess(score_validation(arrived,graph)['score'],score_validation(connected,graph)['score'])
 
     def test_subgoal_and_arrival_options_are_validated(self):
-        for bad in (dict(world_size=1000.,termination='goal'),dict(termination='arrival'),
-                    dict(world_size=1000.,subgoal_radius=10.),dict(world_size=1000.,arrival_reward=-1.),
+        for bad in (dict(world_size=1000.,termination='goal'),dict(termination='map'),
+                    dict(world_size=1000.,subgoal_radius=-1.),dict(world_size=1000.,arrival_reward=-1.),
                     dict(world_size=1000.,init_checkpoint=3)):
             with self.assertRaises(ValueError):
                 validate_config(bad)
@@ -117,42 +108,7 @@ class LargeTrainingTests(unittest.TestCase):
         total=sum(route_graph_reward(a,b,4000.,10.,.01)[0] for a,b in zip(costs,costs[1:]))
         self.assertAlmostEqual(total,10.*(1-750./4000.)-.04)
 
-    def test_vehicle_route_reward_scales_v2_gain_and_charges_time(self):
-        from simulator.mappo_experiment import Experiment
-        torch.set_num_threads(1)
-        with contextlib.redirect_stdout(io.StringIO()):
-            env=Experiment(20000,ActorCritic(),reward_mode='vehicle_route',route_reward_weight=10.,time_penalty=.01,
-                           exploration_weight=.6)
-            for frame in range(8):
-                _,reward,metrics=env.step(frame)
-                self.assertAlmostEqual(reward,10.*metrics['cadmm_gain']/env._initial_route_cost-.01)
-            self.assertGreater(env.summary()['exploration_area'],0.)  # explored, but not rewarded
-            env.env.close()
 
-    def test_stationary_vehicle_map_episode_gets_route_scaled_success(self):
-        from simulator.mappo_experiment import Experiment
-        config=validate_config(dict(world_size=1000.,steps=6,initial_validation=False,reward_mode='route_graph',
-            ground_stationary=True,map_success_reward=10.,time_penalty=.01,map_stability_steps=2))
-        original=Experiment.step;rewards=[]
-        def connected_from_second(env,frame):
-            result=original(env,frame)
-            rewards.append(result[1])
-            env.trace[-1].update(graph_task_connected=float(frame>=1),graph_task_path_length=1000.)
-            return result
-        torch.manual_seed(1)
-        with patch('simulator.train_mappo.generate_training_scene',return_value=self.scene()), \
-             patch.object(Experiment,'step',connected_from_second):
-            rollout,summary=run_episode(ActorCritic(),config,50001,fixed_schedule(config,0),True)
-        self.assertEqual(len(rollout),3)
-        self.assertEqual(summary['map_completed'],1.)
-        self.assertLess(summary['ground_distance'],1e-6)
-        self.assertAlmostEqual(rollout[-1][4],rewards[-1]+10.*750./1000.)
-        self.assertAlmostEqual(summary['route_efficiency'],.75)
-        for bad in (dict(world_size=1000.,ground_stationary=True,termination='arrival'),
-                    dict(world_size=1000.,ground_stationary=True,subgoal_radius=200.),
-                    dict(world_size=1000.,reward_mode='other'),dict(world_size=1000.,time_penalty=-1.)):
-            with self.assertRaises(ValueError):
-                validate_config(bad)
 
     def test_large_config_rejects_tasks_that_cannot_fit(self):
         with self.assertRaises(ValueError):

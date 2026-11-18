@@ -15,7 +15,6 @@ import math
 import multiprocessing
 import os
 from pathlib import Path
-import shutil
 import sys
 import time
 
@@ -25,6 +24,8 @@ SOURCE = Path(__file__).resolve().parent
 if __package__ in (None, ''):
     sys.path.insert(0, str(SOURCE.parent))
     __package__ = 'world_model'
+
+from .hierarchical_sources import copy_source_files, package_python_files
 from .data import (ALGORITHM, CHECKPOINT_SHA, HORIZON, MISSION_ACTION_CONTRACT,
                   MISSION_SCHEMA_VERSION, atomic_json, build_environment, encode,
                   provenance, sha256)
@@ -236,8 +237,7 @@ def main():
     if not frozen:
         output.mkdir(exist_ok=False)
         snapshot.mkdir(parents=True)
-        for source in SOURCE.glob('*.py'):
-            shutil.copy2(source, snapshot/source.name)
+        copy_source_files(SOURCE, snapshot, package_python_files(SOURCE))
         args.output = output
         args.checkpoint = args.checkpoint.resolve() if args.checkpoint else None
         config = {key: str(value) if isinstance(value, Path) else value
@@ -249,7 +249,7 @@ def main():
     if SOURCE != snapshot:
         raise ValueError('Run config must execute from its own source snapshot')
     evidence = provenance()
-    evidence['world_model_sources'] = {path.name: sha256(path) for path in SOURCE.glob('*.py')}
+    evidence['world_model_sources'] = {str(rel): sha256(SOURCE / rel) for rel in package_python_files(SOURCE)}
     atomic_json(output/'provenance.json', evidence)
     atomic_json(output/'status.json', dict(stage='certifying', pid=os.getpid()))
     from .feasibility import generate_certified_scene

@@ -1,4 +1,4 @@
-"""V3 continuous velocity policy for fixed-height 2D simulation.
+"""Continuous velocity control and shared inputs for received-map policies.
 
 No candidate generation, frontier search or waypoint selection. The sampled
 action stored for PPO is a two-dimensional Gaussian latent. A fixed radial
@@ -7,14 +7,11 @@ Log probabilities and entropy refer to the latent policy, never CBF outputs.
 """
 import numpy as np
 import torch
-from torch import nn
-from torch.distributions import Independent, Normal
 from drone.communication import ChainState
 from drone.drone_navigator import DroneNavigator
-from drone.mappo import GLOBAL_FEATURES, legal_observation
+from drone.mappo import legal_observation
 
 SENSOR_SIZE = 12
-GRAPH_SIZE = 16
 GRAPH_RADIUS = 96.
 # Actor input versions. 1 (v3-v6): 32 state values and a sensor VALIDITY plane,
 # which is exactly 1 on every simulated step; with Adam those 144 identical
@@ -27,76 +24,10 @@ INPUT_VERSIONS = tuple(STATE_FEATURES)
 FLIGHT_HEIGHT = 15.
 
 
-def velocity_features(input_version=1):
-    return STATE_FEATURES[input_version] + 2*SENSOR_SIZE**2 + 2*GRAPH_SIZE**2
-
-
-def input_version_for_width(width, prefix=0):
-    """Actor input version from a first-layer width (minus any fixed suffix)."""
-    for version in INPUT_VERSIONS:
-        if width-prefix == velocity_features(version):
-            return version
-    raise ValueError(f'Unknown velocity actor input width {width}')
-
-
-VELOCITY_FEATURES = velocity_features(1)
-
-
-def _identity_value_statistics(module, state, prefix, *args):
-    # Checkpoints from before value normalization load as identity statistics.
-    state.setdefault(prefix+'value_mean', torch.zeros(()))
-    state.setdefault(prefix+'value_std', torch.ones(()))
-    state.setdefault(prefix+'value_moments', torch.zeros(3))
-
-
-class VelocityActorCritic(nn.Module):
-    action_mode = 'velocity'
-
-    def __init__(self, global_features=GLOBAL_FEATURES, input_version=1):
-        super().__init__()
-        self.global_features = int(global_features)
-        self.input_version = int(input_version)
-        width = velocity_features(self.input_version)
-        self.velocity_actor = nn.Sequential(nn.Linear(width, 128), nn.Tanh(),
-            nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, 2))
-        self.log_std = nn.Parameter(torch.full((2,), -.5))
-        self.critic = nn.Sequential(nn.Linear(width+self.global_features, 128),
-            nn.Tanh(), nn.Linear(128, 64), nn.Tanh(), nn.Linear(64, 1))
-        nn.init.orthogonal_(self.velocity_actor[-1].weight, gain=.01)
-        nn.init.zeros_(self.velocity_actor[-1].bias)
-        # PopArt: value = critic(s)*std + mean. Identity unless the trainer
-        # enables value normalization; moments are [weight, E[R], E[R虏]].
-        self.register_buffer('value_mean', torch.zeros(()))
-        self.register_buffer('value_std', torch.ones(()))
-        self.register_buffer('value_moments', torch.zeros(3))
-        self.register_load_state_dict_pre_hook(_identity_value_statistics)
-
-    @classmethod
-    def from_state_dict(cls, state):
-        version = input_version_for_width(state['velocity_actor.0.weight'].shape[1])
-        model = cls(state['critic.0.weight'].shape[1]-velocity_features(version), version)
-        model.load_state_dict(state)
-        return model
-
-    def distribution(self, x, mask=None):
-        return Independent(Normal(self.velocity_actor(x), self.log_std.clamp(-5., 1.).exp()), 1)
-
-    def critic_input(self, x, mask=None, state=None):
-        pooled = x.mean(-2)
-        if self.global_features:
-            if state is None:
-                raise ValueError('Velocity critic requires the centralized training state')
-            pooled = torch.cat((pooled, state), dim=-1)
-        return pooled
-
-    def value(self, x, mask=None, state=None):
-        return self.critic(self.critic_input(x, mask, state)).squeeze(-1)*self.value_std+self.value_mean
-
-    @staticmethod
-    def velocity(action, max_speed=6.):
-        # Smooth bijection R虏 -> open speed disk; zero also represents hold.
-        a = np.asarray(action, dtype=np.float64)
-        return max_speed*a/np.sqrt(1.+np.sum(a*a, axis=-1, keepdims=True))
+def bounded_velocity(action, max_speed=6.):
+    """Map a two-dimensional Gaussian action into the open speed disk."""
+    a = np.asarray(action, dtype=np.float64)
+    return max_speed*a/np.sqrt(1.+np.sum(a*a, axis=-1, keepdims=True))
 
 
 class VelocityNavigator(DroneNavigator):
@@ -201,21 +132,8 @@ class VelocityNavigator(DroneNavigator):
             valid = np.isfinite(raw) & (raw >= 0)
             sensor[0] = np.where(valid, np.clip(raw, 0., 1.), 0.)
             sensor[1] = valid if version == 1 else ~valid
-        spatial = np.zeros((2, GRAPH_SIZE, GRAPH_SIZE), np.float32)
-        graph = obs['graph']
-        if graph is not None:
-            for node, data in graph.graph.nodes(data=True):
-                xy = np.asarray(data['position'][:2])-p[:2]
-                cell = np.floor((xy+GRAPH_RADIUS)/(2*GRAPH_RADIUS)*GRAPH_SIZE).astype(int)
-                if np.all((cell >= 0) & (cell < GRAPH_SIZE)):
-                    x, y = cell
-                    spatial[0, y, x] += 1.
-                    spatial[1, y, x] += graph.node_confidence(node)
-            spatial[1] /= np.maximum(spatial[0], 1.)
-            spatial[0] = np.minimum(spatial[0]/8., 1.)
-        features = np.concatenate((state, sensor.ravel(), spatial.ravel()))
-        if hasattr(self.model, 'encode_graph'):
-            features = self.model.encode_graph(features, p, obs)
+        prefix = np.concatenate((state, sensor.ravel()))
+        features = self.model.encode_graph(prefix, p, obs)
         return features, np.ones(1, dtype=bool)
 
     def compute_velocity(self, position, observation):

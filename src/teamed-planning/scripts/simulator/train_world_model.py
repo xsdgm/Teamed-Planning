@@ -14,7 +14,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from world_model.models import ARCHITECTURES
+from world_model.models import architecture_matches
 
 PIPELINES = {'vtmp2': 'mission_pipeline.py', 'vtmp3': 'ab_pipeline.py'}
 
@@ -23,7 +23,7 @@ def build_command(config_path, overrides=(), algorithm=None):
     path = Path(config_path).resolve()
     config = json.loads(path.read_text())
     selected = config.get('algorithm')
-    if selected not in PIPELINES or config.get('model_architecture') != ARCHITECTURES[selected]:
+    if selected not in PIPELINES or not architecture_matches(selected, config.get('model_architecture')):
         raise ValueError('Configuration must declare a supported algorithm and matching model_architecture')
     if algorithm is not None and algorithm != selected:
         raise ValueError('--algorithm disagrees with the selected configuration')
@@ -42,10 +42,14 @@ def build_command(config_path, overrides=(), algorithm=None):
             continue
         if not isinstance(value, (str, int, float)):
             raise ValueError('Pipeline option values must be scalars')
-        if key in ('v11_config', 'wildscenes_manifest'):
+        if key in ('v11_config', 'wildscenes_manifest', 'source_root', 'data_manifest', 'v9_checkpoint', 'prepared_data'):
             value = str((path.parent/value).resolve())
         arguments.extend((option, str(value)))
-    return [sys.executable, '-I', '-B', str(SCRIPTS/'world_model'/PIPELINES[selected]),
+    pipeline = {'terrain_dynamics_vtmp2': 'decoupled_pipeline.py',
+                'semantic_completion_vtmp2': 'semantic_training.py',
+                'coarse_frontier_vtmp2': 'frontier_training.py',
+                'abstract_observation_vtmp2': 'abstract_training.py'}.get(config['model_architecture'], PIPELINES[selected])
+    return [sys.executable, '-I', '-B', str(SCRIPTS/'world_model'/pipeline),
             *arguments, *overrides]
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import fcntl
-import hashlib
 import json
 import multiprocessing
 import os
@@ -21,16 +20,12 @@ if __package__ in (None, ''):
     sys.path.insert(0, str(SOURCE.parent))
     __package__ = 'world_model'
 
-
-def write_json(path, value):
-    path = Path(path)
-    temporary = path.with_suffix(path.suffix+'.tmp')
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False)+'\n')
-    temporary.replace(path)
-
-
-def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+from .hierarchical_sources import (
+    atomic_json as write_json,
+    copy_source_files,
+    file_sha256 as digest,
+    package_python_files,
+)
 
 
 def screen(job):
@@ -94,7 +89,7 @@ def run(config):
             torch.cuda.empty_cache()
             from .data import provenance
             evidence = provenance()
-            evidence.update(source_files={p.name:digest(p) for p in sorted(SOURCE.glob('*.py'))},
+            evidence.update(source_files={str(rel):digest(SOURCE / rel) for rel in package_python_files(SOURCE)},
                             python=sys.executable, torch=torch.__version__, cuda=torch.version.cuda,
                             gpu=torch.cuda.get_device_name(0))
             write_json(output/'provenance.json', evidence)
@@ -176,8 +171,7 @@ def launch(args):
     output.mkdir(parents=True)
     snapshot=output/'runtime_sources/world_model'
     snapshot.mkdir(parents=True)
-    for source in SOURCE.glob('*.py'):
-        shutil.copy2(source, snapshot/source.name)
+    copy_source_files(SOURCE, snapshot, package_python_files(SOURCE))
     shutil.copy2(SOURCE/'requirements-gpu.txt', snapshot/'requirements-gpu.txt')
     config=dict(output=str(output), gpu_uuid=args.gpu_uuid, workers=args.workers,
         train_scenes=args.train_scenes, val_scenes=args.val_scenes, steps=args.steps,

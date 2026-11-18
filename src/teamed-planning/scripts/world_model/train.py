@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import random
+import sys
 import time
 
 import numpy as np
@@ -21,36 +22,21 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
-if __package__:
-    from .data import (ALGORITHM, CHANNELS, CHECKPOINT_SHA, FEATURES, HORIZON,
-                       MISSION_ACTION_CONTRACT, MISSION_SCHEMA_VERSION, SCHEMA_VERSION, SIDE)
-    from .model import Vtmp2WorldModel, imagine_sequence, sequence_loss
-    from .models import make_model
-else:
-    from data import (ALGORITHM, CHANNELS, CHECKPOINT_SHA, FEATURES, HORIZON,
-                      MISSION_ACTION_CONTRACT, MISSION_SCHEMA_VERSION, SCHEMA_VERSION, SIDE)
-    from model import Vtmp2WorldModel, imagine_sequence, sequence_loss
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = 'world_model'
+
+from .data import (ALGORITHM, CHANNELS, CHECKPOINT_SHA, FEATURES, HORIZON,
+                   MISSION_ACTION_CONTRACT, MISSION_SCHEMA_VERSION, SCHEMA_VERSION, SIDE)
+from .hierarchical_sources import atomic_json, file_sha256 as digest
+from .model import Vtmp2WorldModel, sequence_loss
+from .models import imagine_sequence, make_model, padded_window
 
 
 CHECKPOINT_FORMAT = 'vtmp2-world-model-training-v1'
 LEGACY_ACTION_CONTRACT = 'legacy_drive_v1'
 COMPLETION_EVENT_SEMANTICS = (
     'within_recorded_transition_drive_arrival_or_survey_evidence_not_eventual_ground_reachability')
-
-
-def digest(path):
-    result = hashlib.sha256()
-    with Path(path).open('rb') as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b''):
-            result.update(block)
-    return result.hexdigest()
-
-
-def atomic_json(path, value):
-    path = Path(path)
-    temporary = path.with_suffix(path.suffix + '.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + '\n')
-    temporary.replace(path)
 
 
 def atomic_checkpoint(path, value):
@@ -229,21 +215,7 @@ class EpisodeWindowDataset(Dataset):
     def __getitem__(self, index):
         episode_index, start = self.windows[index]
         episode = self.episodes[episode_index]
-        length = min(self.sequence_length, len(episode['actions']) - start)
-        result = {}
-        for key in ('maps', 'states'):
-            values = episode[key][start:start+length+1]
-            padded = np.repeat(values[-1:], self.sequence_length+1, axis=0)
-            padded[:length+1] = values
-            result[key] = padded
-        for key in ('actions', 'labels', 'elapsed'):
-            values = episode[key][start:start+length]
-            padded = np.zeros((self.sequence_length, *values.shape[1:]), np.float32)
-            padded[:length] = values
-            result[key] = padded
-        result['mask'] = np.r_[np.ones(length, np.float32),
-                               np.zeros(self.sequence_length-length, np.float32)]
-        return result
+        return padded_window(episode, start, self.sequence_length, ('actions', 'labels', 'elapsed'))
 
 
 def split_statistics(episodes):
@@ -446,8 +418,10 @@ def _train(dataset_dir, output, *, device, epochs, batch_size, sequence_length, 
     episodes, manifest = load_episodes(dataset_dir)
     datasets = {split: EpisodeWindowDataset(values, sequence_length) for split, values in episodes.items()}
     statistics = {split: split_statistics(values) for split, values in episodes.items()}
-    sources = {name: digest(Path(__file__).with_name(name))
-               for name in ('train.py', 'model.py', 'models.py', 'data.py', 'runtime.py', 'vtmp2.py')}
+    source_root = Path(__file__).resolve().parent
+    sources = {name: digest(source_root / name) for name in (
+        '__init__.py', 'train.py', 'models.py', 'rssm/model.py',
+        'rssm/data.py', 'rssm/runtime.py', 'rssm/vtmp2.py', 'hierarchical_sources.py')}
     config = dict(algorithm=ALGORITHM, schema_version=manifest['schema_version'], device=str(device),
                   action_contract=manifest['action_contract'],
                   observed_action_purposes=manifest['observed_action_purposes'],
@@ -462,8 +436,7 @@ def _train(dataset_dir, output, *, device, epochs, batch_size, sequence_length, 
     torch.manual_seed(seed)
     if device.type == 'cuda':
         torch.cuda.manual_seed_all(seed)
-    model = (make_model(dict(algorithm=ALGORITHM, hidden=hidden, latent=latent)) if __package__
-             else Vtmp2WorldModel(hidden=hidden, latent=latent)).to(device)
+    model = make_model(dict(algorithm=ALGORITHM, hidden=hidden, latent=latent)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=config['weight_decay'])
     first_epoch, global_step, best_loss, best_epoch, history = 1, 0, float('inf'), 0, []
     if resume:

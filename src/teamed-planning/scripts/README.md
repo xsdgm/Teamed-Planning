@@ -44,11 +44,11 @@ multi_robot_navigation/
 │   ├── skeleton_graph_builder.py    # Build topology from semantic maps
 │   ├── communication.py             # Chain state, local backbone, relay cache
 │   ├── cbf_safety.py                # Independent and synchronous joint CBF
-│   ├── mappo.py                     # Candidate policy and checkpoint dispatch
-│   ├── velocity_mappo.py            # Continuous-velocity policy
-│   ├── graph_attention_mappo.py     # Map graph attention
-│   ├── cooperative_mappo.py         # V7 cooperative policy
-│   ├── relay_attention_mappo.py     # V8/V9 relay attention
+│   ├── mappo.py                     # Checkpoint loading and candidate baselines
+│   ├── velocity_mappo.py            # Shared velocity encoding and control
+│   ├── graph_attention_mappo.py     # Shared map graph attention
+│   ├── cooperative_mappo.py         # Shared cooperative encoders and navigation
+│   ├── relay_attention_mappo.py     # Relay attention used by v9 and later policies
 │   ├── cograph_mappo.py             # CoGraph V1 multi-target policy
 │   ├── cograph_v2_mappo.py          # CoGraph V2 target selector
 │   ├── survey_mappo.py              # V10 survey and V11 fixed-route policies
@@ -69,6 +69,14 @@ multi_robot_navigation/
 │   ├── ros_ground_node.py           # ROS ground-controller entry point
 │   └── ros_gcs_node.py              # ROS ground-control station
 │
+├── simulator/                       # Simulation, map backends and experiment runners
+├── world_model/                     # Learned dynamics, hierarchical policies and training
+│   ├── navigation/                  # Navigation dynamics, policies, rollouts and safety
+│   ├── rssm/                        # Single-target recurrent model, data and planning
+│   ├── terrain/                     # Terrain prediction and decoupled planning models
+│   └── survey/                      # A/B survey environment, models and planning
+├── tests/                          # Tests grouped by their implementation package
+│   └── world_model/                # Includes test_hierarchical_*.py
 └── example_integration.py           # Integration example
 
 ```
@@ -110,6 +118,109 @@ The unused `GraphReceiver` export and controller instance are removed; actual
 reception statistics, fusion throttling, reset behavior and navigation are
 unchanged. The current candidate evaluator copies the merged modules, while
 archived evaluation modes keep their original dependency layout.
+
+### World-model and hierarchical training organization
+
+Hierarchical training and evaluation commands run from `world_model/`. The navigation models and rollout code live under `world_model/navigation/`. See the [world model directory guide](world_model/README.md).
+
+| Responsibility | Directory under `world_model/` | Modules |
+| --- | --- | --- |
+| Dynamics and received telemetry | `navigation/` | `graph_dynamics.py`, `residual_world.py`, `telemetry.py` |
+| Fast and slow policies | `navigation/` | `graph_fast_policy.py`, `hierarchical_policy.py`, `slow_policy.py`, `belief_actor.py` |
+| Hierarchical execution and planning inputs | `navigation/` | `hierarchical_runtime.py`, `planning_graph.py`, `navigation_evidence.py` |
+| Rollout collection | `navigation/` | `graph_rollouts.py`, `belief_rollouts.py` |
+| Local safety and its evidence | `navigation/` | `hierarchical_cbf.py`, `hierarchical_safety.py`, `safety_context.py` |
+| Navigation scenes and training schedule | `navigation/` | `scene_manifest.py`, `training_schedule.py` |
+| Single-target RSSM, mission collection and planning | `rssm/` | `model.py`, `data.py`, `mission.py`, `planner.py`, `runtime.py` |
+| Scene manifests and WildScenes validation | `navigation/` | `scene_manifest.py`, `wildscenes_runtime.py`, `wildscenes_tasks.py` |
+| Training commands | Package root | `train_hierarchical.py`, `train_slow_policy.py`, `train_joint_policy.py` |
+| Evaluation and archived runtime loading | Package root | `evaluate_safety_repairs.py`, `evaluate_slow_policy.py`, `evaluate_fixed_target.py`, `frozen_navigation.py` |
+
+New hierarchical runs copy the selected navigation modules directly into
+`runtime_sources/world_model/`. For example, the frozen copy of
+`navigation/graph_rollouts.py` is `runtime_sources/world_model/graph_rollouts.py`.
+Older runs can also use `runtime_sources/vtemp2/`. Checkpoints and evidence
+retain their historical `vtemp2` schema identifiers. Hierarchical regression tests live in
+`tests/world_model/test_hierarchical_*.py`.
+
+The main graph-based training entry point is
+`world_model/train_hierarchical.py`. `--fresh-all` initializes the fast policy,
+world model and slow policy from fresh constructors, with new optimizer state,
+zero training counters and empty replay. It loads no pretrained policy weights
+and uses no learned teacher. The archived simulator architecture remains a
+runtime dependency. The manifest records `training_mode=fresh_all_staged`,
+initial model hashes, the random seed, source hashes and each stage's optimizer
+targets.
+
+The three-stage schedule trains the world model throughout:
+
+| Stage | Tasks | Updates |
+| --- | --- | --- |
+| Short-distance `fast` | Rule-based UGV subgoals | World-model supervision and fast-policy PPO; slow policy fixed |
+| Long-distance `slow` | Learned UGV subgoals | World-model supervision and slow-policy PPO; fast policy fixed |
+| Long-distance `joint` | Learned UGV subgoals | World-model supervision and both policy PPO updates |
+
+There is no separate imitation warmup in this mode. Four, sixteen and eight
+16-episode batches give 64 short-distance tasks, 256 slow-stage tasks and 128
+joint-stage tasks. `--update-plan` embeds the prepared schedule in the run's
+configuration; the scene manifest fixes task identities and curriculum before
+launch. Checkpoints retain model, optimizer and random-generator state for
+later recovery, while per-update metrics and held-out evaluation remain separate.
+
+Example invocation from the repository root, using prepared input files:
+
+```bash
+python src/teamed-planning/scripts/world_model/train_hierarchical.py \
+  --repo . --output artifacts/hierarchical-fresh-all-new --fresh-all \
+  --scene-manifest /path/to/fresh_all_scenes.json \
+  --update-plan /path/to/fresh_all_schedule.json \
+  --warmup-updates 0 --fast-updates 4 --slow-updates 16 --joint-updates 8 \
+  --episodes-per-update 16 --workers 16 --device cpu \
+  --warmup-distances 100 200 --mission-distances 1000 1000 --eval-scenes 9
+```
+
+For a separate slow-only experiment, `--fresh-slow --graph-init CHECKPOINT
+--freeze-fast-world` transfers only fast/world weights and randomizes the slow
+policy with fresh optimizer state. That optional mode rejects inherited slow
+weights and fast/joint optimization stages; it is distinct from `--fresh-all`.
+
+For independent fast/world training, use `--fresh-fast-world` with zero warmup,
+slow and joint updates. It creates all models and optimizer state from scratch,
+trains only world supervision and fast PPO, and freezes the unused slow model.
+Both training and held-out validation use the geometry UGV subgoal selector;
+validation uses deterministic fast actions and never calls the slow policy.
+The manifest records `training_mode=fresh_fast_world` and the controller choices.
+Geometry/evaluation decisions are marked ineligible for slow PPO. This mode
+rejects weight initialization, resume/continuation, other fresh modes and random
+UGV selection. The existing three-stage mode still defaults to learned-slow
+validation; `--validation-slow-controller geometry` requests an explicit rule
+control comparison for other modes.
+
+An 800-task mixed-distance run uses 50 batches of 16, without claiming that this
+fixed budget guarantees convergence:
+
+```bash
+python src/teamed-planning/scripts/world_model/train_hierarchical.py \
+  --repo . --output artifacts/hierarchical-fresh-fast-world-new --fresh-fast-world \
+  --scene-manifest /path/to/fast_world_scenes.json \
+  --warmup-updates 0 --fast-updates 50 --slow-updates 0 --joint-updates 0 \
+  --episodes-per-update 16 --workers 16 --device cpu \
+  --warmup-distances 100 400 --mission-distances 100 400 \
+  --validation-slow-controller geometry --eval-scenes 9
+```
+
+Training task distance is independent of the execution subgoal scale: the
+existing approximately 67/133/200 m candidate rings and adaptive option duration
+remain in use. Longer missions exercise repeated local commitments.
+
+Run the relocated hierarchical regression suite with the project's Python
+environment:
+
+```bash
+python -B -m unittest discover \
+  -s src/teamed-planning/scripts/tests/world_model \
+  -p 'test_hierarchical_*.py'
+```
 
 ## Key Components
 

@@ -1,23 +1,15 @@
-"""GAT observation, topology, PPO, checkpoint and live-baseline regressions."""
-import copy,contextlib,io,json,sys,tempfile
+"""GAT observation, topology, PPO and checkpoint regressions."""
+import copy, sys
 from pathlib import Path
 import unittest
-from unittest.mock import patch
 import numpy as np
 import torch
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from common.graph_structure import TopologicalGraph
 from drone.mappo import ActorCritic,GLOBAL_FEATURES
-from drone.velocity_mappo import VelocityActorCritic
 from drone.graph_attention_mappo import (GraphAttentionActorCritic,GraphEncoder,encode_graph,
     PREFIX,MAX_NODES,NEIGHBORS,NODE_FEATURES,GAT_FEATURES)
 from simulator.ppo_batch import update_batch,update_value_statistics
-from simulator.train_mappo import train,validate_config,run_episode,fixed_schedule
-
-
-def config():
-    p=Path(__file__).resolve().parents[3]/'config/algorithm/mappo_training_v6_gat_surprise.json'
-    return validate_config(json.loads(p.read_text()))
 
 
 def graph(order=(0,1,2,3)):
@@ -29,7 +21,7 @@ def graph(order=(0,1,2,3)):
 
 
 def features(g=None):
-    base=np.zeros(832,np.float32);base[4]=.2;base[10]=1.
+    base=np.zeros(PREFIX,np.float32);base[4]=.2;base[10]=1.
     return encode_graph(base,(0.,0.,15.),dict(graph=g))
 
 
@@ -98,51 +90,6 @@ class GATTests(unittest.TestCase):
             x=torch.tensor(rollouts[0][0][0]);s=torch.zeros(GLOBAL_FEATURES)
             value=model.value(x,state=s).clone();update_value_statistics(model,torch.tensor([100.,200.,300.]))
             torch.testing.assert_close(value,model.value(x,state=s),atol=1e-4,rtol=1e-4)
-
-    def test_real_rollout_training_checkpoint_and_validation(self):
-        c=config();c.update(episodes=2,steps=5,validation_interval=2,snapshot_interval=2,
-                           validation_seeds=[60000],validation_samples=1,ppo_epochs=1,critic_epochs=1)
-        with tempfile.TemporaryDirectory() as directory,contextlib.redirect_stdout(io.StringIO()):
-            train(c,directory,workers=2)
-            p=Path(directory);saved=torch.load(p/'latest.pt',weights_only=True)
-            self.assertEqual(saved['feature_version'],4);self.assertEqual(saved['policy_architecture'],'gat_map_v1')
-            self.assertEqual(saved['surprise']['batches'],1)
-            rows=[json.loads(x) for x in (p/'training.jsonl').read_text().splitlines()]
-            for r in rows:self.assertAlmostEqual(r['reward']+r['surprise_reward'],r['training_reward'],places=5)
-            v=json.loads((p/'validation.jsonl').read_text().splitlines()[-1])
-            self.assertNotIn('surprise_reward',v['means'])
-            model=ActorCritic.from_state_dict(saved['model'])
-            episode,_=run_episode(model,c,50000,fixed_schedule(c,0),True)
-            self.assertEqual(episode[0][0].shape,(3,GAT_FEATURES))
-            train(c,directory,resume=True,workers=2)
-
-    def test_existing_v6_mlp_encoding_matches_frozen_running_sources(self):
-        import importlib.util
-        frozen=Path(__file__).resolve().parents[5]/'artifacts/mappo-v6-stage1-20261026-120411/stage_01/sources/drone/velocity_mappo.py'
-        if not frozen.exists():self.skipTest('Original v6 source snapshot is not on this host')
-        # The archived policy retains its old import path. Supply the archived
-        # dependency only while loading it; leave the current package untouched.
-        chain_spec=importlib.util.spec_from_file_location('frozen_chain_v6',frozen.with_name('chain_state.py'))
-        old_chain=importlib.util.module_from_spec(chain_spec);chain_spec.loader.exec_module(old_chain)
-        spec=importlib.util.spec_from_file_location('frozen_velocity_v6',frozen)
-        old=importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules,{'drone.chain_state':old_chain}):
-            spec.loader.exec_module(old)
-        from drone.velocity_mappo import VelocityNavigator
-        model=VelocityActorCritic()
-        kwargs=dict(drone_id='drone_0',total_drones=3,model=model)
-        before=old.VelocityNavigator(**kwargs);after=VelocityNavigator(**kwargs)
-        obs=dict(graph=graph(),time=1.,ground_robots={},nearby_drones={},neighbor_waypoints={},
-                 occupancy_map=np.zeros((12,12)),sensor_valid=True)
-        a,_=before.encode((0.,0.,15.),obs);b,_=after.encode((0.,0.,15.),obs)
-        np.testing.assert_array_equal(a,b)
-        rebuilt=ActorCritic.from_state_dict(model.state_dict())
-        with torch.no_grad():torch.testing.assert_close(model.distribution(torch.tensor(a)).mean,
-                                                       rebuilt.distribution(torch.tensor(b)).mean,rtol=0,atol=0)
-
-    def test_invalid_architecture_is_rejected(self):
-        with self.assertRaises(ValueError):validate_config(dict(config(),policy_architecture='unknown'))
-        with self.assertRaises(ValueError):validate_config(dict(config(),rollout_mode='asynchronous'))
 
 
 if __name__=='__main__':unittest.main()

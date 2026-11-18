@@ -1,0 +1,33 @@
+{
+  "updates": 100,
+  "episodes_per_update": 4,
+  "workers": 2,
+  "rollout_steps": 6000,
+  "evaluation_episodes": 4,
+  "evaluation_interval": 5,
+  "seed": 15112026,
+  "world_size": 2000.0,
+  "learning_rate": 0.0003,
+  "epochs": 4,
+  "gae_lambda": 0.95,
+  "hierarchy": {
+    "radius": 200.0,
+    "arrival": 25.0,
+    "option_steps": 80,
+    "hold_steps": 10,
+    "minimum_steps": 4,
+    "evidence_interval": 10,
+    "gamma": 0.999,
+    "time_cost": 0.02,
+    "collision_cost": 10.0,
+    "success_reward": 100.0,
+    "safety_failure_cost": 100.0,
+    "budget_failure_cost": 20.0,
+    "potential_scale": 200.0
+  },
+  "curriculum": [
+    {"start_update": 0, "distance": [150.0, 300.0]},
+    {"start_update": 20, "distance": [300.0, 700.0]},
+    {"start_update": 60, "distance": [800.0, 1200.0]}
+  ]
+}

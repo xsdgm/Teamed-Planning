@@ -26,8 +26,9 @@ from simulator.large_world_scenarios import generate_training_scene
 from world_model.ab_environment import (
     ACTION_CONTRACT, ALGORITHM, SurveyNavigationEnv, MappingConfig, ProxyMapper,
 )
+from world_model.hierarchical_sources import file_sha256
 from world_model.ab_planner import ModelPlanner, bootstrap_select
-from world_model.ab_training import atomic_json, load_model, train
+from world_model.ab_model import atomic_json, train
 
 
 def scene_for(seed, config):
@@ -109,17 +110,17 @@ def freeze_sources(output, args):
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(contents)
             digest = hashlib.sha256(contents).hexdigest()
-            if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
+            if file_sha256(source) != digest:
                 raise RuntimeError(f'Source changed while freezing: {relative}')
             manifest[str(relative)] = digest
     source_config = Path(args.v11_config).resolve()
     shutil.copyfile(source_config, output/'v11_2_config.json')
-    manifest['v11_2_config.json'] = hashlib.sha256((output/'v11_2_config.json').read_bytes()).hexdigest()
+    manifest['v11_2_config.json'] = file_sha256(output/'v11_2_config.json')
     if args.wildscenes_manifest:
         from world_model.ab_wildscenes import freeze_manifest
         frozen = freeze_manifest(args.wildscenes_manifest, output/'wildscenes_inputs')
         for item in frozen.parent.glob('*.json'):
-            manifest[str(item.relative_to(output))] = hashlib.sha256(item.read_bytes()).hexdigest()
+            manifest[str(item.relative_to(output))] = file_sha256(item)
     atomic_json(output/'source_manifest.json', manifest)
     return sources/'world_model/ab_pipeline.py'
 
@@ -165,7 +166,7 @@ def run(args):
         action='[ax, ay, bx, by] / 1000; width fixed to v11-2 config',
         scene_truth_in_policy=False))
     (output/'data').mkdir(); (output/'scenes').mkdir()
-    manifest_hash = hashlib.sha256((output/'source_manifest.json').read_bytes()).hexdigest()
+    manifest_hash = file_sha256(output/'source_manifest.json')
     summaries, scenes = [], {}
     seeds = {'train': list(range(args.train_seed, args.train_seed+args.train_scenes)),
              'val': list(range(args.val_seed, args.val_seed+args.val_scenes)),
