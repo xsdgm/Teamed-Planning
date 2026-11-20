@@ -71,7 +71,7 @@ class SurveyActorCritic(RelayActorCritic):
 
     def __init__(self, global_features=10, input_version=2, relay_attention='full'):
         super().__init__(global_features, input_version, relay_attention)
-        # Feature version 10 already belongs to the CoGraph v2 target selector.
+        # Feature version 11 is part of the saved survey checkpoint contract.
         self.feature_version = 11
         self.register_buffer('survey_schema', torch.tensor(1))
         self.gat_actor = nn.Sequential(

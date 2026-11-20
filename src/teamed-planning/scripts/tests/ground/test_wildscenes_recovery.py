@@ -131,16 +131,16 @@ class RecoveryTests(unittest.TestCase):
         env.close()
 
     def test_final_approach_reacquires_goal_despite_failure_penalties(self):
-        manager = SubgoalManager((100., 100.), stall=10.)
-        manager.update((0., 100.), None, 0.)
-        # Recreate a historical state that was already chasing a detour.
-        manager.target=np.array([180.,100.]);manager.final=False
-        manager.failures=[(manager.goal.copy(),11.)]
-        target, changed = manager.update((90., 100.), None, 12.)
+        manager = SubgoalManager((300., 100.), stall=10.)
+        initial, _ = manager.update((0., 100.), None, 0.)
+        detour, _ = manager.update((0., 100.), None, 11.)
+        self.assertFalse(np.allclose(initial, detour))
+        self.assertEqual(manager.failed, 1)
+        target, changed = manager.update((290., 100.), None, 12.)
         self.assertTrue(changed)
         np.testing.assert_allclose(target, manager.goal)
         for time in (13., 30., 100., 1000.):
-            target, _ = manager.update((90., 100.), None, time)
+            target, _ = manager.update((290., 100.), None, time)
             np.testing.assert_allclose(target, manager.goal)
         self.assertTrue(manager.final)
         self.assertEqual(manager.arrivals, 0)  # 10m remaining is NOT success.

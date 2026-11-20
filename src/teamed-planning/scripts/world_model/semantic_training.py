@@ -18,7 +18,7 @@ from scipy.ndimage import distance_transform_edt
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from .hierarchical_sources import copy_source_files
+from .hierarchical_sources import atomic_checkpoint, copy_source_files
 from .semantic_data import (CHANNELS, CLASSES, CLASS_NAMES, FORMAT, NATIVE_IDS, atomic_json, augment_patch,
     crop_patch, encode_observation, load_scene, observation_mask, patch_coordinates, prepare_sequence, sha256)
 from .semantic_model import (ARCHITECTURE, CHECKPOINT_FORMAT, SCHEMA_VERSION,
@@ -153,9 +153,7 @@ def evaluate(model, loader, device, prior, resolution, *, baselines=False):
 
 
 def save_checkpoint(path, document):
-    temp = Path(path).with_suffix('.tmp')
-    torch.save(document, temp)
-    temp.replace(path)
+    return atomic_checkpoint(path, document)
 
 
 def train(data_manifest, output, *, epochs=100, side=128, samples_per_epoch=1024,

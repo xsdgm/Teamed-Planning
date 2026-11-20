@@ -15,7 +15,7 @@ import uuid
 
 SOURCE = Path(__file__).resolve().parent
 sys.path.insert(0, str(SOURCE.parent))
-from world_model.hierarchical_sources import atomic_json as write_json, source_files, source_package
+from world_model.hierarchical_sources import atomic_json as write_json, source_paths, source_package
 from world_model.scene_manifest import file_sha256
 
 READY = 'verified_kilometer_tasks_available'
@@ -50,7 +50,7 @@ def validate_assets(plan):
             raise WorkflowBlocked(key + ' must be an absolute path')
     source = Path(plan['source_dir'])
     expected = plan['source_sha256']
-    files = {path.name: path for path in source_files(source)}
+    files = source_paths(source)
     required = (REQUIRED_SOURCES - {'train_hierarchical.py'}) | {
         'train_graph.py' if source_package(source) == 'vtemp2' else 'train_hierarchical.py'}
     if not isinstance(expected, dict) or files.keys() != expected.keys() or not required <= files.keys():

@@ -13,7 +13,7 @@ for group in list(root.findall("group")):
     if namespace.startswith("iris_") and int(namespace.split("_")[-1]) >= count:
         root.remove(group)
 
-if os.environ.get("PLANNING_MODE") == "v9-vtemp":
+if os.environ.get("PLANNING_MODE") in ("v9-vtemp1", "v9-vtemp"):
     # Translate intact tree models to extend the original forest along X.
     # Keep their physical scale and provide the trained fleet's 18 m spacing.
     px4 = Path(source).parents[1]

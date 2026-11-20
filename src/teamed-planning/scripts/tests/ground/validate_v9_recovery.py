@@ -29,11 +29,15 @@ def main():
     parser.add_argument('--case',action='append',required=True)
     parser.add_argument('--max-steps',type=int)
     parser.add_argument('--clearance',type=float,default=1.)
+    parser.add_argument('--subgoal-review-interval',type=float,default=None,
+                        help='Time between direction reviews in simulation seconds (default: 15)')
     parser.add_argument('--disable-joint-recovery',action='store_true')
     parser.add_argument('--terminal-step',type=int,
                         help='Restart at an archived 1-based trace step with fresh maps; NOT a full-task replay')
     parser.add_argument('--frozen',action='store_true',help=argparse.SUPPRESS)
     args=parser.parse_args()
+    if args.subgoal_review_interval is not None and not 0 < args.subgoal_review_interval < math.inf:
+        parser.error('--subgoal-review-interval must be a positive finite duration')
     stop_signals=[]
     for number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(number, lambda signum, frame: stop_signals.append(signum))
@@ -50,6 +54,7 @@ def main():
     import torch
     from simulator import mappo_experiment as me
     from simulator import train_mappo as tm
+    from ground.subgoal_manager import DEFAULT_REVIEW_INTERVAL_S
     from simulator import validate_wildscenes_vtemp as common
     from simulator.validate_wildscenes_legacy import native_runtime, legacy_summary, BEST576_SHA256
     from simulator import wildscenes_legacy_scene as adapter
@@ -65,8 +70,11 @@ def main():
     torch.set_num_threads(1)
     source_hashes={str(p.relative_to(scripts)):hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in sorted(scripts.rglob('*.py'))}
-    write_json(args.output/'manifest.json',dict(protocol='v9_repaired_navigation_review_v1',
+    review_interval = (DEFAULT_REVIEW_INTERVAL_S if args.subgoal_review_interval is None
+                       else args.subgoal_review_interval)
+    write_json(args.output/'manifest.json',dict(protocol='v9_directional_navigation_review_v2', strategy='vtemp1',
         policy='v9 best576, frozen weights, no training',checkpoint=str(weight),
+        subgoal_review_interval_s=review_interval,
         checkpoint_sha256=weight_hash,cases=args.case,clearance_m=args.clearance,
         ground_navigation_resolution_m=.1,ground_sensor_width_m=8.,
         terminal_restart_step=args.terminal_step,
@@ -90,7 +98,7 @@ def main():
         model=tm.ActorCritic.from_state_dict(checkpoint['model']).eval()
         schedule=tm.fixed_schedule(config,config['episodes']-1)
         options=common.experiment_options(config,schedule,scene.world_size_m,case)
-        options.update(ground_safety_distance=args.clearance,
+        options.update(ground_safety_distance=args.clearance, subgoal_review_interval=review_interval,
                        coordinated_safety=not args.disable_joint_recovery)
         budget=max(600,math.ceil(3.*case['reference_length_m']+240))
         if args.max_steps is not None:
@@ -138,7 +146,7 @@ def main():
                         local_progress_position=controller._local_progress_position,
                         failed_connections=controller._failed_local_connections,
                         subgoal_selected=env.subgoals.selected, subgoal_failed=env.subgoals.failed,
-                        subgoal_best=env.subgoals._best, subgoal_since=env.subgoals._since)
+                        subgoal_reviews=env.subgoals.reviews)
                     encode=lambda value: value.tolist() if hasattr(value,'tolist') else float(value)
                     steps_log.write(json.dumps(step_record,default=encode)+'\n')
                     if frame%100==0:

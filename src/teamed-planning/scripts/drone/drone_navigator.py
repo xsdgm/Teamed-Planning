@@ -681,11 +681,7 @@ class DroneNavigator:
             'segment_start':      self.segment_start_position,
         }
 
-    def get_current_waypoint_index(self) -> int:
-        return self.waypoints_reached
 
-    def get_total_waypoints(self) -> int:
-        return len(self._planned_path)
 
     def reset(self):
         self.phase                  = NavigationPhase.DISCOVERING

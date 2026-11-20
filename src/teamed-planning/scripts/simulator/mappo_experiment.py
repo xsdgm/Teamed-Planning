@@ -18,6 +18,7 @@ from drone.mappo import CandidateNavigator
 from drone.velocity_mappo import VelocityNavigator
 from simulator.env import EnvConfig, MultiRobotEnv, RelayChannel
 from ground.ground_main import GroundRobotController
+from ground.subgoal_manager import DEFAULT_REVIEW_INTERVAL_S
 from simulator.scenarios import generate_scene, ENVIRONMENT_VERSION
 from simulator.navigation_metrics import task_graph_metrics, RouteQualityTracker, vehicle_route_update
 from drone.communication import RelayManager
@@ -228,7 +229,8 @@ class Experiment:
                  cbf_margin_weight=0.,cbf_margin_scale=8.,frontier_progress_weight=0.,
                  relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,
                  fusion_bridge_distance=0., mapping_route_origin='initial',
-                 ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M, coordinated_safety=False):
+                 ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M, coordinated_safety=False,
+                 subgoal_review_interval=DEFAULT_REVIEW_INTERVAL_S, guidance_strategy='vtemp1'):
         if type(num_drones) is not int or num_drones < 2:
             raise ValueError('At least two drones are required for the chain experiment')
         if reward_mode not in ('cadmm_exploration','velocity_mapping'):
@@ -357,7 +359,7 @@ class Experiment:
                     exploration_candidates=exploration_candidates, world_bounds=bounds,
                     communication_mode=communication_mode,
                     chain_ground_range=chain_ground_range, chain_link_range=chain_link_range,
-                    algorithm=algorithm or 'greedy')
+                    algorithm=algorithm or 'cadmm_controlled')
             else:
                 c.navigator.fov_radius = 12.  # Same actual 24m sensor footprint.
             if self.relay_channel is not None:
@@ -367,12 +369,12 @@ class Experiment:
             c.graph_builder.world_bounds = bounds
             c.ground_max_speed=ground_speed if moving_ground and not ground_stationary else 0.
         self.obs = self.env.reset()
-        # With relay subgoals the vehicle drives to, and broadcasts, the subgoal.
+        # Both the ground planner and the aircraft receive the current direction.
         self.ground_controller=GroundRobotController('ground_0',resolution=2.,
             perception_range=8.,max_linear_vel=ground_speed,max_angular_vel=1.,
             fusion_interval=5.,safety_distance=self.ground_safety_distance,subgoal_radius=subgoal_radius,
-            subgoal_arrival=subgoal_arrival,
-            world_bounds=bounds)
+            subgoal_arrival=subgoal_arrival, subgoal_review_interval=subgoal_review_interval,
+            world_bounds=bounds, guidance_strategy=guidance_strategy)
         self.ground_controller.set_goal(tuple(self.goal))
         # The vehicle only originates its own state/task evidence; it does not forward.
         self.ground_relay=(RelayManager(self.ground_controller.robot_id, capacity=relay_capacity)
@@ -392,7 +394,7 @@ class Experiment:
         initial_target=(self.subgoals.target if self.vehicle_route_mapping
                         and self.subgoals is not None else self.goal)
         self.reward_task_region = self.ledger.task_mask(self.start, initial_target)
-        self.algorithm = algorithm or ('mappo' if getattr(model, 'action_mode', None) == 'velocity' else 'greedy')
+        self.algorithm = algorithm or ('mappo' if getattr(model, 'action_mode', None) == 'velocity' else 'cadmm_controlled')
         self.trace = []
         self.first_graph_connection_step = -1
         self._graph_metric_source = None

@@ -190,23 +190,6 @@ class SemanticProcessor:
 
         return (world_x, world_y)
     
-    def compute_traversability_map(self, semantic_map: np.ndarray) -> np.ndarray:
-        """
-        Convert semantic map to traversability cost map.
-        
-        Args:
-            semantic_map: 2D array of terrain types
-            
-        Returns:
-            2D array of traversability costs
-        """
-        traversability_map = np.zeros_like(semantic_map, dtype=float)
-        
-        for terrain_type in TerrainType:
-            mask = semantic_map == terrain_type.value
-            traversability_map[mask] = self.get_traversability_cost(terrain_type)
-
-        return traversability_map
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -141,14 +141,13 @@ src/
 │   │   │   ├── local_planner.py  # Local perception and obstacle avoidance
 │   │   │   ├── graph_fusion.py   # Merge graphs from multiple drones
 │   │   │   ├── observed_grid.py  # Observed route memory and escape geometry
-│   │   │   ├── subgoal_manager.py # Rolling relay subgoals
-│   │   │   ├── task_planner.py   # Coverage, travel costs and vehicle claims
-│   │   │   ├── vehicle_motion.py # Link keeping and vehicle avoidance
+│   │   │   ├── subgoal_manager.py # vtemp1 directional lookahead guidance
+│   │   │   ├── vtemp.py          # Original vtemp rolling200 waypoints
 │   │   │   ├── ros_ground_node.py
 │   │   │   └── ros_gcs_node.py
 │   │   ├── common/
 │   │   │   ├── graph_structure.py   # TopologicalGraph (NetworkX + KD-tree)
-│   │   │   └── message_definitions.py
+│   │   │   └── timing.py
 │   │   └── simulator/           # Pure-Python sim (no ROS needed)
 │   └── urdf/
 │       └── ground_robot_sim.urdf  # Diff-drive + 32-line LiDAR for Gazebo
@@ -315,9 +314,9 @@ Config is split into three layers so real-world tuning does not break simulation
 | **Real hardware** | `config/real/` | Field IPs, sensors, SLAM |
 
 See the [algorithm configuration index](src/teamed-planning/config/algorithm/README.md)
-for MAPPO v9 through v11.2, CoGraph and world-model training presets.
-Browse the [experiment index](experiments/README.md) for MAPPO, CoGraph, ground navigation and world-model reports.
-The [historical MAPPO experiment index](experiments/mappo/mappo_early_through_v8.md) links the reports, archived logs and three retained checkpoints through v8.
+for MAPPO v9 through v11.2 and world-model training presets.
+Browse the [experiment index](experiments/README.md) for MAPPO, historical CoGraph, ground navigation and world-model reports.
+The [historical MAPPO experiment index](experiments/mappo/mappo_early_through_v8.md) links the reports, archived logs and weight retention notes through v8.
 
 ### `config/algorithm/drone.yaml` (shared)
 ```yaml

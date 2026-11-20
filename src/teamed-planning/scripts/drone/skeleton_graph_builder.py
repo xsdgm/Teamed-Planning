@@ -4,9 +4,8 @@ Builds sparse, safe graphs for forest environments using medial axis (skeleton)
 """
 
 import numpy as np
-from typing import Dict, List, Tuple, Optional
-from scipy import ndimage
-from skimage.morphology import skeletonize, medial_axis
+from typing import Dict, List, Tuple
+from skimage.morphology import skeletonize
 from scipy.ndimage import distance_transform_edt
 import time
 import sys
@@ -352,40 +351,10 @@ class SkeletonGraphBuilder:
         # This removes skeleton pixels too close to obstacles
         skeleton = skeleton & (distance_map >= self.min_clearance_pixels)
         
-        # Clean up skeleton: remove isolated pixels and small branches MORE AGGRESSIVELY
-        # Preserve endpoints: peeling every endpoint also erases useful corridors.
+        # Preserve endpoints rather than pruning useful corridor branches.
         
         return skeleton, distance_map
     
-    def _clean_skeleton(self, skeleton: np.ndarray, min_branch_length: int = 10) -> np.ndarray:
-        """
-        Clean skeleton by removing short branches and isolated pixels.
-        
-        Args:
-            skeleton: Binary skeleton image
-            min_branch_length: Minimum branch length in pixels
-            
-        Returns:
-            Cleaned skeleton
-        """
-        # Remove isolated pixels (pixels with <2 neighbors)
-        cleaned = skeleton.copy()
-        
-        # Simple pruning: iteratively remove endpoints of short branches
-        for _ in range(min_branch_length):
-            # Find endpoints (pixels with exactly 1 neighbor)
-            neighbors = ndimage.convolve(cleaned.astype(int), 
-                                        np.ones((3, 3)), 
-                                        mode='constant')
-            endpoints = (cleaned) & (neighbors == 2)  # 1 neighbor + self = 2
-            
-            if np.sum(endpoints) == 0:
-                break
-            
-            # Remove endpoints
-            cleaned[endpoints] = False
-        
-        return cleaned
     
     def _sample_nodes_on_skeleton(self, skeleton: np.ndarray,
                                    distance_map: np.ndarray,
@@ -510,20 +479,6 @@ class SkeletonGraphBuilder:
             self._refresh_visible_edges(graph, semantic_map,
                 dict(coverage_bounds=bounds, map_shape=semantic_map.shape))
     
-    def _add_edges_incremental(self, graph: TopologicalGraph,
-                               new_nodes: List[Tuple[str, Tuple[float, float]]],
-                               semantic_map: np.ndarray,
-                               semantic_data: Dict):
-        """
-        Add edges for newly added nodes (incremental update).
-        
-        Args:
-            graph: TopologicalGraph to add edges to
-            new_nodes: List of (node_id, world_position) tuples
-            semantic_map: Semantic segmentation map
-            semantic_data: Processed semantic data
-        """
-        self._refresh_visible_edges(graph, semantic_map, semantic_data)
     
     def _is_path_traversable(self, semantic_map: np.ndarray,
                             start_pixel: Tuple[int, int],

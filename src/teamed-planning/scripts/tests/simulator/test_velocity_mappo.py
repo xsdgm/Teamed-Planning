@@ -54,6 +54,7 @@ class VelocityTests(unittest.TestCase):
 
     def test_neighbor_pool_is_permutation_invariant(self):
         nav = VelocityNavigator('drone_1', model=GraphAttentionActorCritic(), total_drones=4)
+        nav.cbf_margin_source = lambda: None
         peers = {'drone_0':dict(position=[10.,10.,15.]),
                  'drone_2':dict(position=[40.,10.,15.]),
                  'drone_3':dict(position=[60.,10.,15.])}
@@ -64,6 +65,7 @@ class VelocityTests(unittest.TestCase):
     def test_observation_uses_received_information_only(self):
         model = GraphAttentionActorCritic()
         nav = VelocityNavigator('drone_0', model=model, total_drones=3)
+        nav.cbf_margin_source = lambda: None
         obs = dict(time=0., occupancy_map=np.zeros((12,12)), sensor_valid=True,
                    ground_robots={'g':dict(position=[10.,10.,0.],target=[100.,10.])})
         a, _ = nav.encode([20.,10.,15.], obs)

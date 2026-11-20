@@ -1,5 +1,7 @@
 # 世界模型导航算法
 
+本目录保存实验说明与结果记录。训练、场景生成和回放工具放在 [scripts](../../src/teamed-planning/scripts/) 中；VTemp4 的工具位于 [simulator](../../src/teamed-planning/scripts/simulator/)。
+
 vtmp2 与 vtmp3 的世界模型实现统一放在 [world_model](../../src/teamed-planning/scripts/world_model/) 下，使用统一训练入口并通过配置选择架构。当前 vtmp2 默认训练原版 WildScenes 的粗区域边界外推模型，不启动仿真。已有精细语义模型、二值二维原型、旧 RSSM 与 vtmp3 的既有数据和权重契约仍保留。
 
 **2026-11-13 后续要求：**vtmp2 改为真实森林数据集离线训练语义地形补全模型，接入完整系统后只在 Docker 三维仿真验证，不再返回二维模拟器采样、训练或评估。接口适配与已知差距见 [vtmp2 训练与部署要求](vtmp2/README.md)。下文二维入口保留用于历史复现，尚不是新部署链路。

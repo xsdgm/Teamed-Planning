@@ -2,7 +2,7 @@
 
 Run with the existing teamedplanning-2d Python. Only the new return regressor
 is fitted. Candidate experiments branch from identical complete snapshots;
-after the injected decision they continue with the original VTemp manager.
+after the injected decision they continue with the original vtemp manager.
 This is a finite-horizon decision experiment, not a full-mission benchmark.
 """
 from __future__ import annotations
@@ -12,6 +12,9 @@ import contextlib
 import copy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import inspect
+import importlib
+import importlib.abc
+import importlib.util
 import json
 import multiprocessing
 import os
@@ -30,7 +33,7 @@ from world_model.hierarchical_sources import (
     file_sha256 as digest,
     runtime_source,
     snapshot_sources,
-    source_files,
+    source_paths,
     source_hashes as hierarchical_source_hashes,
 )
 from world_model.navigation_evidence import EvidenceGrid, FEATURE_NAMES, ReturnModel, candidates, features, select
@@ -40,6 +43,38 @@ V9_RUN=Path('artifacts/mappo-v9-mixed100to400-no-subgoal-800ep-20261105-153146')
 V9_FAST_REWARD_CONTRACT='uav_remaining_route_mapping_v9'
 PROTOCOL='vtemp2_frozen_v9_single_decision_pilot_v1'
 _RUNTIME=None
+
+
+def _is_navigation_extension(package, name):
+    if name.startswith(('vtemp4_', 'train_vtemp4', 'evaluate_vtemp4')):
+        return package in {'ground', 'simulator'}
+    if package == 'ground':
+        return name in {'ground_policy', 'survey_fleet_clearance'}
+    if package == 'simulator':
+        return name in {'ground_evidence', 'ground_relay', 'survey_fleet_drive',
+                        'survey_fleet_metrics', 'survey_fleet_observation', 'survey_fleet_phase',
+                        'survey_fleet_runtime', 'survey_km_maps', 'survey_pretrain_env',
+                        'survey_pretrain_maps', 'survey_pretrain_policy', 'train_survey_fleet',
+                        'train_survey_pretrain', 'evaluate_survey_fleet'}
+    return False
+
+
+class _NavigationExtensionFinder(importlib.abc.MetaPathFinder):
+    """Resolve navigation experiment extensions outside the archived runtime."""
+    def __init__(self, extension_root, sources):
+        self.extension_root=extension_root
+        self.sources=sources
+
+    def find_spec(self, fullname, path=None, target=None):
+        parts=fullname.split('.')
+        if len(parts)!=2 or not _is_navigation_extension(parts[0],parts[1]):
+            return None
+        if (self.sources/parts[0]/(parts[1]+'.py')).is_file():
+            return None
+        candidate=self.extension_root/parts[0]/(parts[1]+'.py')
+        if candidate.is_file():
+            return importlib.util.spec_from_file_location(fullname,candidate)
+        return None
 
 
 def write_json(path, data):
@@ -56,14 +91,33 @@ def runtime(repo, *, random_init=False):
         return _RUNTIME
     run=Path(repo).resolve()/V9_RUN
     sources=run/'runtime_sources'
+    extension_root=SOURCE.parent
     for name,module in list(sys.modules.items()):
-        if name.split('.')[0] in {'ground','drone','common','simulator'}:
+        parts=name.split('.')
+        if parts[0] in {'ground','drone','common','simulator'}:
             location=getattr(module,'__file__',None)
             if location and not Path(location).resolve().is_relative_to(sources):
+                # Navigation experiments live beside the frozen core. Allow
+                # only their own modules and the two lightweight package roots;
+                # all actual v9 core modules must still come from the archive.
+                extension=(parts[0] in {'ground','simulator'} and
+                           (len(parts)==1 or (len(parts)==2 and
+                            _is_navigation_extension(parts[0],parts[1]))) and
+                           Path(location).resolve().is_relative_to(extension_root/parts[0]))
+                if extension:
+                    continue
                 raise RuntimeError(f'Mutable runtime already imported: {name}')
     if not random_init and digest(run/'best.pt')!=CHECKPOINT_SHA:
         raise RuntimeError('Frozen v9 checkpoint digest differs')
     sys.path.insert(0,str(sources))
+    # A vtemp4 import may have loaded these package objects already. Restrict
+    # ordinary package lookup to the archive; the finder permits only the
+    # navigation extensions to come from the experiment source tree.
+    for name in ('ground', 'simulator'):
+        package=importlib.import_module(name)
+        package.__path__[:]=[str(sources/name)]
+    sys.meta_path[:]=[finder for finder in sys.meta_path if not isinstance(finder,_NavigationExtensionFinder)]
+    sys.meta_path.insert(0,_NavigationExtensionFinder(extension_root,sources))
     import torch
     from simulator import mappo_experiment as me
     from simulator import train_mappo as tm
@@ -310,7 +364,7 @@ def fit_and_report(output):
                 physical_rollouts=sum(len(q['rollouts']) for r in rows for q in r['candidates']),
                 target_delivery_count=sum(v['target_heard'] for r in rows for q in r['candidates'] for v in q['rollouts']),
                 safety_terminations=sum(v['termination']=='cbf_infeasible' for r in rows for q in r['candidates'] for v in q['rollouts']),
-                scope=['Single slow decision after identical warmup; original VTemp continuation.',
+                scope=['Single slow decision after identical warmup; original vtemp continuation.',
                        'Five predeclared ring candidates, not all 72 candidates.',
                        'Finite-horizon discounted final-goal progress and execution costs; no terminal-value bootstrap.',
                        'Only arrived evidence audit pixels plus ground local sensor reach the slow evaluator.',
@@ -338,8 +392,9 @@ def main():
             raise ValueError('Output already contains files; choose a new output or --resume')
         snapshot=runtime_source(output) if args.resume else output/'runtime_sources/world_model'
         if args.resume:
-            for p in source_files(SOURCE):
-                if not (snapshot/p.name).exists() or digest(p)!=digest(snapshot/p.name):
+            frozen_paths = source_paths(snapshot)
+            for name, path in source_paths(SOURCE).items():
+                if name not in frozen_paths or digest(path)!=digest(frozen_paths[name]):
                     raise ValueError('Source changed; resume would mix different implementations')
         else:
             snapshot_sources(SOURCE,snapshot)
@@ -356,7 +411,7 @@ def main():
                   warmup=args.warmup,horizon=args.horizon,features=FEATURE_NAMES,
                   reward='sum gamma^i * ((distance_to_G_before-distance_to_G_after)/10 - .01 - 10*collisions + 100*mission_arrival); CBF failure -100',
                   discount=.995,stochastic=True,mappo_retrained=False,
-                  experiment='paired snapshot candidate rollouts; fixed original-VTemp continuation',
+                  experiment='paired snapshot candidate rollouts; fixed vtemp continuation',
                   received_evidence_contract='Simulation-only slow receiver extension using actually arrived evidence_audit packets. No hidden map or live fleet truth input. ROS deployment needs equivalent packets.')
     if manifest['checkpoint_sha256']!=CHECKPOINT_SHA:raise ValueError('Checkpoint mismatch')
     if args.resume and json.loads((output/'manifest.json').read_text())!=manifest:

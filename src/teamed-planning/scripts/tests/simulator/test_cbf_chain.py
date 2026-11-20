@@ -10,7 +10,7 @@ import torch
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from drone.cbf_safety import CBFSafetyFilter
 from drone.communication import ChainState
-from drone.mappo import ActorCritic,CandidateNavigator
+from drone.mappo import CandidateNavigator
 from drone.drone_main import DroneController
 from simulator.mappo_experiment import Experiment
 
@@ -107,7 +107,7 @@ class SafetyTests(unittest.TestCase):
                 positions+=np.asarray(commands)
 
     def test_nonadjacent_peer_is_not_required(self):
-        nav=CandidateNavigator('drone_2',total_drones=3,communication_mode='chain',algorithm='greedy',comm_range=95.)
+        nav=CandidateNavigator('drone_2',total_drones=3,communication_mode='chain',algorithm='cadmm_controlled',comm_range=95.)
         obs=dict(time=1.,nearby_drones={'drone_1':dict(position=[40.,60.,15.])},
             ground_robots={'g':dict(position=[15.,60.,0.],target=[110.,60.],direct=False,source_time=1.)})
         _,mask,_,_=nav.encode((60.,60.,15.),obs)
@@ -116,7 +116,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_chain_slack_masks_lengthening_links_beyond_the_slack_range(self):
         def link_ends(position,link_range):
-            nav=CandidateNavigator('drone_2',total_drones=3,communication_mode='chain',algorithm='greedy',
+            nav=CandidateNavigator('drone_2',total_drones=3,communication_mode='chain',algorithm='cadmm_controlled',
                 comm_range=95.,exploration_candidates=8,chain_link_range=link_range)
             obs=dict(time=1.,nearby_drones={'drone_1':dict(position=[400.,500.,15.])},
                 ground_robots={'g':dict(position=[330.,500.,0.],target=[700.,500.],direct=False,source_time=1.)})
@@ -153,7 +153,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_hold_command_is_not_zeroed_after_cbf(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            env=Experiment(20000,ActorCritic(),communication_mode='chain',safety_filter='cbf')
+            env=Experiment(20000,None,communication_mode='chain',safety_filter='cbf')
             env.env.drones[1].position=np.array([24.,56.94,15.])
             env.obs=env.env._get_observations()
             for c in env.controllers:
@@ -169,7 +169,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_evidence_reaches_ground_through_received_peer(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            env=Experiment(20000,ActorCritic(),communication_mode='chain',safety_filter='cbf')
+            env=Experiment(20000,None,communication_mode='chain',safety_filter='cbf')
             for drone,p in zip(env.env.drones,([40,60,15],[105,60,15],[110,110,15])):
                 drone.position=np.array(p,float)
             env.obs=env.env._get_observations()

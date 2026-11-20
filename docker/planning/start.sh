@@ -11,9 +11,9 @@ if [[ ! -s "$MODEL_PATH" ]]; then
     exit 1
 fi
 args=(num_drones:=3 seg_model_path:="$MODEL_PATH")
-if [[ "${PLANNING_MODE:-default}" == "v9-vtemp" ]]; then
+if [[ "${PLANNING_MODE:-default}" == "v9-vtemp1" || "${PLANNING_MODE:-default}" == "v9-vtemp" ]]; then
     checkpoint=/opt/v9-checkpoint/best.pt
     echo "7ac3aedcc3876902773b2241f60e839eb3e3b5630ddeb3c8be660421f2c24198  $checkpoint" | sha256sum -c -
-    args+=(sitl_v9_checkpoint:="$checkpoint")
+    args+=(sitl_v9_checkpoint:="$checkpoint" guidance_strategy:="${PLANNING_MODE#v9-}")
 fi
 exec roslaunch teamed_planning multi_robot_xtdrone.launch "${args[@]}"

@@ -112,6 +112,7 @@ class LegacyRuntimeTests(unittest.TestCase):
             self.runner.main()
         report = json.loads((output / "results.json").read_text())
         self.assertEqual(prepared["signature"], report["signature"])
+        self.assertEqual(report["provenance"]["settings"]["strategy"], "vtemp")
         self.assertEqual(report["provenance"]["settings"]["ground_safety_distance"], 1.)
         self.assertEqual(report["records"][0]["summary"]["planning_clearances"]["bridge_clearance_m"], 1.)
         with mock.patch.object(sys, "argv", arguments + ["--resume", "--ground-safety-distance", "1.5"]):

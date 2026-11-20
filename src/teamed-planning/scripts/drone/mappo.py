@@ -1,8 +1,5 @@
-"""Shared candidate actor and legal-observation centralized critic (CPU capable)."""
+"""Supported checkpoint loading and controlled C-ADMM candidate navigation."""
 import numpy as np
-import torch
-from torch import nn
-from torch.distributions import Categorical
 from drone.drone_navigator import DroneNavigator, NavigationPhase
 from drone.communication import ChainState
 
@@ -21,7 +18,7 @@ def legal_observation(obs):
     """
     return dict(graph=obs.get('graph'), time=float(obs.get('time', 0)),
                 ground_robots={str(k): {f: v[f] for f in
-                    ('position', 'target', 'planned_path', 'source_time', 'direct', 'targets', 'survey') if f in v}
+                    ('position', 'target', 'planned_path', 'source_time', 'direct', 'survey') if f in v}
                     for k, v in obs.get('ground_robots', {}).items()},
                 nearby_drones={str(k): {'position': v['position']}
                     for k, v in obs.get('nearby_drones', {}).items()
@@ -30,65 +27,31 @@ def legal_observation(obs):
                     obs.get('neighbor_waypoints', {}).items() if v is not None})
 
 
-class ActorCritic(nn.Module):
-    def __init__(self, global_features=0):
-        super().__init__()
-        self.global_features = int(global_features)
-        self.actor = nn.Sequential(nn.Linear(FEATURES, 64), nn.Tanh(),
-                                   nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 1))
-        # Mean pooling is invariant to fleet order/size. The optional global
-        # state is used only for training targets, never for acting.
-        self.critic = nn.Sequential(nn.Linear(FEATURES+self.global_features, 64), nn.Tanh(),
-                                    nn.Linear(64, 1))
-
+class ActorCritic:
+    """Factory for supported MAPPO checkpoint architectures."""
     @classmethod
     def from_state_dict(cls, state):
-        """Rebuild with the critic width stored in the weights (older checkpoints: 0)."""
+        """Load a retained V9 or later policy from its architecture markers."""
         if 'route_ab_schema' in state:
             from drone.survey_mappo import RouteABActorCritic
             return RouteABActorCritic.from_state_dict(state)
         if 'survey_schema' in state:
             from drone.survey_mappo import SurveyActorCritic
             return SurveyActorCritic.from_state_dict(state)
-        if 'selector.prior.weight' in state:
-            from drone.cograph_v2_mappo import CoGraphV2ActorCritic
-            return CoGraphV2ActorCritic.from_state_dict(state)
-        if 'gat_actor.0.targets.query.weight' in state:
-            from drone.cograph_mappo import CoGraphActorCritic
-            return CoGraphActorCritic.from_state_dict(state)
         if 'gat_actor.0.relay.mode' in state:
             from drone.relay_attention_mappo import RelayActorCritic
             return RelayActorCritic.from_state_dict(state)
-        if 'gat_actor.1.weight' in state:
-            from drone.graph_attention_mappo import GraphAttentionActorCritic
-            return GraphAttentionActorCritic.from_state_dict(state)
-        if 'actor.0.weight' not in state:
-            raise ValueError('Unrecognized MAPPO checkpoint architecture')
-        model = cls(global_features=state['critic.0.weight'].shape[1]-FEATURES)
-        model.load_state_dict(state)
-        return model
-
-    def distribution(self, x, mask):
-        return Categorical(logits=self.actor(x).squeeze(-1).masked_fill(~mask, -1e9))
-
-    def value(self, x, mask, state=None):
-        pooled = (x * mask[..., None]).sum(-2) / mask.sum(-1, keepdim=True).clamp_min(1)
-        pooled = pooled.mean(-2)
-        if self.global_features:
-            if state is None:
-                raise ValueError('This critic requires the global training state')
-            pooled = torch.cat([pooled, state], -1)
-        return self.critic(pooled).squeeze(-1)
+        raise ValueError('Unrecognized or unsupported MAPPO checkpoint architecture')
 
 
 class CandidateNavigator(DroneNavigator):
-    """Controlled greedy and C-ADMM baselines share candidate generation and screening.
+    """Controlled C-ADMM with candidate generation and screening.
 
     First experiment uses direct upload, not an inferred relay chain. Swept
     separation uses received previous proposals and a bounded one-second motion.
     Missing expected neighbors forces hold, rather than assuming connectivity.
     """
-    def __init__(self, *args, algorithm='greedy', max_speed=6., decision_dt=1.,
+    def __init__(self, *args, algorithm='cadmm_controlled', max_speed=6., decision_dt=1.,
                  exploration_candidates=0, world_bounds=None,
                  communication_mode=None, fleet_ids=None,
                  chain_ground_range=None, chain_link_range=None, **kwargs):
@@ -100,7 +63,7 @@ class CandidateNavigator(DroneNavigator):
         self.exploration_candidates = int(exploration_candidates)
         self.world_bounds = world_bounds
         self.communication_mode=communication_mode or 'direct'
-        if algorithm not in ('greedy', 'cadmm_controlled'):
+        if algorithm != 'cadmm_controlled':
             raise ValueError(f'Unknown candidate planning algorithm: {algorithm}')
         if not 0 <= self.exploration_candidates <= 20:
             raise ValueError('exploration_candidates must be between 0 and 20')
@@ -211,18 +174,14 @@ class CandidateNavigator(DroneNavigator):
         x, mask, candidates, obs = self.encode(current_position, observation_data)
         if mask.sum() == 1:
             self.fallbacks += 1
-        if self.algorithm == 'cadmm_controlled':
-            valid = [w for i, w in enumerate(candidates) if mask[i]]
-            target = self._admm_select(valid, obs['graph'], self.ground_robot_position,
-                self.ground_robot_target, obs['neighbor_waypoints'],
-                {k: tuple(v['position']) for k,v in obs['nearby_drones'].items()}, current_position,
-                fixed_candidates=True
-                ) if mask.sum() > 1 and obs['graph'] is not None else candidates[0]
-            index = min((i for i in range(len(candidates)) if mask[i]),
-                        key=lambda i: np.linalg.norm(np.asarray(candidates[i])-target))
-        else:
-            scores = (1-x[:,6]) - .2*x[:,2] - .1*x[:,5] - .2*x[:,9]
-            index = int(np.where(mask, scores, -1e9).argmax())
+        valid = [w for i, w in enumerate(candidates) if mask[i]]
+        target = self._admm_select(valid, obs['graph'], self.ground_robot_position,
+            self.ground_robot_target, obs['neighbor_waypoints'],
+            {k: tuple(v['position']) for k, v in obs['nearby_drones'].items()}, current_position,
+            fixed_candidates=True
+            ) if mask.sum() > 1 and obs['graph'] is not None else candidates[0]
+        index = min((i for i in range(len(candidates)) if mask[i]),
+                    key=lambda i: np.linalg.norm(np.asarray(candidates[i])-target))
         self.last_sample = (x, mask, index, 0.)
         self._current_target = tuple(candidates[index])
         if self.communication_mode=='chain' and self._recovery_target is not None:

@@ -1,17 +1,24 @@
+"""Ground robot control and planning module.
+
+Load public classes on demand so importing an experimental policy does not
+preload mutable navigation code before a frozen runtime is selected.
 """
-Ground robot control and planning module
-"""
+from importlib import import_module
 
-from .ground_main import GroundRobotController
-from .graph_fusion import GraphFusion
-from .global_planner import GlobalPlanner
-from .local_planner import LocalPerception, LocalPlanner
+_EXPORTS = {
+    'GroundRobotController': ('.ground_main', 'GroundRobotController'),
+    'LocalPerception': ('.local_planner', 'LocalPerception'),
+    'GraphFusion': ('.graph_fusion', 'GraphFusion'),
+    'GlobalPlanner': ('.global_planner', 'GlobalPlanner'),
+    'LocalPlanner': ('.local_planner', 'LocalPlanner'),
+}
+__all__ = list(_EXPORTS)
 
-__all__ = [
-    'GroundRobotController',
-    'LocalPerception',
-    'GraphFusion',
-    'GlobalPlanner',
-    'LocalPlanner'
-]
 
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+    module, attribute = _EXPORTS[name]
+    value = getattr(import_module(module, __name__), attribute)
+    globals()[name] = value
+    return value

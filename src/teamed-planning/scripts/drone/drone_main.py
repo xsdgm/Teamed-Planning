@@ -82,7 +82,7 @@ class DroneController:
         # v8 relay cache (drone/communication.py); the transport layer supplies
         # delivered envelopes as observation['relay_envelopes'].
         self.relay=None
-        # CoGraph: several vehicles are separate backbone nodes, keyed by robot_id.
+        # Multiple vehicles are separate backbone nodes, keyed by robot_id.
         self.multi_vehicle=False
         # Initialize modules
         self.semantic_processor = SemanticProcessor(resolution=resolution)
@@ -104,7 +104,7 @@ class DroneController:
             comm_range=communication_range,
         )
         if navigation_algorithm != 'cadmm':
-            if navigation_algorithm not in ('greedy', 'cadmm_controlled'):
+            if navigation_algorithm != 'cadmm_controlled':
                 raise ValueError(f'Unknown navigation algorithm: {navigation_algorithm}')
             from drone.mappo import CandidateNavigator
             self.navigator = CandidateNavigator(
@@ -213,9 +213,6 @@ class DroneController:
                             'direct': True,
                             'broadcast': broadcast_msg
                         }
-                        if broadcast_msg.get('targets') is not None:
-                            # CoGraph mission: every task target and this vehicle's route status.
-                            ground_robots[robot_id]['targets'] = broadcast_msg['targets']
                         if broadcast_msg.get('survey') is not None:
                             # Survey endpoints are independent of the real vehicle position.
                             # Forward them with the received mission, never simulator truth.

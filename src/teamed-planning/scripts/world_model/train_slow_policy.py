@@ -27,15 +27,25 @@ SOURCE=Path(__file__).resolve().parent
 sys.path.insert(0,str(SOURCE.parent))
 import numpy as np
 import torch
-from world_model.hierarchical_runtime import HierarchicalEpisode,HierarchyConfig,SLOW_FEATURES,MAX_CANDIDATES,SCHEMA
+from world_model.hierarchical_runtime import (HierarchicalEpisode, HierarchyConfig, SLOW_FEATURES,
+    MAX_CANDIDATES, SCHEMA as LEGACY_SCHEMA)
 from world_model.slow_policy import SlowActorCritic,update
 from world_model.scene_manifest import make_scene
-from world_model.graph_fast_policy import numpy_state as worker_state
-from world_model.frozen_navigation import CHECKPOINT_SHA,digest,write_json
-from world_model.hierarchical_sources import (source_files, source_hashes as hierarchical_source_hashes,
-    snapshot_sources, runtime_source)
+from world_model.frozen_navigation import CHECKPOINT_SHA,digest,runtime,write_json
+from world_model.hierarchical_sources import (atomic_checkpoint as _atomic_checkpoint, source_paths, source_hashes as hierarchical_source_hashes,
+    runtime_source, snapshot_sources)
 
 FORMAT='vtemp2_hierarchical_ppo_v1'
+GROUND_V1_SCHEMA = 'vtemp2_ground_gat_relay_v1'
+SCHEMA = 'vtemp2_ground_survey_inputs_v2'
+GROUND_SCHEMAS = (GROUND_V1_SCHEMA, SCHEMA)
+SLOW_SOURCES = {
+    '__init__.py', 'frozen_navigation.py', 'hierarchical_cbf.py', 'hierarchical_runtime.py',
+    'ground_evidence.py', 'ground_policy.py', 'ground_relay.py',
+    'hierarchical_safety.py', 'hierarchical_sources.py', 'navigation_evidence.py',
+    'partial_observation.py', 'scene_manifest.py', 'slow_policy.py',
+    'train_slow_policy.py', 'training_schedule.py', 'wildscenes_runtime.py',
+}
 DEFAULTS=dict(updates=100,episodes_per_update=4,workers=2,rollout_steps=6000,
               evaluation_episodes=4,evaluation_interval=5,seed=15112026,world_size=2000.,
               hidden=64,learning_rate=.0003,epochs=4,gae_lambda=.95,clip=.2,
@@ -77,10 +87,28 @@ def frozen_provenance(repo):
     return dict(checkpoint_sha256=actual,config_sha256=digest(root/'config.json'),sources=sources)
 
 
-def contract(config,provenance):
-    return dict(format=FORMAT,schema=SCHEMA,features=SLOW_FEATURES,max_candidates=MAX_CANDIDATES,
-                hidden=config['hidden'],fast=provenance,
-                hierarchy=config['hierarchy'],world_size=config['world_size'])
+def contract(config,provenance,schema=SCHEMA):
+    result = dict(format=FORMAT,schema=schema,features=SLOW_FEATURES,max_candidates=MAX_CANDIDATES,
+                  hidden=config['hidden'],fast=provenance,
+                  hierarchy=config['hierarchy'],world_size=config['world_size'])
+    if schema in GROUND_SCHEMAS:
+        from ground.ground_policy import GROUND_INPUT_WIDTH, TASK_INPUT_WIDTH, TASK_FEATURES
+        if schema == SCHEMA:
+            result.update(ground_input_width=TASK_INPUT_WIDTH, task_features=list(TASK_FEATURES))
+        else:
+            result['ground_input_width'] = GROUND_INPUT_WIDTH
+    elif schema != LEGACY_SCHEMA:
+        raise ValueError(f'Unsupported slow observation schema: {schema}')
+    return result
+
+
+def slow_model(schema, hidden):
+    if schema == LEGACY_SCHEMA:
+        return SlowActorCritic(len(SLOW_FEATURES), hidden)
+    if schema in GROUND_SCHEMAS:
+        from ground.ground_policy import GroundSlowActorCritic
+        return GroundSlowActorCritic(len(SLOW_FEATURES), hidden, task_context=schema == SCHEMA)
+    raise ValueError(f'Unsupported slow observation schema: {schema}')
 
 
 def load_checkpoint(path,expected):
@@ -89,22 +117,31 @@ def load_checkpoint(path,expected):
     return saved
 
 
-def atomic_checkpoint(path,data):
-    path=Path(path);temporary=path.with_suffix('.tmp')
-    torch.save(data,temporary);temporary.replace(path)
+def atomic_checkpoint(path, data):
+    return _atomic_checkpoint(path, data)
+
+
+def worker_state(model):
+    return {key: value.detach().cpu().numpy().copy() for key, value in model.state_dict().items()}
 
 
 def collect(job):
-    repo,case,config,state,mode,output,label=job
+    repo,case,config,schema,state,mode,output,label=job
     torch.set_num_threads(1)
-    slow=SlowActorCritic(len(SLOW_FEATURES),config['hidden'])
+    runtime(repo)
+    slow=slow_model(schema,config['hidden'])
     slow.load_state_dict({key:torch.from_numpy(value) for key,value in state.items()});slow.eval()
     generator=torch.Generator().manual_seed(case['seed']+config['seed']+71)
     log_path=Path(output)/'logs'/f'{label}.log'
     transitions=[]
     with log_path.open('w') as log,contextlib.redirect_stdout(log):
-        env=HierarchicalEpisode(repo,case,HierarchyConfig(**config['hierarchy']),
-                                fast_seed=case['seed']+config['seed'],rollout_limit=config['rollout_steps'])
+        episode_args = dict(fast_seed=case['seed']+config['seed'],rollout_limit=config['rollout_steps'])
+        if schema in GROUND_SCHEMAS:
+            from simulator.ground_evidence import GroundPolicyEpisode
+            env = GroundPolicyEpisode(repo, case, HierarchyConfig(**config['hierarchy']),
+                                      task_context=schema == SCHEMA, **episode_args)
+        else:
+            env = HierarchicalEpisode(repo, case, HierarchyConfig(**config['hierarchy']), **episode_args)
         try:
             while not env.finished:
                 observation=env.observation()
@@ -121,6 +158,8 @@ def collect(job):
                     transitions.append(dict(features=observation['features'].copy(),mask=observation['mask'].copy(),
                         present=observation['present'].copy(),action=action,logp=logp,value=value,
                         reward=reward,duration=duration,next_value=next_value,terminated=terminated,truncated=truncated))
+                    if schema in GROUND_SCHEMAS:
+                        transitions[-1]['ground_inputs'] = observation['ground_inputs'].copy()
             summary=env.summary();summary['mode']=mode
             summary['case']=case
             write_json(Path(output)/'episodes'/f'{label}.json',summary)
@@ -147,15 +186,17 @@ def summaries(results):
 
 def prepare_snapshot(args,config,repo,output):
     if args.frozen:return
+    sources = source_paths(SOURCE)
+    if not SLOW_SOURCES <= sources.keys():
+        raise ValueError(f'Missing VTemp2 sources: {sorted(SLOW_SOURCES - sources.keys())}')
     snapshot=runtime_source(output) if args.resume else output/'runtime_sources/world_model'
     if args.resume:
-        if not snapshot.is_dir():raise ValueError('Resume requires this run\'s source snapshot')
-        for p in source_files(SOURCE):
-            if not (snapshot/p.name).exists() or digest(p)!=digest(snapshot/p.name):
-                raise ValueError('Source changed; resume from the archived entry point or start a new run')
+        recorded = json.loads((output/'manifest.json').read_text())['source_sha256']
+        if hierarchical_source_hashes(snapshot) != recorded or 'train_slow_policy.py' not in recorded:
+            raise ValueError('Resume source snapshot differs from the recorded run')
     else:
         if output.exists() and any(output.iterdir()):raise ValueError('Output exists; use a new directory or --resume')
-        snapshot_sources(SOURCE,snapshot)
+        snapshot_sources(SOURCE, snapshot)
     request=output/'requested_config.json';write_json(request,config)
     command=[sys.executable,'-I','-B','-u',str(snapshot/'train_slow_policy.py'),'--repo',str(repo),
              '--output',str(output),'--config',str(request),'--frozen']
@@ -201,10 +242,15 @@ def main():
     prepare_snapshot(args,config,repo,output)
     for directory in ('logs','episodes','rollouts','updates'):(output/directory).mkdir(parents=True,exist_ok=True)
     provenance=frozen_provenance(repo)
-    expected=contract(config,provenance)
+    schema = SCHEMA
+    if args.evaluate:
+        schema = torch.load(args.evaluate, map_location='cpu', weights_only=True)['contract']['schema']
+    expected=contract(config,provenance,schema)
     hashes=hierarchical_source_hashes(SOURCE)
-    torch.set_num_threads(1);torch.manual_seed(config['seed'])
-    model=SlowActorCritic(len(SLOW_FEATURES),config['hidden'])
+    torch.set_num_threads(1)
+    runtime(repo)
+    torch.manual_seed(config['seed'])
+    model=slow_model(schema,config['hidden'])
     optimizer=torch.optim.Adam(model.parameters(),lr=config['learning_rate'])
     beginning=0;best_quality=(-1.,-float('inf'))
     if args.resume or args.evaluate:
@@ -219,8 +265,11 @@ def main():
             best_quality=tuple(saved['best_quality']);torch.set_rng_state(saved['torch_rng'])
     write_json(output/'config.json',config)
     write_json(output/'manifest.json',dict(contract=expected,source_package='world_model',source_sha256=hashes,
+        version='vtemp2',world_model=False,
         fast_policy='frozen v9 best576; no fast-policy optimizer',algorithm='masked discrete PPO with SMDP GAE',
-        evidence='Slow-only experimental receiver uses actually arrived audit occupancy and own local observations; real deployment requires equivalent evidence packets.',
+        evidence={LEGACY_SCHEMA: 'Legacy candidate features from delivered audit occupancy and local measurements',
+                  GROUND_V1_SCHEMA: 'UGV local sensor and memory, received map topology, one-hop neighbors and delivered V9 state envelopes',
+                  SCHEMA: 'UGV sensor and memory, received topology and state, active drive target and last issued survey with received evidence'}[schema],
         reward='Final-goal potential shaping gamma*Phi(next)-Phi(now), Phi=-distance/scale; time/collision cost; mission success/safety/budget terminals.',
         truncation='Collector limit bootstraps; mission budget and actual terminal events do not.',
         gamma_unit='fast control attempt',lambda_unit='slow decision',
@@ -234,7 +283,7 @@ def main():
                 stage=stage_for(config,index)
                 cases=[make_scene(4100000+config['seed']+i,stage['distance'],config['world_size']) for i in range(config['evaluation_episodes'])]
                 mode='geometry' if args.baseline else 'evaluation'
-                jobs=[(str(repo),case,config,worker_state(model),mode,str(output),f'eval_{i:03d}') for i,case in enumerate(cases)]
+                jobs=[(str(repo),case,config,schema,worker_state(model),mode,str(output),f'eval_{i:03d}') for i,case in enumerate(cases)]
                 result=summaries(list(pool.map(collect,jobs)))
                 write_json(output/'evaluation.json',result)
                 print(json.dumps(dict(phase='evaluation',**{k:v for k,v in result.items() if k!='records'})),flush=True)
@@ -244,19 +293,20 @@ def main():
                     stage=stage_for(config,index)
                     cases=[make_scene(2100000+config['seed']+index*config['episodes_per_update']+i,
                                       stage['distance'],config['world_size']) for i in range(config['episodes_per_update'])]
-                    jobs=[(str(repo),case,config,worker_state(model),'train',str(output),f'u{index+1:04d}_train_{i:03d}') for i,case in enumerate(cases)]
+                    jobs=[(str(repo),case,config,schema,worker_state(model),'train',str(output),f'u{index+1:04d}_train_{i:03d}') for i,case in enumerate(cases)]
                     results=list(pool.map(collect,jobs))
-                    before={k:v.detach().clone() for k,v in model.state_dict().items()}
+                    before={name:p.detach().clone() for name,p in model.named_parameters()}
                     model.train()
                     metrics=update(model,optimizer,[r[0] for r in results],gamma=config['hierarchy']['gamma'],
                         gae_lambda=config['gae_lambda'],epochs=config['epochs'],clip=config['clip'],
                         entropy_coef=config['entropy_coef'],value_coef=config['value_coef'],
                         target_kl=config['target_kl'],max_kl=config['max_kl'])
-                    metrics['parameter_delta_l2']=float(torch.sqrt(sum((v-before[k]).square().sum() for k,v in model.state_dict().items())))
+                    metrics['parameter_delta_l2']=float(torch.sqrt(sum(
+                        (p.detach() - before[name]).square().sum() for name,p in model.named_parameters())))
                     training=summaries(results);validation=None
                     if (index+1)%config['evaluation_interval']==0 or index+1==config['updates']:
                         cases=[make_scene(3100000+config['seed']+i,stage['distance'],config['world_size']) for i in range(config['evaluation_episodes'])]
-                        jobs=[(str(repo),case,config,worker_state(model),'validation',str(output),f'u{index+1:04d}_val_{i:03d}') for i,case in enumerate(cases)]
+                        jobs=[(str(repo),case,config,schema,worker_state(model),'validation',str(output),f'u{index+1:04d}_val_{i:03d}') for i,case in enumerate(cases)]
                         validation=summaries(list(pool.map(collect,jobs)))
                     row=dict(update=index+1,stage=stage,ppo=metrics,training=training,validation=validation)
                     write_json(output/'updates'/f'{index+1:04d}.json',row)

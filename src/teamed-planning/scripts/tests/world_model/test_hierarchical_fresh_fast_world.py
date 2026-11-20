@@ -131,18 +131,19 @@ class FreshFastWorldTests(unittest.TestCase):
                              [3e-4, 3e-4])
             self.assertEqual(json.loads((output / 'manifest.json').read_text()), saved['manifest'])
 
-    def make_states(self):
+    def make_states(self, *, road_topology=False):
         torch.manual_seed(191)
         return [numpy_state(model) for model in
                 (trainer.make_graph_fast(self.repo, random_init=True),
-                 trainer.GraphWorldModel(16, 4), trainer.GraphSlowActorCritic(hidden=16))]
+                 trainer.GraphWorldModel(16, 4, road_topology=road_topology),
+                 trainer.GraphSlowActorCritic(hidden=16))]
 
     def rollout_config(self, extra=()):
         return dict(self.config(extra), horizon=4, option_steps=4, steps=4, stride=1,
                     loss=0., jitter=1, complete_missions=False, random_slow_probability=0.)
 
     def test_fixed_target_reaches_all_fast_actors_from_frame_zero_in_both_splits(self):
-        states = self.make_states()
+        states = self.make_states(road_topology=True)
         config = dict(self.rollout_config(['--fixed-mission-target']), steps=8, ground_start_hold_seconds=30)
         self.assertTrue(config['fixed_mission_target'])
         self.assertFalse(self.config()['fixed_mission_target'])
@@ -196,6 +197,9 @@ class FreshFastWorldTests(unittest.TestCase):
                         self.assertEqual(row['slow_controller'], 'fixed_target')
                         self.assertEqual(row['slow_decisions'], 0)
                         self.assertFalse(row['slow_ppo_eligible'])
+                        with np.load(row['wm_path'], allow_pickle=False) as data:
+                            self.assertEqual(len(data['road_topology']), row['wm_samples'])
+                            self.assertTrue(np.all(data['road_topology'][:, 7] == 1))
                         self.assertIsNone(row['slow_path'])
                         self.assertFalse(list((output / 'data').glob(f'{label}-slow*')))
                         self.assertEqual(row['fast_deterministic'], evaluation)
@@ -214,7 +218,7 @@ class FreshFastWorldTests(unittest.TestCase):
                         np.testing.assert_allclose(rollout['decisions'][0]['target'], case['goal'])
 
     def test_fixed_target_ppo_preserves_v9_rewards_and_handles_terminal_outcomes(self):
-        states = self.make_states()
+        states = self.make_states(road_topology=True)
         config = dict(self.rollout_config(['--fixed-mission-target']), complete_missions=True)
         case = make_scene(58114, (3., 3.), 1000., 'open')
         goal = np.asarray(case['goal'])
@@ -272,7 +276,7 @@ class FreshFastWorldTests(unittest.TestCase):
 
     def test_fixed_target_replaces_v9_reward_when_physics_rejects_unknown_terrain(self):
         from tests.world_model.test_hierarchical_wildscenes_runtime import case_for
-        states = self.make_states()
+        states = self.make_states(road_topology=True)
         config = dict(self.rollout_config(['--fixed-mission-target']), steps=8)
         original_episode = graph_rollouts.HierarchicalEpisode
 

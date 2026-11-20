@@ -24,6 +24,9 @@ import numpy as np
 REPOSITORY = next(parent for parent in Path(__file__).resolve().parents
                   if (parent / "src/teamed-planning/scripts").is_dir())
 EXPECTED_PROTOCOL = "wildscenes_obstacle_layout_native2d_unknown_free_vtemp_v9_v1"
+HISTORICAL_PROTOCOL = "wildscenes_vtemp_rolling200_frozen_v9_v1"
+VTEMP_STRATEGIES = ("vtemp", "vtemp_rolling200")
+FROZEN_MANAGER_SHA256 = "e36971e1a194210a972c38c9d393e7f4c1d6ee970fc077d885aa141fef4e2702"
 CHECKPOINT_SHA256 = "7ac3aedcc3876902773b2241f60e839eb3e3b5630ddeb3c8be660421f2c24198"
 FAILURE_DIAGNOSTIC_SHA256 = "392f160180d0d3b5ada4665c1cd880014c82023424d4d5e9fca0cf002db96311"
 PRIMARY_ZERO_METRICS = ("native_collision_attempts", "physical_swept_violations", "chain_link_violation",
@@ -31,7 +34,7 @@ PRIMARY_ZERO_METRICS = ("native_collision_attempts", "physical_swept_violations"
 SCOPE = (
     "这是从WildScenes二维投影提取障碍布局的简化仿真。实测occupied单元保留为矩形，"
     "未知区域按仿真空地处理，不代表真实地面可通行。原生无人机24×24m/2m和地面车8×8m/0.5m"
-    "感知、冻结v9 best576权重与VTemp 200m/25m机制保持。"
+    "感知、冻结v9 best576权重与vtemp 200m/25m机制保持。"
     "原unknown阻挡实验与本实验环境不同，对照仅供背景参考，不能解释为同环境性能提升。"
 )
 METRIC_NOTE = (
@@ -48,6 +51,13 @@ TERMINATIONS = {
     "budget_exhausted": "预算耗尽", "physical_geometry_violation": "物理扫掠违规",
     "evaluation_error": "运行错误", "user_stop": "停止", "pending": "待完成",
 }
+
+
+def frozen_strategy_names(manager_sha256):
+    # Some frozen reports were written under the name of the later direction policy.
+    if manager_sha256 == FROZEN_MANAGER_SHA256:
+        return (*VTEMP_STRATEGIES, "vtemp1")
+    return VTEMP_STRATEGIES
 
 
 def digest(path):
@@ -189,6 +199,10 @@ class Reader:
             self.check(provenance.get("selected_case_ids") == [case_id], f"{case_id}: case selection differs")
             self.check(provenance.get("settings", {}).get("stochastic") is True, f"{case_id}: stochastic protocol differs")
             settings = provenance.get("settings", {})
+            frozen = provenance.get("frozen_hashes", {})
+            strategies = frozen_strategy_names(frozen.get("runtime_sources/ground/subgoal_manager.py"))
+            self.check("strategy" not in settings or settings["strategy"] in strategies,
+                       f"{case_id}: unexpected vtemp strategy")
             if "ground_safety_distance" in settings or self.safety_clearance_m != 1.5:
                 self.check(settings.get("ground_safety_distance") == self.safety_clearance_m
                            and settings.get("safety_clearance_m") == self.safety_clearance_m
@@ -202,14 +216,16 @@ class Reader:
                                       shared_helper_sha256="validate_wildscenes_vtemp.py",
                                       scene_adapter_sha256="wildscenes_legacy_scene.py").items():
                 self.hash_check(self.root / "implementation" / filename, provenance.get(key), case_id + " execution source")
+            if "support_sha256" in provenance:
+                self.hash_check(self.root / "implementation" / "wildscenes_support.py",
+                                provenance["support_sha256"], case_id + " shared execution source")
             perception = provenance.get("perception", {})
             for key, value in dict(drone_shape=[12, 12], drone_resolution_m=2., drone_footprint_m=[24., 24.],
                                    ground_shape=[16, 16], ground_resolution_m=.5,
                                    ground_footprint_m=[8., 8.], fine_mapping=False).items():
                 self.check(perception.get(key) == value, f"{case_id}: sensor contract differs: {key}")
             self.check(provenance.get("strategy") == dict(subgoal_radius_m=200., subgoal_arrival_m=25., checkpoint_episode=576),
-                       f"{case_id}: VTemp/model strategy differs")
-            frozen = provenance.get("frozen_hashes", {})
+                       f"{case_id}: vtemp/model strategy differs")
             self.check(frozen.get("best.pt") == CHECKPOINT_SHA256, f"{case_id}: wrong model checkpoint")
             run = resolve(provenance["run"], self.root)
             required_frozen = {"best.pt", "config.json"} | {
@@ -247,6 +263,9 @@ class Reader:
                 if detail["status"] == "completed":
                     self.check(detail.get("protocol") == EXPECTED_PROTOCOL, f"{identifier}: mixed case protocol")
                     self.check(detail.get("checkpoint_sha256") == CHECKPOINT_SHA256, f"{identifier}: mixed model")
+                    overrides = detail.get("evaluation_overrides", {})
+                    self.check("strategy" not in overrides or overrides["strategy"] in strategies,
+                               f"{identifier}: unexpected vtemp strategy")
                     self.check(detail.get("simplified_scene") is True, f"{identifier}: missing scene declaration")
                     for key in ("start", "goal", "reference_length_m", "scene_seed"):
                         if key in source_case:
@@ -255,7 +274,7 @@ class Reader:
                     self.check(summary.get("safety_clearance_m") == self.safety_clearance_m,
                                f"{identifier}: summary clearance differs from the formal plan")
                     if "ground_safety_distance" in provenance.get("settings", {}):
-                        actual = detail.get("evaluation_overrides", {}).get("planning_clearances", {})
+                        actual = overrides.get("planning_clearances", {})
                         self.check(actual.get("ground_safety_distance") == self.safety_clearance_m
                                    and actual.get("ground_escape_distance") == .5
                                    and actual.get("graph_clearance_m") == [self.safety_clearance_m] * 3
@@ -813,9 +832,14 @@ def read_historical_context(reader, baseline_root):
         report = read_json(path)
         if object_digest(report["provenance"]) != report["signature"]:
             raise ValueError(f"Historical report signature is inconsistent: {path}")
-        if (report["provenance"].get("protocol") != "wildscenes_vtemp_rolling200_frozen_v9_v1"
-                or report["provenance"].get("checkpoint_sha256") != CHECKPOINT_SHA256):
+        provenance = report["provenance"]
+        if (provenance.get("protocol") != HISTORICAL_PROTOCOL
+                or provenance.get("checkpoint_sha256") != CHECKPOINT_SHA256):
             raise ValueError(f"Historical report uses a different protocol or model: {path}")
+        settings = provenance.get("settings", {})
+        strategies = frozen_strategy_names(provenance.get("source_hashes", {}).get("ground/subgoal_manager.py"))
+        if "strategy" in settings and settings["strategy"] not in strategies:
+            raise ValueError(f"Historical report uses a different vtemp strategy: {path}")
         expected_count = 9 if directory == "evaluation" else 6
         identifiers = [record["id"] for record in report["records"]]
         scheduled_ids = [record["id"] for record in report["scheduled"]]
@@ -830,6 +854,11 @@ def read_historical_context(reader, baseline_root):
             reader.inputs[str(detail_path)] = digest(detail_path)
             if detail.get("signature") != report["signature"] or detail.get("summary") != record["summary"]:
                 raise ValueError(f"Historical detail differs from report: {detail_path}")
+            if "protocol" in detail and detail["protocol"] != HISTORICAL_PROTOCOL:
+                raise ValueError(f"Historical detail uses a different protocol: {detail_path}")
+            overrides = detail.get("evaluation_overrides", {})
+            if "strategy" in overrides and overrides["strategy"] not in strategies:
+                raise ValueError(f"Historical detail uses a different vtemp strategy: {detail_path}")
             summary = dict(detail["summary"])
             summary["native_collision_attempts"] = summary.get("raster_collision_attempts", 0)
             rows.append(dict(status=detail["status"], summary=summary))
@@ -978,7 +1007,7 @@ def publish_reports(audit, output):
     failure = audit.get("failure_behavior", {})
     execution = audit.get("execution_history", {})
     network = audit.get("network_diagnostics", {})
-    text = ["WildScenes障碍布局简化二维仿真：正式验证", "", SCOPE, "", acceptance["note"], "", metric_note, "",
+    text = ["WildScenes vtemp 障碍布局简化二维仿真正式验证", "", SCOPE, "", acceptance["note"], "", metric_note, "",
             f"审计：{audit['status']}；预定{audit['expected_samples']}次，逐例结果全部纳入。", "",
             "\t".join(group_headers), *("\t".join(row) for row in groups), "", "逐例结果", "\t".join(detail_headers),
             *("\t".join(row) for row in details), "", "历史背景：原unknown阻挡、原1.5m设置，环境及配置不同", "\t".join(historical_headers),
@@ -1026,15 +1055,15 @@ def publish_reports(audit, output):
                        '起点分量与2m终点盘相交的所有保留格不连通，因此不存在符合净空要求的正式到达路线。'
                        '证明范围限于本简化投影障碍几何。</p></details>') if proof else f'<p>{proof_links}</p>'
     page = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WildScenes简化二维场景正式验证</title><style>
+<title>WildScenes vtemp 简化二维场景正式验证</title><style>
 body{{margin:0;background:#f6f5ef;color:#26342f;font:15px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}
 main{{max-width:1500px;margin:30px auto;padding:0 24px 50px}}h1{{font-size:29px;line-height:1.35}}h2{{margin-top:32px;font-size:20px}}
 .notice{{border-left:4px solid #aa6b32;background:#fff5e4;padding:16px 20px}}.note{{color:#52625a}}
 .scroll{{overflow:auto;background:white;border:1px solid #dbe0d5;border-radius:8px}}table{{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}}
 td,th{{padding:10px 12px;border-bottom:1px solid #e5e8df;text-align:left}}th{{background:#eaf0e5}}tr:last-child td{{border-bottom:0}}
 img{{width:100%;height:auto;background:white;border:1px solid #dbe0d5}}code{{overflow-wrap:anywhere}}a{{color:#206841}}
-</style><main><p class="note">冻结v9 best576 · VTemp rolling200 · 三个独立任务组 · {audit['expected_samples']}次预定运行</p>
-<h1>WildScenes障碍布局简化二维仿真：正式验证</h1><p class="notice">{html.escape(SCOPE)}</p>
+</style><main><p class="note">冻结v9 best576 · 三个独立任务组 · {audit['expected_samples']}次预定运行</p>
+<h1>WildScenes vtemp 障碍布局简化二维仿真正式验证</h1><p class="notice">{html.escape(SCOPE)}</p>
 <h2>结果与分母</h2><p class="notice">{html.escape(acceptance['note'])}</p>{amendment_link}<p>计划样本全部读取，原严格成功标记先核验，再从逐例summary派生主验收指标；运行错误仍在预定分母中。</p>
 {table(group_headers, groups)}<p class="note">{outcomes}</p><p class="note">{html.escape(metric_note)}</p>
 {network_section}

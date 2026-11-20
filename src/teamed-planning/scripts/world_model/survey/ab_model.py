@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from .ab_environment import ACTION_CONTRACT, ACTIONS, ALGORITHM, CHANNELS, DELTA_SCALE, FEATURES, SIDE
-from .hierarchical_sources import atomic_json as _write_json, file_sha256
+from .hierarchical_sources import atomic_checkpoint, atomic_json as _write_json, file_sha256
 from .models import RecurrentWorldModel, balanced_kl, imagine_sequence, make_model, padded_window
 
 CHECKPOINT_FORMAT = 'vtmp3-ab-world-model-v1'
@@ -66,7 +66,7 @@ def sequence_loss(model, batch, rollout_steps=4, rollout_weight=.25, sample=True
 
 
 def atomic_json(path, document):
-    _write_json(path, document)
+    return _write_json(path, document)
 
 
 def load_episodes(root):
@@ -233,7 +233,7 @@ def train(dataset, output, *, epochs=50, device='cpu', model=None, seed=20261110
             dataset_sha256=data_hash, mapping_config=mapping_config,
             source_manifest_sha256=source_manifest_sha256, **row)
         for filename in (['latest.pt', 'best.pt'] if improved else ['latest.pt']):
-            temporary = output/(filename+'.tmp'); torch.save(checkpoint, temporary); temporary.replace(output/filename)
+            atomic_checkpoint(output/filename, checkpoint, append_suffix=True)
         atomic_json(output/'status.json', dict(stage='training', **row))
         if epoch == 1 or epoch % 10 == 0 or epoch == epochs:
             print(json.dumps(dict(stage='training', **row)), flush=True)

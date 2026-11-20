@@ -3,6 +3,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -19,6 +21,32 @@ adapter = load("wildscenes_clearance")
 
 
 class ClearanceCompatibilityTests(unittest.TestCase):
+    def test_copied_validators_load_shared_helpers_without_live_simulator(self):
+        sources = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / 'run' / 'implementation'
+            directory.mkdir(parents=True)
+            for name in ('validate_wildscenes_v9.py', 'validate_wildscenes_vtemp.py',
+                         'validate_wildscenes_legacy.py', 'wildscenes_support.py',
+                         'wildscenes_clearance.py'):
+                shutil.copy2(sources / 'simulator' / name, directory / name)
+            shutil.copy2(sources / 'common/navigation_config.py', directory / 'navigation_config.py')
+            script = '''
+import importlib.util, json, sys
+from pathlib import Path
+directory = Path(sys.argv[1])
+for name in ('validate_wildscenes_v9', 'validate_wildscenes_vtemp', 'validate_wildscenes_legacy'):
+    spec = importlib.util.spec_from_file_location('_copied_' + name, directory / (name + '.py'))
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    assert runner.clean({'bad': float('nan'), 'items': (1, 2)}) == {'bad': None, 'items': [1, 2]}
+    assert runner.digest(directory / 'wildscenes_support.py')
+assert 'simulator' not in sys.modules
+'''
+            result = subprocess.run([sys.executable, '-I', '-B', '-c', script, str(directory)],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def runtime(self):
         def ground(*args, safety_distance=1.5, **kwargs):
             return SimpleNamespace(local_planner=SimpleNamespace(safety_distance=safety_distance,

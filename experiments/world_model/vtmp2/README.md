@@ -821,7 +821,7 @@ R选点 = min(配置上限, R侦查)
 - `feasibility.py`：训练场景的连续物理路径认证和证据存档。
 - `train.py`：世界模型监督训练、确定性验证和检查点续训。
 - `pipeline.py`：独立后台运行的筛选、采集、训练流程。
-- `install_gpu.py`：GPU 版 PyTorch 安装与验证。
+- 当时的 GPU 环境安装已完成；一次性 `install_gpu.py` 安装脚本已在代码精简时移除。
 - `requirements-gpu.txt`：GPU 环境依赖清单。
 
 安装日志与状态仍写入 [artifacts/world-model-gpu-setup](../../../artifacts/world-model-gpu-setup/)。

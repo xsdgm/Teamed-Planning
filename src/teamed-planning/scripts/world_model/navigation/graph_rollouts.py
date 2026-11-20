@@ -17,12 +17,13 @@ import torch
 
 from .graph_fast_policy import load_numpy, numpy_state, ppo_batch, state_hash
 from .safety_context import received_cbf_context, validate_cbf_context
-from .graph_dynamics import GraphWorldModel, INPUT_KEYS, NODE_IDS, NODE_COUNT, infer, belief_tokens, planning_readout
+from .graph_dynamics import (GraphWorldModel, NODE_IDS, NODE_COUNT, infer, belief_tokens,
+                             planning_readout, build_road_topology)
 from .hierarchical_policy import make_graph_fast, GraphSlowActorCritic
 from .hierarchical_runtime import HierarchicalEpisode, HierarchyConfig, geometry_teacher_action
 from .telemetry import (ReceivedHistory, TelemetryNetwork, packet, context_features,
                           HISTORY, HISTORY_FEATURES, CONTEXT_FEATURES)
-from .belief_actor import recentered_sensor
+from .wildscenes_runtime import world_sensor_tile
 from .frozen_navigation import V9_FAST_REWARD_CONTRACT, runtime, write_json
 
 
@@ -180,36 +181,27 @@ class GraphRecorder:
             node_mask=np.zeros(NODE_COUNT, bool), node_type=np.asarray([n == 'ground_0' for n in NODE_IDS], np.int64),
             ego_mask=np.asarray([n == owner for n in NODE_IDS], bool), state_observed=np.zeros(NODE_COUNT, bool),
             origins=np.zeros((NODE_COUNT, 2), np.float32), source_stamp=np.zeros(NODE_COUNT, np.float32))
-        cells = np.asarray(local['occupancy_map'])
-        known = float(np.mean(cells >= 0)) if local.get('sensor_valid', True) else 0.
+        sensor_values, sensor_mask = world_sensor_tile(local)
+        known = float(sensor_mask.mean())
         local_graph = (self.env.ground_controller.unified_graph if owner == 'ground_0'
                        else self.controllers[self.ids[owner]].current_graph)
         graph_nodes = 0 if local_graph is None else len(local_graph.graph.nodes)
         # Local graph attributes condition the neural world model, not merely
         # the downstream actor. Unknown pixels and map padding stay explicit.
-        if 'occupancy_known_mask' in local:
-            from .wildscenes_runtime import pool_received_tile
-            known_cells = np.where(np.asarray(local['occupancy_known_mask'], bool), cells, -1)
-            ids, values = pool_received_tile(known_cells, own['position'], local['map_resolution'],
-                2., (12, 12), target_origin=np.asarray(own['position'][:2]) - 12.)
-            pooled = np.zeros(144, np.int8)
-            pooled[ids] = values
-            sensor_mask = (pooled.reshape(12, 12) != 0) & bool(local.get('sensor_valid', True))
-            sensor_values = np.where(sensor_mask, pooled.reshape(12, 12) == 1, 0.).astype(np.float32)
-        else:
-            tile = recentered_sensor(dict(cells=cells, resolution=local['map_resolution'],
-                                          center=own['position']), own['position'])
-            sensor_mask = (tile >= 0) & bool(local.get('sensor_valid', True))
-            sensor_values = np.where(sensor_mask, tile, 0.).astype(np.float32)
+        own_xy = np.asarray(own['position'][:2])
         map_tokens = np.zeros((32, 5), np.float32)
+        nearby = []
         if local_graph is not None:
             nodes = list(local_graph.graph.nodes(data=True))
-            own_xy = np.asarray(own['position'][:2])
             nodes.sort(key=lambda item: (float(np.linalg.norm(np.asarray(item[1]['position'][:2]) - own_xy)),
                                           str(item[0])))
-            for index, (node, attrs) in enumerate(nodes[:32]):
+            nearby = nodes[:32]
+            for index, (node, attrs) in enumerate(nearby):
                 map_tokens[index] = np.r_[(np.asarray(attrs['position'][:2]) - own_xy) / 95.,
                     local_graph.node_confidence(node), local_graph.graph.degree(node) / 8., 1.]
+        if 'road_topology' in self.world.input_keys:
+            arrays['road_topology'] = build_road_topology(local_graph, own_xy, own['goal'],
+                                                          nearby_nodes=[node for node, _ in nearby])
         arrays['local_evidence'] = np.r_[sensor_values.ravel(), sensor_mask.astype(np.float32).ravel(),
                                         map_tokens.ravel()].astype(np.float32)
         for i, name in enumerate(NODE_IDS):
@@ -260,7 +252,7 @@ class GraphRecorder:
         return arrays
 
     def predict(self, graph, kind, environment=None):
-        batch = {key: torch.from_numpy(np.asarray(graph[key]))[None] for key in INPUT_KEYS}
+        batch = {key: torch.from_numpy(np.asarray(graph[key]))[None] for key in self.world.input_keys}
         with torch.inference_mode():
             predicted = infer(self.world, batch)
             result = (belief_tokens(predicted, batch)[0].cpu().numpy() if environment is None
@@ -419,13 +411,15 @@ def collect_graph(job):
             replace(HierarchyConfig(), option_steps=config['option_steps'],
                     ground_start_hold_seconds=config.get('ground_start_hold_seconds', 0)),
             fast_seed=case['seed'] + 43, rollout_limit=config['steps'] + 1,
-            random_init=fresh, v9_fast_reward=fixed_target)
+            random_init=fresh, v9_fast_reward=fixed_target,
+            training_observation_protocol=config.get('training_observation_protocol'))
         if config.get('complete_missions', True):
             episode.rollout_limit = episode.mission_budget + 1
         try:
             fast = make_graph_fast(repo, random_init=fresh)
             load_numpy(fast, fast_state); fast.eval().requires_grad_(False)
-            world = GraphWorldModel(config['hidden'], config['horizon'])
+            world = GraphWorldModel(config['hidden'], config['horizon'],
+                                    road_topology=config.get('road_topology', False))
             load_numpy(world, world_state); world.eval().requires_grad_(False)
             if not fixed_target:
                 slow = GraphSlowActorCritic(hidden=config['hidden'])

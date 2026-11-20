@@ -1,4 +1,4 @@
-"""Run frozen VTemp + v9 in native 2D scenes derived from WildScenes obstacles.
+"""Run frozen vtemp + v9 in native 2D scenes derived from WildScenes obstacles.
 
 Only the recorded obstacle layout is retained. Unrecorded space is assumed free
 inside the simulation world, so these are simplified synthetic scenes, not
@@ -52,7 +52,10 @@ def frozen_hashes(run):
     files = [run / "best.pt", run / "config.json", *sorted((run / "runtime_sources").rglob("*.py"))]
     if len(files) == 2:
         raise ValueError("Missing frozen runtime_sources")
-    return {str(path.relative_to(run)): digest(path) for path in files}
+    hashes = {str(path.relative_to(run)): digest(path) for path in files}
+    if hashes.get("runtime_sources/ground/subgoal_manager.py") != common.FROZEN_MANAGER_SHA256:
+        raise ValueError("Expected the archived vtemp rolling200 manager")
+    return hashes
 
 
 def verify_frozen_inputs(run, expected):
@@ -180,7 +183,7 @@ def evaluate_job(job):
             env = me.Experiment(case["scene_seed"], model, stochastic=job["stochastic"], **options)
             planning_clearances = clearance.verify_experiment(env, safety_distance, escape_distance)
             if env.subgoals is None:
-                raise RuntimeError("VTemp manager is missing")
+                raise RuntimeError("vtemp manager is missing")
             physical_radius = float(env.env.ground_robots[0].radius)
             trajectory.append(common.position_record(env, 0))
             events.append(common.subgoal_event(env, 0))
@@ -264,7 +267,7 @@ def evaluate_job(job):
                 summary=summary, trace=env.trace, trajectory=trajectory, subgoal_events=events,
                 native_collision_events=env.env.legacy_collision_events,
                 swept_violation_events=violations, error=caught_error,
-                evaluation_overrides=dict(strategy="vtemp_rolling200", subgoal_radius=200.,
+                evaluation_overrides=dict(strategy=common.STRATEGY, subgoal_radius=200.,
                     ground_safety_distance=safety_distance, ground_escape_distance=escape_distance,
                     planning_clearances=planning_clearances,
                     subgoal_arrival=25., native_sensor=True, fine_mapping=False,
@@ -347,7 +350,7 @@ def main():
         cases.append(case)
     if not cases or (args.case_ids and set(args.case_ids) - identifiers):
         raise ValueError("No cases selected or an unknown case ID was requested")
-    settings = dict(stochastic=not args.deterministic,
+    settings = dict(strategy=common.STRATEGY, stochastic=not args.deterministic,
                     samples=len(args.sample_seeds) if args.sample_seeds is not None else args.samples,
                     sample_seeds=args.sample_seeds, max_steps=args.max_steps, workers=1,
                     ground_safety_distance=args.ground_safety_distance, ground_escape_distance=.5,
@@ -359,6 +362,7 @@ def main():
         source_map_sha256=source_map_sha256,
         cases_path=str(cases_path), cases_sha256=digest(cases_path),
         runner_sha256=digest(__file__), shared_helper_sha256=digest(common.__file__),
+        support_sha256=digest(common.support.__file__),
         clearance_source_hashes=clearance.source_hashes(),
         scene_adapter_sha256=digest(Path(__file__).with_name("wildscenes_legacy_scene.py")),
         rectangle_count=len(scene.rectangles), settings=settings, selected_case_ids=[c["id"] for c in cases],

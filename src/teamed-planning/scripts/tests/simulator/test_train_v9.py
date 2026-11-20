@@ -27,6 +27,22 @@ def record(**overrides):
 
 
 class TrainingV9Tests(unittest.TestCase):
+    def test_historical_inert_team_defaults_do_not_change_v9_resume(self):
+        current = config('v9')
+        previous = dict(current, vehicle_count=1, target_count_range=None,
+                        scene_regime='any', vehicle_planner='parked', budget_reference='sum',
+                        vehicle_depart_progress=.5, vehicle_transfer_margin=.15,
+                        vehicle_motion='free', vehicle_keep_range=88., cograph_route_reward='legacy')
+        self.assertEqual(validate_config(previous), current)
+        self.assertEqual(optimizer_config_changes(previous, current), {})
+        for setting in ({'vehicle_count': 3}, {'vehicle_count': True}, {'target_count_range': [2, 8]},
+                        {'vehicle_planner': 'decentralized'}, {'cograph_route_reward': 'paired_current'}):
+            with self.subTest(setting=setting), self.assertRaises(ValueError):
+                validate_config(dict(previous, **setting))
+        for architecture in ('cograph_v1', 'cograph_v2'):
+            with self.subTest(architecture=architecture), self.assertRaises(ValueError):
+                validate_config(dict(current, policy_architecture=architecture))
+
     def test_mixed_distance_config_uses_arrival_reward(self):
         v9 = config('v9')
         self.assertEqual(reward_contract(v9), 'uav_remaining_route_mapping_v9')

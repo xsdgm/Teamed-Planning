@@ -295,16 +295,3 @@ class EvidenceGrid:
     def reset(self) -> None:
         """Clear all accumulated evidence (call at mission start)."""
         self._evidence[:] = 0.0
-
-    # ── Debug helpers ─────────────────────────────────────────────────────────
-
-    def coverage_fraction(self) -> float:
-        """Fraction of grid cells that have received at least one observation."""
-        return float(np.count_nonzero(self._evidence)) / self._evidence.size
-
-    def obstacle_fraction(self) -> float:
-        """Fraction of observed cells currently classified as obstacle."""
-        observed = self._evidence != 0
-        if not np.any(observed):
-            return 0.0
-        return float(np.sum(self._evidence[observed] > 0)) / np.count_nonzero(observed)

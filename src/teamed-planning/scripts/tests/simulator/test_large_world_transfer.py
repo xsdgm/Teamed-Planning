@@ -3,7 +3,6 @@ import contextlib, io, sys, unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 import numpy as np
-from drone.mappo import ActorCritic
 from simulator.mappo_experiment import Experiment,DeliveredEvidence
 from simulator.large_world_scenarios import CircleGeometry,raster_free,reference_route
 
@@ -11,7 +10,7 @@ from simulator.large_world_scenarios import CircleGeometry,raster_free,reference
 class TransferTests(unittest.TestCase):
     def test_ledger_and_boundary_expand_without_changing_sensor(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            env=Experiment(1,ActorCritic(),world_size=1000.,start=(30.,500.),
+            env=Experiment(1,None,world_size=1000.,start=(30.,500.),
                 scene=(np.array([780.,500.]),[],1),moving_ground=True,stop_on_ground_arrival=False)
         try:
             self.assertEqual(env.ledger.seen.shape,(500,500))

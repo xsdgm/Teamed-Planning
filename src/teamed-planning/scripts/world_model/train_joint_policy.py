@@ -27,7 +27,7 @@ from world_model.scene_manifest import make_scene
 from world_model.train_residual_world import load_data, tensor_batch, evaluate
 from world_model.residual_world import ResidualWorldModel, infer, objective, MODEL_SCHEMA
 from world_model.frozen_navigation import digest, write_json, CHECKPOINT_SHA
-from world_model.hierarchical_sources import snapshot_sources, source_hashes
+from world_model.hierarchical_sources import atomic_checkpoint, snapshot_sources, source_hashes
 
 
 def train_world_batch(model, optimizer, data, device, rng, epochs=2, batch_size=256):
@@ -143,15 +143,13 @@ def main():
 
     def checkpoint(name):
         path = output / 'checkpoints' / name
-        temp = path.with_suffix('.tmp')
-        torch.save(dict(fast=fast.state_dict(), world=world.state_dict(),
+        atomic_checkpoint(path, dict(fast=fast.state_dict(), world=world.state_dict(),
             actor_optimizer=actor_optimizer.state_dict(), critic_optimizer=critic_optimizer.state_dict(),
             world_optimizer=world_optimizer.state_dict(), config=config, manifest=manifest,
             completed_updates=completed, actor_optimizer_updates=actor_updates,
             world_optimizer_updates=world_updates, training_env_steps=env_steps,
             torch_rng=torch.get_rng_state(), numpy_rng=rng.bit_generator.state,
-            cuda_rng=torch.cuda.get_rng_state(device) if device.type == 'cuda' else None), temp)
-        temp.replace(path)
+            cuda_rng=torch.cuda.get_rng_state(device) if device.type == 'cuda' else None))
 
     try:
         checkpoint('initial.pt')

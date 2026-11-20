@@ -44,6 +44,8 @@ def main():
     parser.add_argument('--seeds',type=int,nargs='+',help='override validation_seeds')
     parser.add_argument('--subgoal-radius',type=float,
                         help='override: relay subgoals at most this far ahead (ground/subgoal_manager.py); 0 disables')
+    parser.add_argument('--subgoal-review-interval',type=float,
+                        help='time between direction reviews in simulation seconds')
     parser.add_argument('--termination',choices=('map','arrival'),
                         help="override: end at a stable task graph or at vehicle arrival")
     parser.add_argument('--chain-ranges',type=float,nargs=2,metavar=('GROUND','LINK'),
@@ -53,6 +55,8 @@ def main():
     args=parser.parse_args()
     if args.every < 1:
         parser.error('--every must be a positive integer')
+    if args.subgoal_review_interval is not None and not 0 < args.subgoal_review_interval < float('inf'):
+        parser.error('--subgoal-review-interval must be a positive finite duration')
     names = args.checkpoints
     if not names:
         names = [p.name for p in sorted(args.run.glob('episode_*.pt'))
@@ -74,6 +78,8 @@ def main():
     # Without overrides each checkpoint keeps its own training protocol.
     if args.subgoal_radius is not None:
         protocol['subgoal_radius']=args.subgoal_radius or None
+    if args.subgoal_review_interval is not None:
+        protocol['subgoal_review_interval'] = args.subgoal_review_interval
     if args.termination:
         protocol['termination']=args.termination
     if args.chain_ranges:

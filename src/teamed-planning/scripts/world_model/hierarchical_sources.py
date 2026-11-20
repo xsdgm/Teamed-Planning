@@ -1,13 +1,15 @@
 """Source inventories and frozen-layout compatibility for hierarchical navigation.
 
-New runs use world_model. Historical vtemp2 snapshots remain byte-for-byte
-unchanged and are imported under their original package and module names.
+VTemp3 source modules keep the flat world_model package in run snapshots.
+Historical vtemp2 snapshots are imported under their original package and
+module names.
 """
 from __future__ import annotations
 
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -25,7 +27,6 @@ BACKEND_NAME = '_wildscenes_map_backend.py'
 
 
 def _navigation_source(source, filename):
-    # Hierarchical snapshots store public module filenames at package root.
     flat = source / filename
     return flat if flat.is_file() else source / 'navigation' / filename
 
@@ -38,16 +39,38 @@ def source_package(source):
     return 'world_model'
 
 
-def source_files(source):
-    """Select this feature's sources without copying unrelated world models."""
+def source_paths(source):
+    """Map frozen basenames to the files supplying their source."""
     source = Path(source)
     if source_package(source) == 'vtemp2':
-        return sorted(source.glob('*.py'))
+        return {path.name: path for path in sorted(source.glob('*.py'))}
     names = {name + '.py' for name in MODULE_MAP.values()}
     # run_io.py is part of the hash inventory in earlier flat snapshots.
-    names.update(('__init__.py', 'hierarchical_sources.py', 'run_io.py', BACKEND_NAME))
-    paths = (_navigation_source(source, name) for name in sorted(names))
-    return [path for path in paths if path.is_file()]
+    names.update(('__init__.py', 'hierarchical_sources.py', 'run_io.py', 'partial_observation.py',
+                  'ground_evidence.py', 'ground_policy.py', 'ground_relay.py', BACKEND_NAME))
+    paths = {name: _navigation_source(source, name) for name in sorted(names)}
+    # New source trees keep vehicle/simulation extensions in their own packages.
+    # Flat snapshots retain their original files and keep taking precedence.
+    for name, family in (('ground_policy.py', 'ground'),
+                         ('ground_evidence.py', 'simulator'), ('ground_relay.py', 'simulator')):
+        if not paths[name].is_file():
+            paths[name] = source.parent / family / name
+    for family in ('ground', 'simulator'):
+        saved_init = source / family / '__init__.py'
+        current_init = source.parent / family / '__init__.py'
+        if saved_init.is_file():
+            paths[family + '/__init__.py'] = saved_init
+        elif current_init.is_file() and source.name == 'world_model' and (source / 'navigation').is_dir():
+            paths[family + '/__init__.py'] = current_init
+    trainer = source / 'train_vtemp3.py'
+    if trainer.is_file():
+        paths['train_hierarchical.py'] = trainer
+    return {name: path for name, path in paths.items() if path.is_file()}
+
+
+def source_files(source):
+    """Select this feature's physical sources without unrelated world models."""
+    return list(source_paths(source).values())
 
 
 def atomic_json(path, value, *, ensure_ascii=False):
@@ -58,6 +81,32 @@ def atomic_json(path, value, *, ensure_ascii=False):
         with stream:
             json.dump(value, stream, ensure_ascii=ensure_ascii, indent=2, allow_nan=False)
             stream.write('\n')
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_checkpoint(path, value, *, append_suffix=False, stream=False):
+    """Publish a complete, durable Torch checkpoint without exposing partial writes."""
+    import torch
+
+    path = Path(path)
+    # Torch uses the filename stem for the ZIP archive's internal root. Keep
+    # both historical temporary suffix conventions and optional file-object
+    # writing so consolidation does not change serialized checkpoint bytes.
+    temporary = path.with_suffix(path.suffix + '.tmp' if append_suffix else '.tmp')
+    if temporary == path:
+        temporary = path.with_name(path.name + '.tmp')
+    try:
+        if stream:
+            with temporary.open('wb') as handle:
+                torch.save(value, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+        else:
+            torch.save(value, temporary)
+            with temporary.open('rb') as handle:
+                os.fsync(handle.fileno())
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -88,7 +137,7 @@ def copy_source_files(root, destination, relative_paths):
 
 
 def source_hashes(source):
-    return {path.name: file_sha256(path) for path in source_files(source)}
+    return {name: file_sha256(path) for name, path in source_paths(source).items()}
 
 
 def snapshot_sources(source, target, include_backend=False):
@@ -97,8 +146,29 @@ def snapshot_sources(source, target, include_backend=False):
     if source == target:
         raise ValueError('Snapshot target must differ from source')
     target.mkdir(parents=True, exist_ok=True)
-    for path in source_files(source):
-        shutil.copy2(path, target / path.name)
+    paths = source_paths(source)
+    for name, path in paths.items():
+        # New layouts resolve these aliases to the sibling package.  Keeping a
+        # second flat copy would create a distinct Python module in snapshots.
+        relocated = {'ground_policy.py': 'ground', 'ground_evidence.py': 'simulator',
+                     'ground_relay.py': 'simulator'}
+        if name in relocated and path.parent.name == relocated[name]:
+            continue
+        destination = target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+    # Relocated modules use their public ground/simulator names. Preserve those
+    # imports alongside the flat compatibility copies in a newly frozen run.
+    for name, family in (('ground_policy.py', 'ground'),
+                         ('ground_evidence.py', 'simulator'), ('ground_relay.py', 'simulator')):
+        path = paths.get(name)
+        extension = source.parent / family / name
+        if path is not None and (path.parent.name == family or (family + '/__init__.py' in paths and extension.is_file())):
+            path = extension if extension.is_file() else path
+            destination = target.parent / family
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination / name)
+            shutil.copy2(paths[family + '/__init__.py'], destination / '__init__.py')
     if include_backend:
         backend = source / BACKEND_NAME
         if not backend.is_file():

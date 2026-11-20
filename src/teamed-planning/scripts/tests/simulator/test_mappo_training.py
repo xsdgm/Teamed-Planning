@@ -21,14 +21,13 @@ class TrainingTests(unittest.TestCase):
 
     def test_exploration_candidates_are_shared_and_bounded(self):
         obs=dict(time=20.,ground_robots={'g':dict(position=[15,60,0],target=[100,60])})
-        variants=[CandidateNavigator('drone_0',algorithm=a,exploration_candidates=5,
-                    world_bounds=(0,0,120,120),comm_range=95.)
-                  for a in ('greedy','cadmm_controlled')]
-        encoded=[nav.encode((24.,60.,15.),obs) for nav in variants]
-        for other in encoded[1:]:
-            np.testing.assert_array_equal(encoded[0][0],other[0])
-            np.testing.assert_array_equal(encoded[0][1],other[1])
-            self.assertEqual(encoded[0][2],other[2])
+        nav = CandidateNavigator('drone_0', algorithm='cadmm_controlled', exploration_candidates=5,
+                                 world_bounds=(0, 0, 120, 120), comm_range=95.)
+        _, mask, candidates, _ = nav.encode((24., 60., 15.), obs)
+        self.assertEqual(len(mask), 21)
+        self.assertLessEqual(len(candidates), 21)
+        with self.assertRaises(ValueError):
+            CandidateNavigator('drone_0', algorithm='greedy')
         all_explore=CandidateNavigator('drone_0',exploration_candidates=20)
         self.assertEqual(len(all_explore.encode((24.,60.,15.),obs)[2]),21)
 

@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from .abstract_data import (AbstractTasks, STATE_NAMES, TRAVEL_WEIGHT,
     baseline_features, load_prepared, prepare, utility, query_mask)
 from .abstract_model import AbstractWorldModel, ARCHITECTURE, FORMAT, SCHEMA_VERSION, loss
-from .hierarchical_sources import copy_source_files
+from .hierarchical_sources import atomic_checkpoint, copy_source_files
 from .semantic_data import atomic_json, sha256
 
 V9_SHA256='7ac3aedcc3876902773b2241f60e839eb3e3b5630ddeb3c8be660421f2c24198'
@@ -27,8 +27,8 @@ SOURCES=('world_model/__init__.py', 'world_model/hierarchical_sources.py', 'worl
          'world_model/goose_data.py','world_model/terrain/frontier_data.py','world_model/semantic_data.py')
 
 
-def checkpoint_save(path,document):
-    path=Path(path);temporary=path.with_suffix('.tmp');torch.save(document,temporary);temporary.replace(path)
+def checkpoint_save(path, document):
+    return atomic_checkpoint(path, document)
 
 
 def choice_metrics(scores,arrays,indices=None):

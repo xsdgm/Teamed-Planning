@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
-from drone.mappo import ActorCritic, CandidateNavigator, GLOBAL_FEATURES
+from drone.mappo import CandidateNavigator
 from common.graph_structure import TopologicalGraph
 from simulator.mappo_experiment import DeliveredEvidence, evidence_metrics
 
@@ -34,14 +34,14 @@ class MAPPOTests(unittest.TestCase):
         self.assertFalse(ledger.seen.any())
 
     def test_missing_task_holds_and_ignores_privileged_fields(self):
-        nav = CandidateNavigator('drone_0', algorithm='greedy')
+        nav = CandidateNavigator('drone_0', algorithm='cadmm_controlled')
         p = (20.,30.,15.)
         obs = dict(full_state={'all_robots_positions': np.ones((10,3))},
                    ground_robots={'g': {'broadcast': {'target':[100,100]}, 'position':[10,10]}})
         self.assertEqual(nav.compute_next_target(p, obs),p)
 
-    def test_white_list_and_candidate_permutation(self):
-        nav = CandidateNavigator('drone_0', algorithm='greedy', comm_range=100.)
+    def test_white_list_ignores_privileged_fields(self):
+        nav = CandidateNavigator('drone_0', algorithm='cadmm_controlled', comm_range=100.)
         obs = dict(ground_robots={'g':dict(position=[15,30,0],target=[80,30],planned_path=[])})
         a = nav.encode((20,30,15),obs)
         obs['ground_robots']['g']['broadcast'] = {'secret':np.ones(100), 'target':[999,999]}
@@ -49,14 +49,9 @@ class MAPPOTests(unittest.TestCase):
         b = nav.encode((20,30,15),obs)
         np.testing.assert_array_equal(a[0],b[0])
         np.testing.assert_array_equal(a[1],b[1])
-        model = ActorCritic()
-        x,mask = torch.from_numpy(a[0]),torch.from_numpy(a[1])
-        perm = torch.randperm(len(mask))
-        np.testing.assert_allclose(model.distribution(x,mask).probs.detach().numpy()[perm],
-            model.distribution(x[perm],mask[perm]).probs.detach().numpy(), atol=1e-7)
 
     def test_missing_neighbor_forces_hold(self):
-        nav = CandidateNavigator('drone_0',total_drones=3,algorithm='greedy')
+        nav = CandidateNavigator('drone_0',total_drones=3,algorithm='cadmm_controlled')
         _,mask,_,_ = nav.encode((20,30,15),dict(ground_robots={'g':dict(position=[15,30,0],target=[80,30])}))
         self.assertEqual(mask.sum(),1)
 

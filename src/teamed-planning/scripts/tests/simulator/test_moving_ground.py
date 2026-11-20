@@ -7,7 +7,6 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
-from drone.mappo import ActorCritic
 from drone.cbf_safety import CBFSafetyFilter
 from simulator.mappo_experiment import Experiment,navigation_cost,cadmm_exploration_reward
 from ground.ground_main import GroundRobotController
@@ -17,7 +16,7 @@ class MovingGroundTests(unittest.TestCase):
     def test_vehicle_motion_without_delivered_maps_has_no_map_reward(self):
         torch.set_num_threads(1)
         with contextlib.redirect_stdout(io.StringIO()):
-            env=Experiment(20000,ActorCritic(),drop=1.,moving_ground=True,
+            env=Experiment(20000,None,drop=1.,moving_ground=True,
                 reward_mode='cadmm_exploration',communication_mode='chain',safety_filter='cbf')
             for frame in range(8):
                 _,reward,metrics=env.step(frame)
@@ -67,7 +66,7 @@ class MovingGroundTests(unittest.TestCase):
     def test_ground_moves_receives_maps_and_updates_mission(self):
         torch.set_num_threads(1);torch.manual_seed(42)
         with contextlib.redirect_stdout(io.StringIO()):
-            env=Experiment(20000,ActorCritic(),stochastic=True,exploration_candidates=5,
+            env=Experiment(20000,None,stochastic=True,exploration_candidates=5,
                 communication_mode='chain',safety_filter='cbf',moving_ground=True,
                 reward_mode='cadmm_exploration')
             start=env.obs[env.ground]['self']['position'].copy()

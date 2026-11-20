@@ -25,7 +25,7 @@ from world_model.frozen_navigation import write_json, CHECKPOINT_SHA
 from world_model.belief_rollouts import collect_scene
 from world_model.residual_world import ResidualWorldModel, MODEL_SCHEMA, infer, objective
 from world_model.telemetry import SCHEMA
-from world_model.hierarchical_sources import snapshot_sources, source_hashes as hierarchical_source_hashes
+from world_model.hierarchical_sources import atomic_checkpoint, snapshot_sources, source_hashes as hierarchical_source_hashes
 
 
 def load_data(paths):
@@ -85,13 +85,11 @@ def evaluate(model, data, device, batch_size=256):
 
 
 def save_checkpoint(path, model, optimizer, config, epoch, updates, source_hashes):
-    temporary = path.with_suffix('.tmp')
-    torch.save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(), config=config,
+    atomic_checkpoint(path, dict(model=model.state_dict(), optimizer=optimizer.state_dict(), config=config,
                     completed_epochs=epoch, optimizer_updates=updates,
                     schema=MODEL_SCHEMA, telemetry_schema=SCHEMA,
                     actor_checkpoint_sha256=CHECKPOINT_SHA, source_sha256=source_hashes,
-                    torch_rng=torch.get_rng_state()), temporary)
-    temporary.replace(path)
+                    torch_rng=torch.get_rng_state()))
 
 
 def snapshot(args):

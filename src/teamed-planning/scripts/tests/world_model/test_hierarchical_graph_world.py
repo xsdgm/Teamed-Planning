@@ -205,8 +205,8 @@ class GraphWorldTests(unittest.TestCase):
         fields = dict(zip(ROAD_SUMMARY_FIELDS, cut))
         self.assertEqual(fields['anchors_connected'], 0.)
         self.assertAlmostEqual(fields['anchor_component_fraction'], 46. / 60.)
-        self.assertAlmostEqual(fields['nearest_reachable_to_target_m'], 140. / 95.)
-        self.assertAlmostEqual(complete[ROAD_SUMMARY_FIELDS.index('anchor_path_m')], 590. / 95., places=5)
+        self.assertAlmostEqual(fields['nearest_reachable_to_target_over_95m'], 140. / 95.)
+        self.assertAlmostEqual(complete[ROAD_SUMMARY_FIELDS.index('anchor_path_over_95m')], 590. / 95., places=5)
         graph.remove_edge(52, 53)
         changed = build_road_topology(wrapped, coordinates[0], coordinates[59])
         self.assertFalse(np.array_equal(changed[len(ROAD_SUMMARY_FIELDS):-496],

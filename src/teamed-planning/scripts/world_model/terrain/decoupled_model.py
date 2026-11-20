@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 from .decoupled_observation import (ACTION_CONTRACT, ARCHITECTURE, CHANNELS, CHECKPOINT_FORMAT,
                                     DRONE_FEATURES, GROUND_FEATURES, HALF_EXTENT, SCHEMA_VERSION,
                                     SIDE, VEHICLE_RUNTIME, motion_state)
-from .hierarchical_sources import atomic_json, file_sha256
+from .hierarchical_sources import atomic_checkpoint, atomic_json, file_sha256
 
 
 class _Predictor(nn.Module):
@@ -319,9 +319,7 @@ def train_model(dataset_dir, output, *, epochs=20, batch_size=16, learning_rate=
         for name in ('last.pt', 'best.pt'):
             if name == 'best.pt' and metrics['validation']['loss'] >= best:
                 continue
-            temporary = output/(name+'.tmp')
-            torch.save(checkpoint, temporary)
-            temporary.replace(output/name)
+            atomic_checkpoint(output/name, checkpoint, append_suffix=True)
         best = min(best, metrics['validation']['loss'])
     selected = min(history, key=lambda row: row['validation']['loss'])
     return dict(checkpoint=str(output/'best.pt'), epochs=epochs, best_epoch=selected['epoch'],

@@ -1,178 +1,337 @@
-"""Relay subgoals for a goal beyond the reach of the drone chain.
+"""vtemp1 directional lookahead for ground travel and aerial mapping."""
+from dataclasses import dataclass
+from heapq import heappop, heappush
+from itertools import count
+from numbers import Real
 
-The vehicle drives to a temporary target within reach of the chain and
-broadcasts it as its mission target, so the drones map the same stretch.
-Only the vehicle's own position, its fused graph and the surveyed world
-bounds are used; no map truth or reference route.
-"""
 import numpy as np
 
 
-class SubgoalManager:
-    """Hold one subgoal until the vehicle arrives near it or it fails.
+DEFAULT_REVIEW_INTERVAL_S = 15.0
+ROAD_SUPPORT_WEIGHT = 1.5
+SUPPORT_GAIN_M = 10.0
 
-    Candidates on rings around the vehicle are scored by the straight-line
-    distance from the vehicle plus the distance to the goal (optimistic A*
-    through unknown space) plus decaying penalties near failed subgoals.
-    Ties along the straight segment go to the point closest to the goal.
-    A subgoal fails when the vehicle moves `retreat` m farther from it than
-    its closest approach, when for `stall` s the vehicle neither closes in
-    nor sees the graph grow in the corridor toward it, or when it has not
-    closed in for `max_wait` s even though the graph grows. The penalty then lets
-    side or rear candidates win, which gives detours and backtracking.
-    Penalties decay instead of banning, so a wrongly failed area can be
-    retried later.
-    """
+
+@dataclass(frozen=True)
+class FailedApproach:
+    position: np.ndarray  # Vehicle position when progress failed.
+    direction: np.ndarray
+    time: float
+    support: float  # Connected road support for this approach at failure.
+
+
+class LookaheadGuidance:
+    """Represent a travel direction by a rolling point inside the survey radius."""
+
     def __init__(self, goal, radius=200., arrival=25., snap=20., snap_distance=None,
-                 stall=180., max_wait=600., retreat=40., corridor=30., penalty_radius=60.,
-                 penalty_decay=600., directions=24, world_bounds=None, margin=10.):
+                 stall=180., max_wait=600., retreat=40., corridor=30., penalty_radius=5.,
+                 penalty_decay=600., directions=24, world_bounds=None, margin=10.,
+                 review_interval=DEFAULT_REVIEW_INTERVAL_S):
         if not 0 < arrival < radius or snap < 0 or not 0 < stall <= max_wait or retreat <= 0:
             raise ValueError('Require 0 < arrival < radius, snap >= 0, 0 < stall <= max_wait and retreat > 0')
-        self.goal=np.asarray(goal,float)[:2]
-        self.radius,self.arrival,self.retreat=float(radius),float(arrival),float(retreat)
-        self.stall,self.max_wait=float(stall),float(max_wait)
-        # Snap a little before the arrival radius (default: arrival + 25 m).
-        snap_distance=self.arrival+25. if snap_distance is None else snap_distance
-        self.snap,self.snap_distance,self.corridor=float(snap),float(snap_distance),float(corridor)
-        self.penalty_radius,self.penalty_decay=float(penalty_radius),float(penalty_decay)
-        self.directions=int(directions)
-        self.world_bounds=world_bounds
-        self.margin=float(margin)
-        self.target=None
-        self.origin=None  # Vehicle position when the target was selected
-        self.final=False
-        self.snapped=False
-        self.failures=[]  # (failed target, time)
-        self.selected=self.arrivals=self.failed=0
-        self._best=self._since=self._approached=0.
-        self._nodes=0
-        self.finishing=False
+        if type(review_interval) not in (float, int) or not np.isfinite(review_interval) or review_interval <= 0:
+            raise ValueError('review_interval must be a positive finite duration in seconds')
+        if directions < 3 or corridor <= 0 or penalty_radius < 0 or penalty_decay <= 0:
+            raise ValueError('Require a positive corridor and decay, a nonnegative penalty radius, and >= 3 directions')
+        self.goal = np.asarray(goal, float)[:2]
+        self.radius, self.arrival = float(radius), float(arrival)
+        self.stall, self.max_wait, self.retreat = float(stall), float(max_wait), float(retreat)
+        self.corridor = float(corridor)
+        self.penalty_radius, self.penalty_decay = float(penalty_radius), float(penalty_decay)
+        self.directions = int(directions)
+        self.world_bounds, self.margin = world_bounds, float(margin)
+        self.review_interval = float(review_interval)
+        self.target = self.origin = self._direction = self._route_direction = None
+        self.final = self.finishing = self.direction_changed = False
+        # Legacy configurations and recorders carry snap options/status. A
+        # direction marker can pass an obstacle without snapping onto a node.
+        self.snapped = False
+        self.failures = []
+        self.selected = self.arrivals = self.failed = self.reviews = 0
+        self._last_review = self._last_update = None
+        self._last_position = None
+        self._progress = 0.
+        self._best = self._support = self._since = self._approached = 0.
 
-    def update(self, position, graph, now):
-        """Return (target, changed); the vehicle replans only when changed."""
-        p=np.asarray(position,float)[:2]
-        if self.finishing and np.linalg.norm(self.goal-p)>self.radius:
-            # A large detour must return to local reconnaissance targets;
-            # capturing the final goal never overrides the flight radius.
-            self.finishing=False
-            self.target=None
-            self.final=False
-        # Once near the real destination, keep it as the navigation goal.
-        # Failure penalties belong to exploratory approaches, not to the
-        # final arrival manoeuvre. This does NOT enlarge the arrival tolerance.
-        if self.finishing or np.linalg.norm(self.goal-p)<=min(self.arrival,25.):
-            self.finishing=True
-            if self.target is None or not self.final:
-                self.target=self.goal.copy()
-                self.origin=p.copy()
-                self.final=True
-                self.snapped=False
-                self.selected+=1
-                self._since=now
-                return self.target,True
-            # A local deadlock still requests replanning; it must not turn
-            # into a distant survey target that pulls the car away again.
-            if now-self._since>=self.stall:
-                self._since=now
-                return self.target,True
-            return self.target,False
-        if self.target is None:
-            return self._select(p,graph,now),True
-        distance=float(np.linalg.norm(self.target-p))
-        if not self.final and distance<=self.arrival:
-            self.arrivals+=1
-            return self._select(p,graph,now),True
-        if distance>self._best+self.retreat:
-            return self._fail(p,graph,now),True
-        # Graph growth is counted in the fixed corridor from the selection
-        # point, so driving away cannot masquerade as mapping progress.
-        nodes=self._count(graph,self.origin,self.target)
-        closer=distance<self._best-2.
-        if closer:
-            self._approached=now
-        if closer or nodes>self._nodes+10:
-            self._best=min(self._best,distance)
-            self._nodes=max(self._nodes,nodes)
-            self._since=now
-        elif now-self._since>=self.stall:
-            return self._fail(p,graph,now),True
-        # Graph growth postpones a failure only up to `max_wait` without approach.
-        if now-self._approached>=self.max_wait:
-            return self._fail(p,graph,now),True
-        # Close to an intermediate target, move it once onto a mapped free node
-        # so it cannot remain inside an obstacle. Snapping earlier only forces
-        # needless replanning while the vehicle is still far away.
-        if not self.final and not self.snapped and distance<=self.snap_distance:
-            node=self._snap_node(self.target,graph)
-            if node is not None:
-                self.target,self.snapped=node,True
-                self._best=float(np.linalg.norm(node-p))
-                return self.target,True
-        return self.target,False
+    def update(self, position, graph, now, entry_allowed=None):
+        """Return (shared target, needs update) using this frame's filtered road graph.
 
-    def _fail(self, p, graph, now):
-        self.failed+=1
-        self.failures.append((self.target.copy(),now))
-        return self._select(p,graph,now)
+        entry_allowed(xy) checks a short car-to-road connection using current
+        local observations. Standalone callers without one can enter at the car.
+        """
+        p = np.asarray(position, float)[:2]
+        self.direction_changed = False
+        if self._last_update is not None and now < self._last_update:
+            self.target = None
+            self._direction = None
+            self.finishing = False
+            self.failures = [failure for failure in self.failures if failure.time <= now]
+        self._last_update = now
 
-    def _select(self, p, graph, now):
-        offset=self.goal-p
-        heading=np.arctan2(offset[1],offset[0])
-        angles=heading+np.linspace(-np.pi,np.pi,self.directions,endpoint=False)
-        rays=np.stack([np.cos(angles),np.sin(angles)],-1)
-        points=(p+self.radius*np.array([1.,2/3,1/3])[:,None,None]*rays).reshape(-1,2)
+        goal_distance = np.linalg.norm(self.goal - p)
+        if self.finishing and goal_distance > self.radius:
+            self.finishing = False
+            self.target = self._direction = None
+        if self.finishing or goal_distance <= min(25., self.arrival):
+            self.finishing = True
+            changed = self.target is None or not self.final
+            if changed:
+                self.target, self.origin, self.final = self.goal.copy(), p.copy(), True
+                self.selected += 1
+                self._since = now
+            if now - self._since >= self.stall:
+                self._since = now
+                changed = True
+            self._last_review = now
+            self.direction_changed = changed
+            return self.target, changed
+
+        initial = self.target is None
+        early = failed = False
+        if not initial:
+            # Accumulate actual motion along the bearing active during each
+            # step, so a gradual bend does not look like a retreat.
+            self._progress += float((p - self._last_position) @ self._direction)
+            self._last_position = p.copy()
+            if self._progress > self._best + 2.:
+                self._best, self._since, self._approached = self._progress, now, now
+            retreated = self._progress < self._best - self.retreat
+            timed_out = now - self._approached >= self.max_wait
+            failed = retreated or timed_out
+            # A fast vehicle can pass the old marker between two scheduled
+            # reviews. Refresh before the controller would steer back toward it.
+            length = np.linalg.norm(self.target - self.origin)
+            if not self.final and length > 1e-8:
+                early = (np.linalg.norm(self.target - p) <= min(self.arrival, length / 2)
+                         or (p - self.origin) @ self._direction >= length)
+            if (not early and not failed and now - self._since < self.stall
+                    and now - self._last_review < self.review_interval):
+                return self.target, False
+
+        points = self._candidates(p, goal_distance)
+        offsets = points - p
+        lengths = np.linalg.norm(offsets, axis=1)
+        rays = offsets / np.maximum(lengths[:, None], 1e-9)
+        remaining = np.linalg.norm(points - self.goal, axis=1)
+        reference = self._direction if not initial else None
+        if self.final and not initial and np.any(remaining < 1e-8):
+            reference = (self.goal - p) / goal_distance
+        support, outside_support = self._road_support(p, graph, rays, lengths, entry_allowed, reference)
+        turn_threshold = np.cos(np.pi / self.directions)
+        same_heading = (np.zeros(len(points), dtype=bool) if initial else
+                        rays @ self._direction >= turn_threshold)
+
+        if not initial:
+            prior_support = float(np.max(support[same_heading], initial=0.))
+            if prior_support > self._support + SUPPORT_GAIN_M:
+                self._since, self._support = now, prior_support
+            failed = failed or now - self._since >= self.stall
+            if failed:
+                self.failures.append(FailedApproach(p.copy(), self._direction.copy(), now, prior_support))
+                self.failed += 1
+            if early:
+                self.arrivals += 1
+
+        # Let a surveyed, continuous detour outweigh a modest increase in
+        # remaining straight-line distance. Unknown directions can still win.
+        penalties = self._approach_penalties(p, rays, support, turn_threshold, now)
+        penalties[remaining < 1e-8] = 0.  # The mission destination is immutable.
+        scoring_support = support
+        holding = np.zeros(len(points), dtype=bool)
+        if not initial and not failed:
+            # Compare the actual bearings. Rolling the marker forward along
+            # the existing bearing, or tracking the same fixed destination,
+            # should not pay a turn cost.
+            cosine = np.clip(rays @ reference, -1., 1.)
+            holding = cosine >= 1. - 1e-12
+            if holding.any():
+                # A local bend that still fits the current corridor is already
+                # available to the vehicle planner. Aligning a new bearing
+                # with that same bend should not earn an extra mapping credit.
+                held_support = np.max(support[holding])
+                scoring_support = np.minimum(support, np.maximum(held_support, outside_support))
+                angles = np.degrees(np.arccos(cosine))
+                turn_cost = (10. + .2 * angles) * (self.radius / 200.)
+                penalties += np.where(holding, 0., turn_cost)
+        scores = remaining - ROAD_SUPPORT_WEIGHT * scoring_support + penalties
+        index = int(np.lexsort((remaining, ~holding, np.round(scores, 6)))[0])
+        new_target = points[index]
+        final = remaining[index] < 1e-8
+        moved = initial or np.linalg.norm(new_target - self.target) > 1e-6
+        new_direction = initial or failed or final != self.final or (moved and not same_heading[index])
+        # The vehicle may reuse its route across several small successive
+        # rolls. Account for their cumulative turn relative to that route.
+        self.direction_changed = new_direction or (moved and rays[index] @ self._route_direction < turn_threshold)
+        if moved:
+            self.selected += 1
+        if self.direction_changed:
+            self._route_direction = rays[index].copy()
+        if new_direction:
+            self._progress = self._best = 0.
+            self._support = float(support[index])
+            self._since = self._approached = now
+        self._last_position = p.copy()
+        self.target, self.origin, self.final = new_target.copy(), p.copy(), bool(final)
+        self._direction = rays[index].copy()
+        self._last_review = now
+        self.reviews += 1
+        return self.target, moved or self.direction_changed
+
+    def _candidates(self, p, goal_distance):
+        goal_offset = self.goal - p
+        heading = np.arctan2(goal_offset[1], goal_offset[0])
+        angles = heading + np.arange(self.directions) * (2 * np.pi / self.directions)
+        rays = np.column_stack((np.cos(angles), np.sin(angles)))
+        if self.target is not None:
+            rays = np.vstack([rays, self._direction])
+        horizon = min(goal_distance, self.radius)
+        lengths = np.full(len(rays), horizon)
         if self.world_bounds is not None:
-            xmin,ymin,xmax,ymax=self.world_bounds
-            inside=((points[:,0]>=xmin+self.margin)&(points[:,0]<=xmax-self.margin)&
-                    (points[:,1]>=ymin+self.margin)&(points[:,1]<=ymax-self.margin))
-            points=points[inside]
-        if np.linalg.norm(offset)<=self.radius or not len(points):
-            points=np.vstack([self.goal,points])
-        remaining=np.linalg.norm(points-self.goal,axis=1)
-        scores=np.linalg.norm(points-p,axis=1)+remaining+self._penalty(points,now)
-        index=int(np.lexsort((remaining,np.round(scores,3)))[0])
-        self.final=bool(index==0 and remaining[0]==0.)
-        self.target=points[index].copy()
-        self.origin=p.copy()
-        self.snapped=False
-        self.selected+=1
-        self._best=float(np.linalg.norm(self.target-p))
-        self._nodes=self._count(graph,self.origin,self.target)
-        self._since=self._approached=now
-        return self.target
+            bounds = np.asarray(self.world_bounds, float).reshape(2, 2)
+            margin = np.minimum(self.margin, (bounds[1] - bounds[0]) / 2)
+            low, high = bounds[0] + margin, bounds[1] - margin
+            for axis in (0, 1):
+                direction = rays[:, axis]
+                moving = np.abs(direction) > 1e-9
+                boundary = np.where(direction > 0, high[axis], low[axis])
+                lengths[moving] = np.minimum(lengths[moving],
+                    (boundary[moving] - p[axis]) / direction[moving])
+            points = p + np.maximum(lengths, 0.)[:, None] * rays
+            inside = np.all((points >= low - 1e-8) & (points <= high + 1e-8), axis=1)
+            valid = inside & (lengths > 1e-6)
+            # Prefer a marker far enough to convey a heading. In a tiny
+            # survey box even the longest admissible ray may fall short.
+            useful = valid & (lengths >= min(self.arrival, horizon / 2))
+            points = points[useful if np.any(useful) else valid]
+        else:
+            points = p + lengths[:, None] * rays
+        if goal_distance <= self.radius:
+            points = np.vstack([self.goal, points])
+        if not len(points):
+            # Outside the surveyed box: approach its interior within the
+            # radius until an in-bounds direction becomes available.
+            toward = np.clip(self.goal, low, high) - p
+            points = p + toward[None, :] * min(1., horizon / max(np.linalg.norm(toward), 1e-9))
+        return points
 
-    def _penalty(self, points, now):
-        total=np.zeros(len(points))
-        for position,time in self.failures:
-            near=np.linalg.norm(points-position,axis=1)<=self.penalty_radius
-            total+=near*self.radius*np.exp(-(now-time)/self.penalty_decay)
-        # A failed approach is not a failed mission destination. Penalizing
-        # the destination itself sends nearby missions on repeated 60m+
-        # excursions. The ground planner now handles failed local approaches.
-        total[np.linalg.norm(points-self.goal,axis=1)<1e-9]=0.
-        return total
+    def _road_support(self, p, graph, rays, lengths, entry_allowed, reference=None):
+        """Measure continuous road support, including reach outside the held corridor."""
+        support = np.zeros(len(rays))
+        outside = np.zeros(len(rays))
+        if graph is None or not len(graph):
+            return support, outside
+        network = graph.graph
+        roads = {}
 
-    def _snap_node(self, point, graph):
-        if graph is None or len(graph)==0 or not self.snap:
-            return None
-        nearest=graph.find_nearest_node(tuple(point))
-        if nearest is None or nearest[1]>self.snap:
-            return None
-        return np.asarray(graph.get_node_position(nearest[0]),float)[:2]
+        def neighbors(node):
+            if node not in roads:
+                roads[node] = []
+                for other, edge in network[node].items():
+                    weight = edge.get('weight')
+                    if not edge.get('bridged') and isinstance(weight, Real) and 0 <= weight < np.inf:
+                        roads[node].append((other, weight))
+            return roads[node]
 
-    def _count(self, graph, start, end):
-        """Graph nodes within `corridor` m of the segment start -> end."""
-        if graph is None or len(graph)==0:
-            return 0
-        segment=end-start
-        length=float(np.linalg.norm(segment))
-        nearby=graph.find_nearby_nodes(tuple((start+end)/2),length/2+self.corridor)
-        if not nearby:
-            return 0
-        points=np.asarray([graph.get_node_position(node) for node,_ in nearby],float)[:,:2]
-        t=np.clip((points-start)@segment/max(length*length,1e-8),0.,1.)
-        return int(np.count_nonzero(np.linalg.norm(points-start-t[:,None]*segment,axis=1)<=self.corridor))
+        # Seed all locally accessible road components with the actual entry
+        # distance. With no vehicle observation only a coincident entry is known.
+        entries = []
+        for node, distance in graph.find_nearby_nodes(tuple(p), min(15., max(lengths))):
+            if not neighbors(node):
+                continue
+            if distance > 1e-6 and (entry_allowed is None or not entry_allowed(graph.get_node_position(node))):
+                continue
+            entries.append((node, distance))
+        if not entries:
+            return support, outside
+
+        # Every traversed edge stays within this heading's corridor. A branch
+        # that leaves and later re-enters cannot supply evidence past the gap.
+        # A little room behind the car also permits a local turn around a tree.
+        for index, (ray, length) in enumerate(zip(rays, lengths)):
+            coordinates = {}
+            if reference is not None:
+                along = reference @ ray
+                across = reference[0] * ray[1] - reference[1] * ray[0]
+
+            def credit(ahead, side, cost):
+                value = ahead - abs(side) - max(0., cost - ahead)
+                support[index] = max(support[index], value)
+                if reference is not None:
+                    forward = ahead * along - side * across
+                    lateral = ahead * across + side * along
+                    if forward < -self.corridor or abs(lateral) > self.corridor:
+                        outside[index] = max(outside[index], value)
+
+            def project(node):
+                if node not in coordinates:
+                    x, y = graph.get_node_position(node)[:2]
+                    dx, dy = x - p[0], y - p[1]
+                    coordinates[node] = (dx * ray[0] + dy * ray[1], dy * ray[0] - dx * ray[1])
+                return coordinates[node]
+
+            costs, queue = {}, []
+            sequence = count()
+            for node, distance in entries:
+                ahead, side = project(node)
+                if distance <= length and -self.corridor <= ahead <= length and abs(side) <= self.corridor:
+                    costs[node] = distance
+                    heappush(queue, (distance, next(sequence), node))
+
+            while queue:
+                cost, _, node = heappop(queue)
+                if cost != costs[node]:
+                    continue
+                ahead, side = project(node)
+                credit(ahead, side, cost)
+                for other, weight in neighbors(node):
+                    new_cost = cost + weight
+                    if new_cost >= costs.get(other, np.inf):
+                        continue
+                    end, lateral = project(other)
+                    if new_cost <= length and -self.corridor <= end <= length and abs(lateral) <= self.corridor:
+                        costs[other] = new_cost
+                        heappush(queue, (new_cost, next(sequence), other))
+                        continue
+                    # Count the continuous prefix of a long observed edge up
+                    # to its first exit or the travel budget. Its far endpoint
+                    # is available to the search only if the entire edge fits.
+                    fraction = 1.
+                    if new_cost > length:
+                        fraction = (length - cost) / weight
+                    if end > length:
+                        fraction = min(fraction, (length - ahead) / (end - ahead))
+                    elif end < -self.corridor:
+                        fraction = min(fraction, (-self.corridor - ahead) / (end - ahead))
+                    if abs(lateral) > self.corridor:
+                        limit = np.copysign(self.corridor, lateral)
+                        fraction = min(fraction, (limit - side) / (lateral - side))
+                    end = ahead + fraction * (end - ahead)
+                    lateral = side + fraction * (lateral - side)
+                    partial_cost = cost + fraction * weight
+                    credit(end, lateral, partial_cost)
+        return support, outside
+
+    def _approach_penalties(self, position, rays, support, turn_threshold, now):
+        """Discount a failed departure only at its local entry and bearing."""
+        penalties = np.zeros(len(rays))
+        retained = []
+        for failure in self.failures:
+            distance = np.linalg.norm(position - failure.position)
+            if distance <= self.penalty_radius:
+                aligned = rays @ failure.direction >= turn_threshold
+                # Require useful new reach beyond any gain that can be
+                # explained by the car's movement within this entry area.
+                if np.any(support[aligned] > failure.support + SUPPORT_GAIN_M + distance):
+                    continue
+                penalties[aligned] += self.radius * np.exp(-(now - failure.time) / self.penalty_decay)
+            retained.append(failure)
+        self.failures = retained
+        return penalties
 
     def stats(self):
-        return dict(subgoals_selected=float(self.selected),subgoal_arrivals=float(self.arrivals),
-                    subgoal_failures=float(self.failed))
+        return dict(subgoals_selected=float(self.selected), subgoal_arrivals=float(self.arrivals),
+                    subgoal_failures=float(self.failed), subgoal_reviews=float(self.reviews))
+
+
+# Existing callers use this name for the active vehicle guidance.
+SubgoalManager = LookaheadGuidance

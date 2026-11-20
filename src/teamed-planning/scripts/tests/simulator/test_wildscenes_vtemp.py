@@ -1,4 +1,4 @@
-"""Check the real frozen v9 runtime's VTemp temporary-goal contract.
+"""Check the real frozen v9 runtime's vtemp temporary-goal contract.
 
 Run this file in its own process: it deliberately refuses to mix a mutable
 working-tree simulator/drone/ground package with the frozen inference runtime.
@@ -66,6 +66,7 @@ class WildScenesVTempTests(unittest.TestCase):
         self.assertEqual(frozen, original)
 
     def test_runner_changes_only_temporary_goal_options(self):
+        self.assertEqual(self.runner.STRATEGY, "vtemp")
         case = dict(scene_seed=92000, start=[100., 500.], goal=[800., 500.])
         baseline = self.baseline.experiment_options(self.config, self.schedule, 1000., case)
         rolling = self.runner.experiment_options(self.config, self.schedule, 1000., case)

@@ -44,14 +44,16 @@ class ActorInputTests(unittest.TestCase):
                 validate_config(dict(c, **delta))
         self.assertIsNone(validate_config(dict(c, episodes_per_batch=None))['episodes_per_batch'])
 
-    def test_checkpoint_widths_round_trip(self):
-        for version in (1, 2):
-            gat = GraphAttentionActorCritic(GLOBAL_FEATURES, version)
-            rebuilt = ActorCritic.from_state_dict(gat.state_dict())
-            self.assertIsInstance(rebuilt, GraphAttentionActorCritic)
-            self.assertEqual((rebuilt.input_version, rebuilt.prefix, rebuilt.feature_version),
-                             (version, prefix_width(version), 4 if version == 1 else 6))
-        self.assertEqual((prefix_width(1), prefix_width(2)), (320, 322))
+    def test_checkpoint_loader_rejects_older_architectures(self):
+        with self.assertRaisesRegex(ValueError, 'version 2'):
+            GraphAttentionActorCritic(GLOBAL_FEATURES, 1)
+        gat = GraphAttentionActorCritic(GLOBAL_FEATURES, 2)
+        with self.assertRaisesRegex(ValueError, 'unsupported'):
+            ActorCritic.from_state_dict(gat.state_dict())
+        with self.assertRaisesRegex(ValueError, 'unsupported'):
+            ActorCritic.from_state_dict({'actor.0.weight': torch.zeros(64, 12)})
+        retained = RelayActorCritic(GLOBAL_FEATURES, 2)
+        self.assertIsInstance(ActorCritic.from_state_dict(retained.state_dict()), RelayActorCritic)
         self.assertEqual(make_model(config()).prefix, 322)
 
     def test_version_two_requires_the_controller_margin(self):

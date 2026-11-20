@@ -37,10 +37,10 @@ INPUT_KEYS = ('history', 'history_mask', 'context', 'baseline_states',
               'baseline_actions', 'node_mask', 'node_type', 'ego_mask', 'state_observed',
               'local_evidence')
 ROAD_INPUT_KEYS = (*INPUT_KEYS, 'road_topology')
-ROAD_SUMMARY_FIELDS = ('nodes', 'edges', 'components', 'independent_cycles', 'anchor_component_fraction',
-                       'largest_component_fraction', 'ego_to_anchor_m', 'has_target', 'ego_to_target_m',
-                       'target_to_anchor_m', 'anchors_connected', 'anchor_path_m',
-                       'nearest_reachable_to_target_m')
+ROAD_SUMMARY_FIELDS = ('log1p_nodes', 'log1p_edges', 'log1p_components', 'log1p_independent_cycles',
+                       'anchor_component_fraction', 'largest_component_fraction', 'ego_to_anchor_over_95m',
+                       'has_target', 'ego_to_target_over_95m', 'target_to_anchor_over_95m',
+                       'anchors_connected', 'anchor_path_over_95m', 'nearest_reachable_to_target_over_95m')
 _ROAD_SECTORS = 8
 _ROAD_RADII = (25., 95., 200.)
 _ROAD_BINS = (1 + len(_ROAD_RADII)) * _ROAD_SECTORS
@@ -60,10 +60,11 @@ def build_road_topology(local_graph, own_xy, target_xy=None, *, nearby_nodes=Non
     """
     result = np.zeros(ROAD_TOPOLOGY_WIDTH, np.float32)
     own = np.asarray(own_xy, dtype=float)[:2]
-    direction = np.zeros(2) if target_xy is None else np.asarray(target_xy, dtype=float)[:2] - own
-    distance = np.linalg.norm(direction)
-    if own.shape != (2,) or not np.isfinite(own).all() or not np.isfinite(distance):
+    target = own if target_xy is None else np.asarray(target_xy, dtype=float)[:2]
+    if own.shape != (2,) or target.shape != (2,) or not np.isfinite([own, target]).all():
         raise ValueError('Road features require finite receiver and task coordinates')
+    direction = target - own
+    distance = np.linalg.norm(direction)
     result[7:9] = (target_xy is not None, distance / 95.)
     if local_graph is None:
         return result
@@ -310,7 +311,7 @@ class GraphWorldModel(nn.Module):
 
 def infer(model, batch):
     """Whitelist inputs: labels, absolute simulator state, and future data stay out."""
-    return model(**{key: batch[key] for key in model.input_keys})
+    return model(**{key: batch[key] for key in getattr(model, 'input_keys', INPUT_KEYS)})
 
 
 def planning_readout(prediction, batch, *, belief, current_target, candidate_targets):

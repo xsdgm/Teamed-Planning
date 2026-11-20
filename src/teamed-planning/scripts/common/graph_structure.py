@@ -289,26 +289,6 @@ class TopologicalGraph:
         except (nx.NetworkXNoPath, nx.NodeNotFound, nx.exception.NetworkXError):
             return None
     
-    def get_path_length(self, start_node: str, goal_node: str,
-                       weight: str = 'weight') -> Optional[float]:
-        """
-        Get the length of the shortest path between two nodes.
-        
-        Args:
-            start_node: Starting node ID
-            goal_node: Goal node ID  
-            weight: Edge attribute to use as weight
-            
-        Returns:
-            Path length or None if no path exists
-        """
-        if start_node not in self.graph or goal_node not in self.graph:
-            return None
-        try:
-            length = nx.astar_path_length(self.graph, start_node, goal_node, weight=weight)
-            return length
-        except (nx.NetworkXNoPath, nx.NodeNotFound, nx.exception.NetworkXError):
-            return None
     
     def __len__(self) -> int:
         """Return number of nodes in the graph."""
@@ -691,18 +671,6 @@ class TopologicalGraph:
 
         return weight
 
-    def path_confidence(self, waypoints: List[Tuple[float, float]]) -> float:
-        """C(π) = min c(e) over all consecutive waypoint pairs (weakest-link).
-
-        Returns 0.0 for paths shorter than two waypoints.
-        """
-        if len(waypoints) < 2:
-            return 0.0
-        confidences = [
-            self.edge_confidence_from_positions(waypoints[i], waypoints[i + 1])
-            for i in range(len(waypoints) - 1)
-        ]
-        return float(min(confidences))
 
     # ── Path cost & observation prediction (for C-ADMM dispatcher) ──────────
 

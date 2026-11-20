@@ -230,7 +230,7 @@ def build_observation(belief,memory,config,*,now=0.,remaining_budget=1.,previous
 class HierarchicalEpisode:
     """Simulator adapter. No simulator truth is passed to the slow network."""
     def __init__(self,repo,case,config=None,*,fast_seed=0,rollout_limit=1800,random_init=False,
-                 v9_fast_reward=False):
+                 v9_fast_reward=False,training_observation_protocol=None):
         self.config=config or HierarchyConfig()
         self._repo=repo
         from .wildscenes_runtime import is_raster_case
@@ -249,10 +249,18 @@ class HierarchicalEpisode:
             self.v9_safety_failure_penalty=float(archived['safety_failure_penalty'])
         self.torch.manual_seed(int(fast_seed))
         raster_scope=contextlib.nullcontext()
+        self.observation_protocol='native'
         if self.raster_case:
             from .wildscenes_runtime import load_forest,load_map_backend,raster_runtime
             forest=load_forest(case,repo)
             raster_scope=raster_runtime(self.me,forest,load_map_backend(repo),case['required_clearance_m'])
+            self.observation_protocol='wildscenes_source_raster'
+        elif case.get('kind')=='v9_random' and training_observation_protocol is not None:
+            from .partial_observation import PARTIAL_OBSERVATION_PROTOCOL,partial_v9_runtime
+            if training_observation_protocol!=PARTIAL_OBSERVATION_PROTOCOL:
+                raise ValueError('Unsupported synthetic aerial observation protocol')
+            raster_scope=partial_v9_runtime(self.me,case['seed'])
+            self.observation_protocol=training_observation_protocol
         if case.get('kind') == 'v9_random' and 'circles_path' in case:
             from .scene_manifest import load_v9_circles
             circles = [(row[:2], float(row[2])) for row in load_v9_circles(case)]
@@ -484,6 +492,7 @@ class HierarchicalEpisode:
         from .hierarchical_safety import control_contract
         return dict(seed=self.case['seed'],kind=self.case['kind'],direct_distance_m=self.case['direct_distance_m'],
                     steps=self.frame,control_attempts=self.attempts,slow_decisions=len(self.decisions),
+                    observation_protocol=self.observation_protocol,
                     ground_start_hold_seconds=self.config.ground_start_hold_seconds,
                     startup_hold_control_attempts=self.startup_hold_steps,
                     startup_hold_max_displacement_m=self.max_startup_hold_displacement_m,

@@ -1,11 +1,11 @@
-"""Evaluate VTemp rolling200 with frozen v9 weights and local raster perception.
+"""Evaluate vtemp with frozen v9 weights and local raster perception.
 
 The raster is visible only to the simulator's local sensor/collision adapter.
 Reference paths are evaluation metadata and never enter controllers or policy
 observations. Mapping defaults to a separate 0.5m local grid over the same 24m
 footprint. The actor and delivered evidence retain their original 12x12 / 2m
 input. An explicit controller adapter changes only the mapping input; the
-VTemp manager, weights, archived runtime files and training configuration stay
+vtemp manager, weights, archived runtime files and training configuration stay
 unchanged. Use --mapping-resolution 2 for the original single-grid behavior.
 """
 from __future__ import annotations
@@ -18,7 +18,6 @@ for _thread_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"
 import argparse
 import concurrent.futures
 import contextlib
-import hashlib
 import importlib.util
 import json
 import math
@@ -27,74 +26,30 @@ from pathlib import Path
 import re
 import sys
 import time
-import traceback
-from datetime import datetime, timezone
 
 
 REPOSITORY = Path(__file__).resolve().parents[4]
 DEFAULT_RUN = REPOSITORY / "artifacts/mappo-v9-mixed100to400-no-subgoal-800ep-20261105-153146"
 PROTOCOL = "wildscenes_vtemp_dual_resolution_v2"
 LEGACY_PROTOCOL = "wildscenes_vtemp_rolling200_frozen_v9_v1"
+STRATEGY = "vtemp"
+FROZEN_MANAGER_SHA256 = "e36971e1a194210a972c38c9d393e7f4c1d6ee970fc077d885aa141fef4e2702"
 VTEMP_RADIUS_M = 200.
 VTEMP_ARRIVAL_M = 25.
 
 
-def load_clearance_adapter():
-    path = Path(__file__).with_name("wildscenes_clearance.py")
-    spec = importlib.util.spec_from_file_location("_wildscenes_clearance_adapter", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+# Load helpers by path without importing the working-tree simulator core.
+_support_spec = importlib.util.spec_from_file_location(
+    "_wildscenes_support", Path(__file__).with_name("wildscenes_support.py"))
+support = importlib.util.module_from_spec(_support_spec)
+_support_spec.loader.exec_module(support)
+load_clearance_adapter, load_adapter = support.load_clearance_adapter, support.load_adapter
+utc, clean, write_json = support.utc, support.clean, support.write_json
+digest, object_digest = support.digest, support.object_digest
+correct_raster_calibration, summarize = support.correct_raster_calibration, support.summarize
 
 
 clearance = load_clearance_adapter()
-
-
-def utc():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def clean(value):
-    if hasattr(value, "tolist"):
-        return clean(value.tolist())
-    if isinstance(value, dict):
-        return {str(k): clean(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [clean(v) for v in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
-
-
-def write_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(clean(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False))
-    temporary.replace(path)
-
-
-def digest(path):
-    result = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            result.update(block)
-    return result.hexdigest()
-
-
-def object_digest(value):
-    return hashlib.sha256(json.dumps(clean(value), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def load_adapter():
-    # Avoid importing the mutable working-tree simulator package. The policy and
-    # all its dependent simulator/drone/ground modules come from runtime_sources.
-    path = Path(__file__).with_name("wildscenes_map.py")
-    spec = importlib.util.spec_from_file_location("_wildscenes_v9_map_adapter", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def local_mapping_path():
@@ -216,42 +171,21 @@ def subgoal_event(env, step, previous=None):
     return event
 
 
-def correct_raster_calibration(summary, env, forest):
-    """Replace circle-only calibration with audit against known raster cells."""
-    import numpy as np
-
-    points = env.ledger.xy[env.ledger.seen]
-    known = forest.known_at(points)
-    probability = 1 / (1 + np.exp(-env.ledger.log_odds[env.ledger.seen]))
-    probability = probability[known]
-    truth = forest.truth(points[known])
-    summary.pop("brier_error", None)
-    summary.pop("calibration_error", None)
-    summary["raster_known_evaluation_points"] = int(known.sum())
-    summary["raster_unknown_evaluation_points"] = int((~known).sum())
-    summary["brier_error"] = float(np.mean((probability - truth) ** 2)) if len(truth) else None
-    certainty = np.maximum(probability, 1 - probability)
-    correct = ((probability >= .5) == truth).astype(float)
-    error = 0.
-    for lower in np.arange(.5, 1., .05):
-        selected = (certainty >= lower) & (certainty < lower + .05)
-        if selected.any():
-            error += float(selected.mean() * abs(certainty[selected].mean() - correct[selected].mean()))
-    summary["calibration_error"] = error if len(truth) else None
-
-
 def evaluate_job(job):
     import numpy as np
     import torch
 
     sources = Path(job["sources"])
     sys.path.insert(0, str(sources))
+    from ground import subgoal_manager
     from simulator import mappo_experiment as me
     from simulator import train_mappo as tm
 
-    for module in (me, tm):
+    for module in (me, tm, subgoal_manager):
         if not Path(module.__file__).resolve().is_relative_to(sources.resolve()):
             raise RuntimeError("A mutable simulator module was imported instead of frozen v9 sources")
+    if digest(subgoal_manager.__file__) != FROZEN_MANAGER_SHA256:
+        raise ValueError("Expected the archived vtemp rolling200 manager")
     torch.set_num_threads(1)
     adapter = load_adapter()
     forest = adapter.RasterForestMap.from_npz(job["map_path"])
@@ -302,7 +236,7 @@ def evaluate_job(job):
             planning_clearances = clearance.verify_experiment(env, safety_distance, escape_distance)
             physical_radius = float(env.env.ground_robots[0].radius)
             if env.subgoals is None:
-                raise RuntimeError("VTemp requires a live temporary-goal manager")
+                raise RuntimeError("vtemp requires a live temporary-goal manager")
             subgoal_events.append(subgoal_event(env, 0))
             trajectory.append(position_record(env, 0))
             previous = np.asarray(trajectory[-1]["ground"][:2])
@@ -408,7 +342,7 @@ def evaluate_job(job):
                     planning_clearances=planning_clearances,
                     step_cap=job["max_steps"], episode_budget_steps=budget,
                     budget_multiplier=job["budget_multiplier"], budget_extra=job["budget_extra"],
-                    strategy="vtemp_rolling200", subgoal_radius=VTEMP_RADIUS_M,
+                    strategy=STRATEGY, subgoal_radius=VTEMP_RADIUS_M,
                     subgoal_arrival=VTEMP_ARRIVAL_M, reference_path_in_policy=False,
                     perception=perception),
             )
@@ -425,35 +359,7 @@ def evaluate_job(job):
 
 
 def safe_job(job):
-    try:
-        return evaluate_job(job)
-    except Exception as exc:
-        result = dict(id=job["id"], case_id=job["case"]["id"], sample=job["sample"],
-            sample_seed=job["sample_seed"], status="error", signature=job["signature"],
-            completed_utc=utc(), error=str(exc), traceback=traceback.format_exc(),
-            summary=dict(arrived=False, collision_free_arrival=False, strict_success=False,
-                         termination="evaluation_error"))
-        write_json(Path(job["output"]) / "cases" / (job["id"] + ".json"), result)
-        write_json(Path(job["output"]) / "progress" / (job["id"] + ".json"), result)
-        return result
-
-
-def summarize(records, expected):
-    completed = [r for r in records if r["status"] == "completed"]
-    counts = {}
-    for row in records:
-        term = row["summary"]["termination"]
-        counts[term] = counts.get(term, 0) + 1
-    # Explicit denominators: execution errors are not silently dropped from the
-    # scheduled set, while completed-rollout counts remain separately visible.
-    return dict(scheduled_runs=expected, recorded_runs=len(records), completed_rollouts=len(completed),
-        execution_errors=sum(r["status"] == "error" for r in records),
-        arrivals=sum(bool(r["summary"].get("arrived")) for r in records),
-        collision_free_arrivals=sum(bool(r["summary"].get("collision_free_arrival")) for r in records),
-        strict_successes=sum(bool(r["summary"].get("strict_success")) for r in records),
-        arrival_rate=sum(bool(r["summary"].get("arrived")) for r in records) / expected,
-        strict_success_rate=sum(bool(r["summary"].get("strict_success")) for r in records) / expected,
-        terminations=counts)
+    return support.safe_evaluate(job, evaluate_job)
 
 
 def main():
@@ -527,7 +433,9 @@ def main():
     source_hashes = {str(p.relative_to(sources)): digest(p) for p in sorted(sources.rglob("*.py"))}
     if not source_hashes:
         raise ValueError("Missing frozen v9 runtime_sources")
-    settings = dict(strategy="vtemp_rolling200", subgoal_radius=VTEMP_RADIUS_M,
+    if source_hashes.get("ground/subgoal_manager.py") != FROZEN_MANAGER_SHA256:
+        raise ValueError("Expected the archived vtemp rolling200 manager")
+    settings = dict(strategy=STRATEGY, subgoal_radius=VTEMP_RADIUS_M,
         subgoal_arrival=VTEMP_ARRIVAL_M, stochastic=not args.deterministic, budget_multiplier=args.budget_multiplier,
         budget_extra=args.budget_extra, min_steps=args.min_steps, max_steps=args.max_steps,
         safety_clearance_m=args.ground_safety_distance, ground_safety_distance=args.ground_safety_distance,
@@ -539,12 +447,12 @@ def main():
         checkpoint=str(checkpoint), checkpoint_sha256=digest(checkpoint),
         config_path=str(config_path), config_sha256=digest(config_path), sources=str(sources),
         source_hashes=source_hashes, clearance_source_hashes=clearance.source_hashes(), cases_path=str(cases_path), cases_sha256=digest(cases_path),
-        map_path=str(map_path), map_sha256=digest(map_path), runner_sha256=digest(__file__),
+        map_path=str(map_path), map_sha256=digest(map_path), runner_sha256=digest(__file__), support_sha256=digest(support.__file__),
         adapter_sha256=digest(Path(__file__).with_name("wildscenes_map.py")), settings=settings,
         mapping_adapter_sha256=digest(local_mapping_path()) if args.mapping_resolution < 2. else None,
         perception=perception_contract(args.mapping_resolution, args.ground_safety_distance),
         selected_case_ids=[c["id"] for c in cases], metadata=manifest.get("metadata", {}),
-        policy_contract="VTemp rolling200 / arrival25 with frozen v9 best576; separate local mapping input; "
+        policy_contract="vtemp / arrival25 with frozen v9 best576; separate local mapping input; "
                         "original actor and evidence grids; no reference path or full map in policy",
         success_contract="Arrival plus zero attempted collisions, physical/safety swept violations, link/spacing violations and boundary violations",
         geometry_scope="2D raster ground navigation; existing idealized aerial mapping/flight and communication models retained")

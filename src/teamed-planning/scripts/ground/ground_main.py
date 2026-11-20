@@ -19,7 +19,9 @@ from ground.graph_fusion import GraphFusion
 from ground.global_planner import GlobalPlanner
 from ground.local_planner import LocalPerception, LocalPlanner
 from ground.observed_grid import ObservedGrid
-from ground.subgoal_manager import SubgoalManager
+from ground.subgoal_manager import DEFAULT_REVIEW_INTERVAL_S, LookaheadGuidance
+# The vtemp module is the original rolling200 selector from the 5 km archive.
+from ground.vtemp import SubgoalManager as RollingSubgoals
 from common.graph_structure import TopologicalGraph
 from common.timing import PerformanceTimer
 
@@ -50,7 +52,9 @@ class GroundRobotController:
                  edge_confidence_threshold: float = 0.0,
                  subgoal_radius: Optional[float] = None,
                  subgoal_arrival: float = 25.0,
-                 world_bounds: Optional[Tuple[float, float, float, float]] = None):
+                 world_bounds: Optional[Tuple[float, float, float, float]] = None,
+                 subgoal_review_interval: float = DEFAULT_REVIEW_INTERVAL_S,
+                 guidance_strategy: str = 'vtemp1'):
         """
         Initialize ground robot controller.
         
@@ -66,11 +70,11 @@ class GroundRobotController:
             waypoint_threshold: Distance to waypoint for "reached" (default 1.0m)
             replan_threshold: Distance from path before replanning (default 5.0m)
             fusion_interval: Minimum time between fusing graphs from same drone (default 20.0s)
-            subgoal_radius: With a goal beyond the drone chain, drive to and
-                broadcast relay subgoals at most this far ahead (None: off)
-            subgoal_arrival: An intermediate subgoal counts as reached within
-                this distance (meters); the final goal still requires arrival
-            world_bounds: Surveyed (min_x, min_y, max_x, max_y) for subgoals
+            subgoal_radius: Maximum guidance radius (meters, None disables)
+            subgoal_arrival: Distance for advancing a nearby waypoint or lookahead point (meters)
+            world_bounds: Surveyed (min_x, min_y, max_x, max_y) for lookahead points
+            subgoal_review_interval: Seconds between direction reviews on the vehicle clock
+            guidance_strategy: 'vtemp' for rolling waypoints or 'vtemp1' for directional lookahead
         """
         self.robot_id = robot_id
         self.resolution = resolution
@@ -121,10 +125,14 @@ class GroundRobotController:
         self.heading = None
         self.goal_position = None
         self.unified_graph = None
-        # Relay subgoals: goal_position (driven to and broadcast) is the
-        # current subgoal; final_goal is the mission goal.
+        # goal_position holds the point sent to the planner and aircraft.
+        # final_goal holds the mission destination throughout the run.
         self.subgoal_radius = subgoal_radius
         self.subgoal_arrival = subgoal_arrival
+        self.subgoal_review_interval = subgoal_review_interval
+        if guidance_strategy not in ('vtemp', 'vtemp1'):
+            raise ValueError("guidance_strategy must be 'vtemp' or 'vtemp1'")
+        self.guidance_strategy = guidance_strategy
         self.world_bounds = world_bounds
         self.subgoals = None
         self.final_goal = None
@@ -181,12 +189,16 @@ class GroundRobotController:
             self._route_recovery = False
         self.final_goal = goal_pos
         if self.subgoal_radius:
-            # The first get_action selects the first subgoal.
-            self.subgoals = SubgoalManager(goal_pos, self.subgoal_radius, arrival=self.subgoal_arrival,
-                                           world_bounds=self.world_bounds)
+            if self.guidance_strategy == 'vtemp':
+                self.subgoals = RollingSubgoals(goal_pos, self.subgoal_radius, arrival=self.subgoal_arrival,
+                                               world_bounds=self.world_bounds)
+            else:
+                self.subgoals = LookaheadGuidance(
+                    goal_pos, self.subgoal_radius, arrival=self.subgoal_arrival,
+                    world_bounds=self.world_bounds, review_interval=self.subgoal_review_interval)
             self.global_planner.clear_path()
             self.goal_position = None
-            print(f"[{self.robot_id}] Goal set to {goal_pos} (relay subgoals, radius {self.subgoal_radius:g}m)")
+            print(f"[{self.robot_id}] Goal set to {goal_pos} ({self.guidance_strategy}, radius {self.subgoal_radius:g}m)")
             return
         self._drive_to(goal_pos)
 
@@ -197,8 +209,18 @@ class GroundRobotController:
             self._terminal_recovery = False
         print(f"[{self.robot_id}] Goal set to {goal_pos}")
 
+    def _start_route_progress(self, route_goal, distance, now):
+        self._route_recovery = False
+        self._route_loop = False
+        self._motion_history.clear()
+        self._motion_distance = 0.
+        self._local_route_goal = route_goal
+        self._local_route_best = distance
+        self._local_route_progress_time = now
+        self._local_route_progress_position = np.asarray(self.position).copy()
+
     def stop(self):
-        """Abandon the mission goal and any relay subgoal."""
+        """Clear the mission goal and its guidance."""
         self.goal_position = None
         self.final_goal = None
         self.subgoals = None
@@ -442,15 +464,16 @@ class GroundRobotController:
         Returns:
             Dictionary with:
                 - 'motion': (linear_vel, angular_vel) velocity command
-                - 'broadcast': None (ground robots don't broadcast yet)
+                - 'broadcast': Vehicle pose, current guidance point and remaining planned path
         """
         current_time = simulator_obs.get('full_state', {}).get('time', time.time())
         # An external startup/survey hold is not a failed navigation command.
         # Keep perception, fusion and planning active, but do not spend the
         # no-progress allowance before the caller permits physical movement.
         motion_held = bool(simulator_obs.get('motion_held', False))
-        if self.subgoals is not None:
-            # Uses the position and graph before this cycle's fusion.
+        lookahead = self.subgoals if isinstance(self.subgoals, LookaheadGuidance) else None
+        if self.subgoals is not None and lookahead is None:
+            # vtemp and externally supplied policies use the pre-fusion observation.
             target, changed = self.subgoals.update(
                 simulator_obs['self']['position'], self.unified_graph, current_time)
             if changed:
@@ -481,13 +504,7 @@ class GroundRobotController:
                             np.linalg.norm(np.asarray(route_goal)-self.position))
             if (route_goal!=self._local_route_goal or self._local_route_progress_time is None
                     or current_time<self._local_route_progress_time):
-                self._route_recovery = False
-                self._motion_history.clear()
-                self._motion_distance = 0.
-                self._local_route_goal=route_goal
-                self._local_route_best=route_distance
-                self._local_route_progress_time=current_time
-                self._local_route_progress_position=np.asarray(self.position).copy()
+                self._start_route_progress(route_goal, route_distance, current_time)
             elif route_distance<self._local_route_best-.5:
                 self._local_route_best=route_distance
                 self._local_route_progress_time=current_time
@@ -626,6 +643,36 @@ class GroundRobotController:
                 planning_graph.graph.remove_nodes_from(blocked_nodes)
                 planning_graph.graph.remove_edges_from(blocked_edges)
                 planning_graph._spatial_index_valid = False
+        if lookahead is not None:
+            # Only count a surveyed branch if its entry can be joined across
+            # locally observed space. The whole connector must fit in the sensor view.
+            clearance = (min(self.local_planner.escape_distance, self.local_planner.safety_distance)
+                         if self._allow_local_escape else self.local_planner.safety_distance)
+            known_extent = np.asarray([width, height]) * self.resolution / 2. - clearance
+
+            def entry_allowed(target):
+                return (np.all(np.abs(np.asarray(target) - self.position) < known_extent)
+                        and connection_allowed(self.position, target)
+                        and not locally_blocked_segment(self.position, target))
+
+            target, changed = lookahead.update(
+                self.position, planning_graph, current_time, entry_allowed=entry_allowed)
+            if changed:
+                target = tuple(target)
+                distance = np.linalg.norm(np.asarray(target) - self.position)
+                if lookahead.direction_changed or self.goal_position is None:
+                    if target != self.goal_position:
+                        self._start_route_progress(target, distance, current_time)
+                        stalled = current_time - self._local_progress_time >= 10.
+                    self._drive_to(target)
+                else:
+                    # A rolling anchor changes the distance reference, even if the
+                    # vehicle has stood still. Preserve physical progress and the
+                    # executable prefix of the route along this same direction.
+                    self._local_route_best += distance - route_distance
+                    self._local_route_goal = self.goal_position = target
+                    if self._route_map is not None:
+                        self._route_map.goal = np.asarray(target)
         old_waypoint = self.global_planner.get_current_waypoint()
         self.global_planner.entry_validator = lambda target: (
             self._local_waypoint(
@@ -708,10 +755,14 @@ class GroundRobotController:
                 needs_replan = False
                 
                 # Check if we need to plan or replan
-                if self.global_planner.current_path is None:
-                    # Initial planning
+                extending_direction = (lookahead is not None
+                    and self.global_planner.goal_position != self.goal_position
+                    and self.global_planner.current_path is not None
+                    and (self.global_planner.waiting_at_frontier
+                         or self.global_planner.current_waypoint_idx >= len(self.global_planner.current_path) - 1
+                         or self.global_planner.is_goal_reached(self.position, self.waypoint_threshold)))
+                if self.global_planner.current_path is None or extending_direction:
                     needs_replan = True
-                    print(f"[{self.robot_id}] Initial planning...")
                 elif route_blocked or (graphs_received and self.unified_graph is not None
                         and (self.global_planner.waiting_at_frontier or not self.global_planner.using_graph)):
                     # New graph fused - re-evaluate planning strategy
@@ -719,7 +770,8 @@ class GroundRobotController:
                     print(f"[{self.robot_id}] New graph fused, re-evaluating route...")
                 else:
                     # Check if goal reached
-                    if self.global_planner.is_goal_reached(self.position, self.waypoint_threshold):
+                    if ((lookahead is None or lookahead.final)
+                            and self.global_planner.is_goal_reached(self.position, self.waypoint_threshold)):
                         print(f"[{self.robot_id}] Goal reached!")
                         self.global_planner.clear_path()
                         self.goal_position = None
@@ -745,7 +797,8 @@ class GroundRobotController:
                         graph_preference_threshold=self.global_planner.graph_preference_threshold)
                     candidate.entry_validator = self.global_planner.entry_validator
                     candidate.connection_validator = self.global_planner.connection_validator
-                    proposed = candidate.plan_path(self.position, self.goal_position, planning_graph)
+                    review_goal = self.global_planner.goal_position if lookahead is not None else self.goal_position
+                    proposed = candidate.plan_path(self.position, review_goal, planning_graph)
                     remaining = [self.position] + (self.global_planner.get_remaining_path() or [])
                     old_cost = self.global_planner._compute_path_length(remaining)
                     new_cost = candidate._compute_path_length(proposed or [])
@@ -787,10 +840,12 @@ class GroundRobotController:
                         edge_start = self.global_planner.current_path[
                             self.global_planner.current_waypoint_idx - 1]
                     conf = planning_graph.edge_confidence_from_positions(edge_start, current_waypoint)
-                    if (self.global_planner.using_graph and self.goal_position is not None
-                            and np.linalg.norm(np.asarray(current_waypoint) - self.goal_position) < 1e-6):
-                        goal_node = planning_graph.find_nearest_node(self.goal_position)
-                        delta = np.abs(np.asarray(self.goal_position) - self.position)
+                    route_end = self.global_planner.goal_position
+                    at_final_connector = (route_end is not None
+                        and np.linalg.norm(np.asarray(current_waypoint) - route_end) < 1e-6)
+                    if self.global_planner.using_graph and at_final_connector:
+                        goal_node = planning_graph.find_nearest_node(route_end)
+                        delta = np.abs(np.asarray(route_end) - self.position)
                         locally_observed_goal = np.all(delta <= np.array([width, height])
                                                        * self.resolution / 2. - 1.)
                         if (goal_node is None or goal_node[1] > self.waypoint_threshold) and not locally_observed_goal:
@@ -811,8 +866,7 @@ class GroundRobotController:
                         current_waypoint = (
                             self._local_waypoint(
                                 self.position, current_waypoint, semantic_map, self.resolution)
-                            if (is_entry or is_connector or (self.goal_position is not None and
-                                np.linalg.norm(np.asarray(current_waypoint) - self.goal_position) < 1e-6))
+                            if is_entry or is_connector or at_final_connector
                             else None)
                         self.global_planner.waiting_at_frontier = current_waypoint is None
                         local_route_used = current_waypoint is not None

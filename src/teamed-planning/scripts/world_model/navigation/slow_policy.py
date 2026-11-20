@@ -51,6 +51,8 @@ def tensors(observation):
             torch.as_tensor(observation['present'],dtype=torch.bool))
     if 'environment_graph' in observation:
         result += (observation['environment_graph'],)
+    if 'ground_inputs' in observation:
+        result += (torch.as_tensor(observation['ground_inputs'], dtype=torch.float32),)
     return result
 
 
@@ -96,12 +98,15 @@ def update(model,optimizer,episodes,*,gamma=.999,gae_lambda=.95,epochs=4,
     x=torch.as_tensor(np.stack([t['features'] for t in transitions]),dtype=torch.float32)
     mask=torch.as_tensor(np.stack([t['mask'] for t in transitions]),dtype=torch.bool)
     present=torch.as_tensor(np.stack([t['present'] for t in transitions]),dtype=torch.bool)
-    has_graph = ['environment_graph' in t for t in transitions]
-    if any(has_graph) and not all(has_graph):
-        raise ValueError('Mixed slow observation schemas in PPO batch')
     inputs = (x, mask, present)
-    if all(has_graph):
+    schemas = {tuple(key for key in ('environment_graph', 'ground_inputs') if key in t)
+               for t in transitions}
+    if len(schemas) != 1 or ('environment_graph', 'ground_inputs') in schemas:
+        raise ValueError('Mixed slow observation schemas in PPO batch')
+    if ('environment_graph',) in schemas:
         inputs += ([t['environment_graph'] for t in transitions],)
+    if ('ground_inputs',) in schemas:
+        inputs += (torch.as_tensor(np.stack([t['ground_inputs'] for t in transitions]), dtype=torch.float32),)
     chunks = [slice(begin, min(begin + microbatch_size, len(transitions)))
               for begin in range(0, len(transitions), microbatch_size)]
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+from functools import partial
 import hashlib
 import json
 import math
@@ -28,25 +29,16 @@ if not __package__:
 
 from .data import (ALGORITHM, CHANNELS, CHECKPOINT_SHA, FEATURES, HORIZON,
                    MISSION_ACTION_CONTRACT, MISSION_SCHEMA_VERSION, SCHEMA_VERSION, SIDE)
-from .hierarchical_sources import atomic_json, file_sha256 as digest
+from .hierarchical_sources import atomic_checkpoint as _atomic_checkpoint, atomic_json, file_sha256 as digest
 from .model import Vtmp2WorldModel, sequence_loss
 from .models import imagine_sequence, make_model, padded_window
 
 
 CHECKPOINT_FORMAT = 'vtmp2-world-model-training-v1'
+atomic_checkpoint = partial(_atomic_checkpoint, append_suffix=True, stream=True)
 LEGACY_ACTION_CONTRACT = 'legacy_drive_v1'
 COMPLETION_EVENT_SEMANTICS = (
     'within_recorded_transition_drive_arrival_or_survey_evidence_not_eventual_ground_reachability')
-
-
-def atomic_checkpoint(path, value):
-    path = Path(path)
-    temporary = path.with_suffix(path.suffix + '.tmp')
-    with temporary.open('wb') as stream:
-        torch.save(value, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
-    temporary.replace(path)
 
 
 def write_metrics(path, history):

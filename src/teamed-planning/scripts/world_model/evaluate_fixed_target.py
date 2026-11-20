@@ -12,6 +12,7 @@ import contextlib
 from dataclasses import replace
 import importlib
 import importlib.util
+import inspect
 import json
 import math
 import multiprocessing
@@ -45,6 +46,16 @@ def evaluate_case(job):
     modules = frozen_modules(run)
     saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
     config = saved['config']
+    graph_world = modules['graph_world']
+    road_arguments = {'road_topology': True} if config.get('road_topology') else {}
+    schema = getattr(graph_world, 'ROAD_MODEL_SCHEMA', None) if road_arguments else graph_world.MODEL_SCHEMA
+    if schema is None or saved['world_schema'] != schema:
+        raise ValueError('Checkpoint world schema differs from selected runtime')
+    protocol = config.get('training_observation_protocol')
+    observation_arguments = {'training_observation_protocol': protocol} if protocol else {}
+    if config.get('fixed_mission_target') and 'v9_fast_reward' in inspect.signature(
+            modules['hierarchy'].HierarchicalEpisode).parameters:
+        observation_arguments['v9_fast_reward'] = True
     fresh_arguments = {'random_init': True} if (config.get('fresh_all', False)
                                                or config.get('fresh_fast_world', False)) else {}
     label = f"{case['kind']}-{case['direct_distance_m']:g}m-seed{case['seed']}"
@@ -55,17 +66,22 @@ def evaluate_case(job):
         # Leave room for the real mission-budget terminal, never a 257-step
         # collection cut. The same budget formula is used by the episode.
         budget = max(hierarchy_config.min_mission_budget,
-                     math.ceil(hierarchy_config.budget_multiplier * case['direct_distance_m']
+                     math.ceil(hierarchy_config.budget_multiplier * case.get('reference_distance_m', case['direct_distance_m'])
                                + hierarchy_config.budget_extra))
         # One human instruction, held until arrival/failure/deadline. The UGV
         # local planner still checks obstacles on every physical control step.
-        hierarchy_config = replace(hierarchy_config, option_steps=budget, evidence_interval=budget + 1)
+        hierarchy_options = dict(option_steps=budget, evidence_interval=budget + 1)
+        if hasattr(hierarchy_config, 'max_option_steps'):
+            hierarchy_options.update(max_option_steps=max(budget, hierarchy_config.max_option_steps), adaptive_options=False)
+        if config.get('ground_start_hold_seconds'):
+            hierarchy_options['ground_start_hold_seconds'] = config['ground_start_hold_seconds']
+        hierarchy_config = replace(hierarchy_config, **hierarchy_options)
         episode = modules['hierarchy'].HierarchicalEpisode(repo, case, hierarchy_config,
-            fast_seed=case['seed'] + 43, rollout_limit=budget + 1, **fresh_arguments)
+            fast_seed=case['seed'] + 43, rollout_limit=budget + 1, **fresh_arguments, **observation_arguments)
         try:
             fast = modules['graph_policy'].make_graph_fast(repo, **fresh_arguments)
             fast.load_state_dict(saved['fast']); fast.eval().requires_grad_(False)
-            world = modules['graph_world'].GraphWorldModel(config['hidden'], config['horizon'])
+            world = graph_world.GraphWorldModel(config['hidden'], config['horizon'], **road_arguments)
             world.load_state_dict(saved['world']); world.eval().requires_grad_(False)
             initial_hashes = {name: modules['fast'].state_hash(modules['fast'].numpy_state(model))
                               for name, model in (('fast', fast), ('world', world))}
@@ -135,6 +151,7 @@ def evaluate_case(job):
             intervention = np.asarray([row['intervention_m_s'] for row in recorder.safety_rows])
             finite_margins = [row['margin_m_s'] for row in recorder.safety_rows if row['margin_m_s'] is not None]
             result = dict(label=label, seed=case['seed'], kind=case['kind'],
+                observation_protocol=getattr(episode, 'observation_protocol', 'native'),
                 distance_m=case['direct_distance_m'], goal_reached=summary['goal_reached'],
                 termination=summary['termination'], steps=summary['steps'], control_attempts=summary['control_attempts'],
                 mission_budget=episode.mission_budget, remaining_m=summary['remaining_m'],
@@ -179,6 +196,7 @@ def main():
     parser.add_argument('--run', type=Path, required=True)
     parser.add_argument('--checkpoint', default='final.pt')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--cases', type=Path, help='JSON list of independent evaluation cases, including V9 circle or WildScenes raster scenes')
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--distances', nargs='+', type=float, default=[100., 150., 200.])
     parser.add_argument('--kinds', nargs='+', choices=['open', 'trees', 'wall_gap'], default=['open', 'trees', 'wall_gap'])
@@ -211,8 +229,13 @@ def main():
     for name, expected in manifest['source_sha256'].items():
         if digest(source / name) != expected:
             raise ValueError('Archived training source changed: ' + name)
-    cases = [modules['scenes'].make_scene(args.seed + i, (distance, distance), 2000., kind)
-             for i, (distance, kind) in enumerate((distance, kind) for distance in args.distances for kind in args.kinds)]
+    if args.cases is None:
+        cases = [modules['scenes'].make_scene(args.seed + i, (distance, distance), 2000., kind)
+                 for i, (distance, kind) in enumerate((distance, kind) for distance in args.distances for kind in args.kinds)]
+    else:
+        cases = json.loads(args.cases.read_text(encoding='utf-8'))
+        if not isinstance(cases, list) or not cases or len({case['seed'] for case in cases}) != len(cases):
+            raise ValueError('Evaluation cases must form a nonempty list with unique seeds')
     old_scenes = json.loads((run / 'scenes.json').read_text())
     used = {case['seed'] for group in old_scenes.values() for case in group}
     if used & {case['seed'] for case in cases}:
@@ -222,7 +245,8 @@ def main():
         evaluator_sha256=digest(__file__), source_sha256=manifest['source_sha256'],
         source_package=_sources.source_package(source), source_helper_sha256=digest(_helper_path),
         deterministic=not args.stochastic, workers=args.workers,
-        mission_budget='max(600, ceil(4*initial_distance_m + 240))',
+        case_source=str(args.cases.resolve()) if args.cases else 'generated_synthetic',
+        mission_budget='Archived episode budget using the reference distance when supplied, otherwise the direct distance.',
         success='Original simulator UGV distance <= 2m, before full mission deadline.',
         control='Human final target held constant; graph world + UAV fast actor; UGV rule planner; no slow model and no learning.',
         evidence='Only local and delivered observations enter policies; offline truth verifies scene feasibility only.',

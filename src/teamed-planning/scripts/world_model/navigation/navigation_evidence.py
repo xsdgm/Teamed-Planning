@@ -21,7 +21,7 @@ class EvidenceGrid:
 
     def __post_init__(self):
         self.cells = np.array(self.cells, dtype=np.int8, copy=True)
-        if self.cells.ndim != 2 or not self.cells.size or not np.isin(self.cells, [-1, 0, 1]).all():
+        if self.cells.ndim != 2 or not self.cells.size or self.cells.min() < -1 or self.cells.max() > 1:
             raise ValueError('cells must be a nonempty ternary grid')
         if not math.isfinite(self.resolution) or self.resolution <= 0:
             raise ValueError('resolution must be finite and positive')
@@ -31,11 +31,12 @@ class EvidenceGrid:
         if len(self.origin) != 2 or not np.isfinite(self.origin).all():
             raise ValueError('origin must be a finite XY pair')
         radius = int(np.ceil(self.clearance / self.resolution))
-        yy, xx = np.mgrid[-radius:radius+1, -radius:radius+1]
-        # Conservative square-cell support, including diagonally adjacent cells.
-        footprint = np.ones_like(xx, dtype=bool)
-        self.blocked = binary_dilation(self.cells == 1, structure=footprint)
-        self.known_free = binary_erosion(self.cells == -1, structure=footprint, border_value=0)
+        self.blocked, self.known_free = self.cells == 1, self.cells == -1
+        if radius:
+            # Conservative square-cell support, including diagonally adjacent cells.
+            footprint = np.ones((2*radius+1, 2*radius+1), dtype=bool)
+            self.blocked = binary_dilation(self.blocked, structure=footprint)
+            self.known_free = binary_erosion(self.known_free, structure=footprint, border_value=0)
         self.optimistic = ~self.blocked
         structure = np.array([[0,1,0], [1,1,1], [0,1,0]], dtype=bool)
         self.free_components = label(self.known_free, structure)[0]
@@ -127,7 +128,31 @@ FEATURE_NAMES = ['target_forward', 'target_lateral', 'target_distance', 'remaini
                      f'corridor_{i}_{kind}' for i in range(8) for kind in ('free','blocked','unknown')]
 
 
-def features(belief, target):
+def corridor_fractions(grid, position, targets, *, sample_bounds=None):
+    """Return eight free/blocked/unknown triples. Optional XY bounds exclude exterior samples."""
+    deltas = np.asarray(targets, dtype=float).reshape(-1, 2) - position
+    normals = np.column_stack((-deltas[:, 1], deltas[:, 0]))
+    normals /= np.maximum(np.linalg.norm(deltas, axis=1), 1e-9)[:, None]
+    along = np.arange(8)[:, None] / 8. + np.linspace(0., 1./8., 5)
+    across = np.linspace(-12., 12., 7)
+    centres = position + along[None, :, :, None] * deltas[:, None, None, :]
+    points = centres[:, :, :, None, :] + across[None, None, None, :, None] * normals[:, None, None, None, :]
+    points = points.reshape(-1, 2)
+    cells, valid = grid.sample(points)
+    sections = cells.reshape(len(deltas), 8, 35)
+    if sample_bounds is not None:
+        low, high = np.asarray(sample_bounds, dtype=float).reshape(2, 2)
+        valid &= np.all((points >= low) & (points < high), axis=1)
+        inside = valid.reshape(sections.shape)
+        count = inside.sum(axis=2)
+        portions = np.stack([((sections == code) & inside).sum(axis=2)
+                             for code in (-1, 1, 0)], axis=-1) / np.maximum(count[..., None], 1)
+        portions[count == 0] = (0., 0., 1.)
+        return portions.reshape(len(deltas), 24)
+    return np.stack([(sections == code).mean(axis=2) for code in (-1, 1, 0)], axis=-1).reshape(len(deltas), 24)
+
+
+def features(belief, target, *, corridor=None):
     """Candidate-conditioned features; no environment, hidden-map or critic input."""
     p, goal, q = (np.asarray(v,float) for v in (belief['position'],belief['goal'],target))
     grid = belief['grid']
@@ -147,12 +172,7 @@ def features(belief, target):
          float(status=='unknown'),float(status=='source_conflict'),
          float(np.mean(local==-1)),float(np.mean(local==1)),float(np.mean(local==0)),
          belief.get('recent_receipts',0.),min(1.,belief.get('receipt_age',60.)/60.),belief.get('speed',0.)]
-    lateral = np.array([-delta[1],delta[0]])/max(distance,1e-9)
-    for i in range(8):
-        along = np.linspace(i/8,(i+1)/8,5)
-        points = (p+along[:,None]*delta)[:,None,:]+np.linspace(-12,12,7)[None,:,None]*lateral
-        values,_ = grid.sample(points.reshape(-1,2))
-        v.extend([float(np.mean(values==-1)),float(np.mean(values==1)),float(np.mean(values==0))])
+    v.extend(corridor_fractions(grid, p, [q])[0] if corridor is None else corridor)
     result = np.asarray(v,np.float32)
     if result.shape != (len(FEATURE_NAMES),) or not np.isfinite(result).all():
         raise ValueError('Invalid belief features')

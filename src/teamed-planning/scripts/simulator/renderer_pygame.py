@@ -447,12 +447,3 @@ class PygameRenderer:
         if PYGAME_AVAILABLE:
             self.closed = True
             pygame.quit()
-
-
-class DummyRenderer:
-    def __init__(self, *args, **kwargs):
-        print("Warning: No rendering backend available")
-    def render(self, *args, **kwargs):
-        return None
-    def close(self):
-        pass

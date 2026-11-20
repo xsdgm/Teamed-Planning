@@ -28,6 +28,7 @@ if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 
 from ground.ground_main import GroundRobotController
+from ground.subgoal_manager import DEFAULT_REVIEW_INTERVAL_S
 from common.graph_structure import TopologicalGraph
 
 import tf.transformations as tft
@@ -49,6 +50,8 @@ class GroundROSNode:
         # world_bounds = [min_x, min_y, max_x, max_y] of the surveyed area.
         self.subgoal_radius = float(rospy.get_param('~subgoal_radius', 0.0)) or None
         self.subgoal_arrival = float(rospy.get_param('~subgoal_arrival', 25.0))
+        self.subgoal_review_interval = float(rospy.get_param('~subgoal_review_interval', DEFAULT_REVIEW_INTERVAL_S))
+        self.guidance_strategy = rospy.get_param('~guidance_strategy', 'vtemp1')
         self.sitl_v9 = rospy.get_param('~sitl_v9', False)
         bounds = rospy.get_param('~world_bounds', None)
         self.world_bounds = tuple(float(v) for v in bounds) if bounds else None
@@ -84,6 +87,8 @@ class GroundROSNode:
             max_angular_vel=self.max_angular_vel,
             subgoal_radius=self.subgoal_radius,
             subgoal_arrival=self.subgoal_arrival,
+            subgoal_review_interval=self.subgoal_review_interval,
+            guidance_strategy=self.guidance_strategy,
             world_bounds=self.world_bounds,
             safety_distance=1. if self.sitl_v9 else 1.5,
             fusion_interval=5. if self.sitl_v9 else 20.,
@@ -277,7 +282,7 @@ class GroundROSNode:
                 final_goal = self.controller.final_goal
                 if final_goal is not None and np.linalg.norm(
                         np.asarray(self.current_position_map) - final_goal) <= 2.:
-                    rospy.loginfo(f'[{self.robot_id}] VTemp final goal reached')
+                    rospy.loginfo(f'[{self.robot_id}] {self.guidance_strategy} final goal reached')
                     self.controller.stop()
                     self.cmd_vel_pub.publish(Twist())
                     return

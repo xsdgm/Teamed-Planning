@@ -43,20 +43,24 @@ def evaluate_case(job):
     modules = util.frozen_modules(run)
     saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
     config = saved['config']
+    road_arguments = {'road_topology': True} if config.get('road_topology') else {}
+    protocol = config.get('training_observation_protocol')
+    observation_arguments = {'training_observation_protocol': protocol} if protocol else {}
     fresh_arguments = {'random_init': True} if (config.get('fresh_all', False)
                                                or config.get('fresh_fast_world', False)) else {}
     output = Path(output)
     label = f"{case['kind']}-{case['direct_distance_m']:g}m-seed{case['seed']}"
     started = time.monotonic()
     with (output / 'logs' / (label + '.log')).open('w') as log, contextlib.redirect_stdout(log):
-        hierarchy = replace(modules['hierarchy'].HierarchyConfig(), option_steps=option_steps)
+        hold = {'ground_start_hold_seconds': config['ground_start_hold_seconds']} if config.get('ground_start_hold_seconds') else {}
+        hierarchy = replace(modules['hierarchy'].HierarchyConfig(), option_steps=option_steps, **hold)
         budget = max(hierarchy.min_mission_budget,
-                     math.ceil(hierarchy.budget_multiplier * case['direct_distance_m'] + hierarchy.budget_extra))
+                     math.ceil(hierarchy.budget_multiplier * case.get('reference_distance_m', case['direct_distance_m']) + hierarchy.budget_extra))
         episode = modules['hierarchy'].HierarchicalEpisode(repo, case, hierarchy,
-            fast_seed=case['seed'] + 43, rollout_limit=budget + 1, **fresh_arguments)
+            fast_seed=case['seed'] + 43, rollout_limit=budget + 1, **fresh_arguments, **observation_arguments)
         try:
             fast = modules['graph_policy'].make_graph_fast(repo, **fresh_arguments)
-            world = modules['graph_world'].GraphWorldModel(config['hidden'], config['horizon'])
+            world = modules['graph_world'].GraphWorldModel(config['hidden'], config['horizon'], **road_arguments)
             slow = modules['graph_policy'].GraphSlowActorCritic(hidden=config['hidden'])
             models = dict(fast=fast, world=world, slow=slow)
             for name, model in models.items():
@@ -123,6 +127,7 @@ def evaluate_case(job):
                 raise AssertionError('Arrival exceeded original two-metre tolerance')
             distances = [float(np.linalg.norm(np.asarray(p) - episode.goal)) for p in summary['trajectory']]
             result = dict(label=label, seed=case['seed'], kind=case['kind'], distance_m=case['direct_distance_m'],
+                observation_protocol=getattr(episode, 'observation_protocol', 'native'),
                 goal_reached=summary['goal_reached'], termination=summary['termination'], steps=summary['steps'],
                 mission_budget=episode.mission_budget, remaining_m=summary['remaining_m'], min_remaining_m=min(distances),
                 collisions=summary['collisions'], slow_decisions=len(decisions),
@@ -188,7 +193,9 @@ def main():
     saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
     if saved['manifest']['source_sha256'] != manifest['source_sha256']:
         raise ValueError('Checkpoint and selected run use different source snapshots')
-    if saved['world_schema'] != modules['graph_world'].MODEL_SCHEMA:
+    graph_world = modules['graph_world']
+    schema = getattr(graph_world, 'ROAD_MODEL_SCHEMA', None) if saved['config'].get('road_topology') else graph_world.MODEL_SCHEMA
+    if schema is None or saved['world_schema'] != schema:
         raise ValueError('Checkpoint world schema differs from selected runtime')
     if saved['manifest']['slow_schema'] != modules['graph_policy'].SLOW_SCHEMA:
         raise ValueError('Checkpoint slow schema differs from selected runtime')

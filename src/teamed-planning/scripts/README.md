@@ -31,8 +31,7 @@ A hierarchical navigation system for coordinating drones and ground robots in fo
 multi_robot_navigation/
 ├── common/                          # Shared utilities
 │   ├── graph_structure.py          # TopologicalGraph (NetworkX + KD-tree)
-│   ├── coordinate_transforms.py    # Coordinate frame utilities
-│   └── message_definitions.py      # Communication protocol
+│   └── timing.py                   # Controller performance measurements
 │
 ├── drone/                           # Drone-side code
 │   ├── __init__.py                  # Public controller/perception exports
@@ -49,8 +48,6 @@ multi_robot_navigation/
 │   ├── graph_attention_mappo.py     # Shared map graph attention
 │   ├── cooperative_mappo.py         # Shared cooperative encoders and navigation
 │   ├── relay_attention_mappo.py     # Relay attention used by v9 and later policies
-│   ├── cograph_mappo.py             # CoGraph V1 multi-target policy
-│   ├── cograph_v2_mappo.py          # CoGraph V2 target selector
 │   ├── survey_mappo.py              # V10 survey and V11 fixed-route policies
 │   ├── ros_drone_node.py            # ROS flight/control entry point
 │   ├── ros_seg_node.py              # ROS segmentation entry point
@@ -63,15 +60,18 @@ multi_robot_navigation/
 │   ├── global_planner.py            # Topological path and graph-entry planning
 │   ├── local_planner.py             # Local perception, avoidance and velocity control
 │   ├── observed_grid.py             # Observed route memory and continuous escape checks
-│   ├── subgoal_manager.py           # Rolling relay subgoals and recovery
-│   ├── task_planner.py              # Multi-target coverage, costs and vehicle claims
-│   ├── vehicle_motion.py            # Vehicle link keeping and collision avoidance
+│   ├── subgoal_manager.py           # vtemp1 directional lookahead guidance
+│   ├── vtemp.py                     # Original vtemp rolling200 waypoint selector
+│   ├── vtemp4_*.py                  # vtemp4 ground observations and policies
 │   ├── ros_ground_node.py           # ROS ground-controller entry point
 │   └── ros_gcs_node.py              # ROS ground-control station
 │
 ├── simulator/                       # Simulation, map backends and experiment runners
-├── world_model/                     # Learned dynamics, hierarchical policies and training
-│   ├── navigation/                  # Navigation dynamics, policies, rollouts and safety
+│   └── *vtemp4*.py                  # vtemp4 runtime, curriculum, training and evaluation
+├── world_model/                     # Shared navigation and model implementations
+│   ├── train_slow_policy.py         # VTemp2 training with frozen V9 UAV MAPPO
+│   ├── train_vtemp3.py              # VTemp3 training with a graph world model
+│   ├── navigation/                  # Execution, PPO policies, safety and graph dynamics
 │   ├── rssm/                        # Single-target recurrent model, data and planning
 │   ├── terrain/                     # Terrain prediction and decoupled planning models
 │   └── survey/                      # A/B survey environment, models and planning
@@ -83,7 +83,7 @@ multi_robot_navigation/
 
 ### Drone module consolidation
 
-The drone package has 19 Python modules. Shared implementations are grouped by
+Shared drone implementations are grouped by
 responsibility; policy variants remain separate where their architectures differ.
 
 | Former module | Current implementation |
@@ -103,14 +103,12 @@ explicitly load those snapshots continue to use their historical imports.
 
 ### Ground module consolidation
 
-The ground package has 11 Python modules. Global routing, rolling subgoals,
-vehicle motion and the two ROS entry points retain their existing boundaries.
+Ground routing, lookahead guidance and the two ROS entry points retain their existing boundaries.
 
 | Former module | Current implementation |
 | --- | --- |
 | `local_perception.py` | [local_planner.py](ground/local_planner.py), alongside local avoidance |
 | `observed_escape.py` | [observed_grid.py](ground/observed_grid.py), alongside observed route memory |
-| `vehicle_claims.py` | [task_planner.py](ground/task_planner.py), alongside coverage and travel estimates |
 | `graph_receiver.py` | Removed: [GroundRobotController](ground/ground_main.py) already receives and deserializes dictionary broadcasts directly |
 
 `LocalPerception` remains available from `ground` and `ground.local_planner`.
@@ -119,32 +117,62 @@ reception statistics, fusion throttling, reset behavior and navigation are
 unchanged. The current candidate evaluator copies the merged modules, while
 archived evaluation modes keep their original dependency layout.
 
-### World-model and hierarchical training organization
+### VTemp4 navigation
 
-Hierarchical training and evaluation commands run from `world_model/`. The navigation models and rollout code live under `world_model/navigation/`. See the [world model directory guide](world_model/README.md).
+VTemp4 is a continuous navigation policy using frozen V9 drone control and the
+ground local planner. Ground observations and policies live in `ground/`; its
+simulation runtime, curricula, training and evaluation live in `simulator/`.
+Corresponding tests are under `tests/ground/` and `tests/simulator/`. The
+[experiment guide](../../../experiments/world_model/vtemp4/README.md)
+describes the training and evaluation workflow. Historical `world_model.vtemp4_*`
+module imports remain available for loading older checkpoints.
+
+### VTemp2 and VTemp3 hierarchical training
+
+`world_model/train_slow_policy.py` uses the archived V9 UAV MAPPO checkpoint for the fast layer.
+Only the UGV's slow policy is updated, using duration-aware PPO. The slow
+layer chooses subgoals from received map evidence. The V9 policy, local
+planners and safety filters execute those subgoals. VTemp2 uses no world model.
+
+From the repository root, run a small CPU training and validation pass with the
+project's Python environment.
+
+```bash
+python -I -B src/teamed-planning/scripts/world_model/train_slow_policy.py \
+  --output artifacts/vtemp2-slow-ppo-new --updates 1 \
+  --episodes-per-update 2 --workers 2 --eval-episodes 1 \
+  --rollout-steps 30 --option-steps 10
+```
+
+Use `--resume` with the original output directory to continue a run. Pass
+`--evaluate artifacts/vtemp2-slow-ppo-new/best.pt` with a new output directory
+to evaluate on independent synthetic tasks.
+
+`world_model/train_vtemp3.py` trains the graph world model and its
+prediction-conditioned policies. See the [world model directory guide](world_model/README.md).
 
 | Responsibility | Directory under `world_model/` | Modules |
 | --- | --- | --- |
 | Dynamics and received telemetry | `navigation/` | `graph_dynamics.py`, `residual_world.py`, `telemetry.py` |
-| Fast and slow policies | `navigation/` | `graph_fast_policy.py`, `hierarchical_policy.py`, `slow_policy.py`, `belief_actor.py` |
+| Prediction-conditioned policies | `navigation/` | `graph_fast_policy.py`, `hierarchical_policy.py`, `belief_actor.py` |
+| Observed candidate PPO | `navigation/` | `slow_policy.py` |
 | Hierarchical execution and planning inputs | `navigation/` | `hierarchical_runtime.py`, `planning_graph.py`, `navigation_evidence.py` |
-| Rollout collection | `navigation/` | `graph_rollouts.py`, `belief_rollouts.py` |
-| Local safety and its evidence | `navigation/` | `hierarchical_cbf.py`, `hierarchical_safety.py`, `safety_context.py` |
+| Graph rollout collection | `navigation/` | `graph_rollouts.py`, `belief_rollouts.py`, `safety_context.py` |
+| Local safety | `navigation/` | `hierarchical_cbf.py`, `hierarchical_safety.py` |
 | Navigation scenes and training schedule | `navigation/` | `scene_manifest.py`, `training_schedule.py` |
 | Single-target RSSM, mission collection and planning | `rssm/` | `model.py`, `data.py`, `mission.py`, `planner.py`, `runtime.py` |
 | Scene manifests and WildScenes validation | `navigation/` | `scene_manifest.py`, `wildscenes_runtime.py`, `wildscenes_tasks.py` |
-| Training commands | Package root | `train_hierarchical.py`, `train_slow_policy.py`, `train_joint_policy.py` |
+| Legacy training commands | Package root | `train_hierarchical.py` (forwards to `train_vtemp3.py`), `train_joint_policy.py` |
 | Evaluation and archived runtime loading | Package root | `evaluate_safety_repairs.py`, `evaluate_slow_policy.py`, `evaluate_fixed_target.py`, `frozen_navigation.py` |
 
-New hierarchical runs copy the selected navigation modules directly into
+VTemp3 runs copy their selected modules directly into
 `runtime_sources/world_model/`. For example, the frozen copy of
 `navigation/graph_rollouts.py` is `runtime_sources/world_model/graph_rollouts.py`.
 Older runs can also use `runtime_sources/vtemp2/`. Checkpoints and evidence
 retain their historical `vtemp2` schema identifiers. Hierarchical regression tests live in
 `tests/world_model/test_hierarchical_*.py`.
 
-The main graph-based training entry point is
-`world_model/train_hierarchical.py`. `--fresh-all` initializes the fast policy,
+For VTemp3, `--fresh-all` initializes the fast policy,
 world model and slow policy from fresh constructors, with new optimizer state,
 zero training counters and empty replay. It loads no pretrained policy weights
 and uses no learned teacher. The archived simulator architecture remains a
@@ -170,7 +198,7 @@ later recovery, while per-update metrics and held-out evaluation remain separate
 Example invocation from the repository root, using prepared input files:
 
 ```bash
-python src/teamed-planning/scripts/world_model/train_hierarchical.py \
+python src/teamed-planning/scripts/world_model/train_vtemp3.py \
   --repo . --output artifacts/hierarchical-fresh-all-new --fresh-all \
   --scene-manifest /path/to/fresh_all_scenes.json \
   --update-plan /path/to/fresh_all_schedule.json \
@@ -200,7 +228,7 @@ An 800-task mixed-distance run uses 50 batches of 16, without claiming that this
 fixed budget guarantees convergence:
 
 ```bash
-python src/teamed-planning/scripts/world_model/train_hierarchical.py \
+python src/teamed-planning/scripts/world_model/train_vtemp3.py \
   --repo . --output artifacts/hierarchical-fresh-fast-world-new --fresh-fast-world \
   --scene-manifest /path/to/fast_world_scenes.json \
   --warmup-updates 0 --fast-updates 50 --slow-updates 0 --joint-updates 0 \
@@ -257,7 +285,13 @@ python -B -m unittest discover \
   - Uses local semantic map from robot sensors
   - Simple proportional controller for velocity commands
 
-All 2D MAPPO/CoGraph versions and VTemp evaluators default to
+The original **vtemp** controller selects rolling waypoints and switches on approach
+or failure. Archived WildScenes runs use this policy. **vtemp1** provides directional
+lookahead guidance. A point up to 200 m ahead communicates the vehicle's preferred
+heading. The controller reviews it every 15 simulation seconds using the received
+road graph and applies a turn penalty when changing direction. [Guidance details](world_model/README.md)
+
+All retained 2D MAPPO versions and vtemp evaluators default to
 `ground_safety_distance=1.0` metres for drone navigation graphs, vehicle local
 planning and checked fusion bridges. The shared default is defined in
 `common/navigation_config.py`; the enclosed-vehicle escape margin remains `0.5`.
@@ -323,7 +357,7 @@ observation = {
 action = drone.get_action(observation, target_position=(tx, ty, tz))
 # action contains:
 # - 'movement': (vx, vy, vz) velocity command
-# - 'broadcast': GraphBroadcastMessage or None
+# - 'broadcast': dictionary or None
 ```
 
 #### Ground Robot Integration
@@ -432,8 +466,7 @@ per-drone fusion interval directly.
 
 [ros_drone_node.py](drone/ros_drone_node.py) and
 [ros_ground_node.py](ground/ros_ground_node.py) adapt these interfaces to ROS
-topics. Legacy message definitions remain in
-[message_definitions.py](common/message_definitions.py).
+topics.
 
 ## Troubleshooting
 
@@ -455,7 +488,7 @@ topics. Legacy message definitions remain in
 ## Future Extensions
 
 ### Uncertainty Handling
-See the uncertainty helpers in [graph_fusion.py](ground/graph_fusion.py).
+Covariance-based fusion is a future extension of [graph_fusion.py](ground/graph_fusion.py).
 
 When adding uncertainty:
 1. Modify `TopologicalGraph` to store node covariances
@@ -466,7 +499,6 @@ When adding uncertainty:
 ### ROS Integration
 Replace communication layer:
 ```python
-# Instead of SimpleMessageBroker
 import rospy
 from your_msgs.msg import TopologicalGraph
 

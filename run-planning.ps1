@@ -4,7 +4,8 @@ param(
     [string]$Command = 'start',
     [Parameter(Position=1)][double]$X,
     [Parameter(Position=2)][double]$Y,
-    [string]$VTempCheckpoint
+    [string]$VTempCheckpoint,
+    [string]$VTemp1Checkpoint
 )
 $ErrorActionPreference = 'Stop'
 $priorPlanningMode = $env:PLANNING_MODE
@@ -15,14 +16,22 @@ try {
         'start' {
             $composeArgs = @('-f', 'compose.xtdrone.yaml')
             $env:PLANNING_MODE = 'default'
-            if ($VTempCheckpoint) {
-                $checkpoint = Get-Item -LiteralPath $VTempCheckpoint
+            if ($VTemp1Checkpoint -and $VTempCheckpoint) {
+                throw 'Choose one guidance strategy with -VTempCheckpoint or -VTemp1Checkpoint.'
+            }
+            if ($VTemp1Checkpoint -or $VTempCheckpoint) {
+                if ($VTempCheckpoint) {
+                    $checkpoint = Get-Item -LiteralPath $VTempCheckpoint
+                    $env:PLANNING_MODE = 'v9-vtemp'
+                } else {
+                    $checkpoint = Get-Item -LiteralPath $VTemp1Checkpoint
+                    $env:PLANNING_MODE = 'v9-vtemp1'
+                }
                 $expectedHash = '7AC3AEDCC3876902773B2241F60E839EB3E3B5630DDEB3C8BE660421F2C24198'
                 if ((Get-FileHash -LiteralPath $checkpoint.FullName).Hash -ne $expectedHash) {
                     throw 'Expected the original v9 best576 best.pt checkpoint.'
                 }
                 $env:V9_CHECKPOINT = $checkpoint.FullName
-                $env:PLANNING_MODE = 'v9-vtemp'
                 $composeArgs += @('-f', 'docker/planning/v9.compose.yaml')
             }
             docker image inspect xtdrone_ad:v4 teamedplanning-ad:v1 *> $null
@@ -33,7 +42,7 @@ try {
                 docker load --input $archive
                 if ($LASTEXITCODE -ne 0) { throw 'Failed to restore Docker images.' }
             }
-            if ($VTempCheckpoint) {
+            if ($VTemp1Checkpoint -or $VTempCheckpoint) {
                 docker compose @composeArgs --profile planning build planning
                 if ($LASTEXITCODE -ne 0) { throw 'Failed to build the v9 planning image.' }
             }

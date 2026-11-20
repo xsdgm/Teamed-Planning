@@ -35,7 +35,7 @@ class AerialSurveyTests(unittest.TestCase):
         self.assertGreater(changed_seeds, len(positions) // 4)
 
     def test_native_sensor_actor_world_evidence_and_wildscenes_isolation(self):
-        me, torch, model, options = runtime(REPO, random_init=True)
+        me, torch, model, options = runtime(REPO)
         options = dict(options, world_size=200., start=(80., 100.), subgoal_radius=None)
         goal = np.array([140., 100.])
         options['scene'] = (goal, [((92., 100.), 4.)], 1)
@@ -87,6 +87,18 @@ class AerialSurveyTests(unittest.TestCase):
             self.assertEqual(int(isolated.seen.sum()), 2)
             self.assertEqual(int((isolated.log_odds < 0).sum()), 1)
             self.assertEqual(int((isolated.log_odds > 0).sum()), 1)
+            # A physical obstacle also collides inside a wholly unsurveyed patch.
+            swaths = SurveySwaths.from_seed(113)
+            center = next((x, y) for x in range(25, 180, 15) for y in range(25, 180, 15)
+                          if not swaths.known_mask((x, y), (12, 12), 2.).any())
+            native.add_circle_obstacle(*center, 2.)
+            car = native.ground_robots[0]
+            car.prev_position = car.position.copy()
+            car.position[:2] = center
+            info = {'collisions': []}
+            native._handle_collisions(info)
+            self.assertEqual(info['collisions'][0]['obstacle_type'], 'circle')
+            np.testing.assert_array_equal(car.position, car.prev_position)
             # Use a strict raster fixture with a known ground corridor; its source
             # support must survive a previous synthetic episode in the same worker.
             backend = load_map_backend(REPO)

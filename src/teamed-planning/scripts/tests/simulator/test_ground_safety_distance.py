@@ -11,7 +11,6 @@ from scipy.ndimage import label
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from drone.cograph_v2_mappo import CoGraphV2ActorCritic
 from drone.relay_attention_mappo import RelayActorCritic
 from drone.semantic_segmentation import TerrainType
 from drone.drone_main import DroneController
@@ -19,7 +18,6 @@ from drone.skeleton_graph_builder import SkeletonGraphBuilder
 from ground.ground_main import GroundRobotController
 from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
 from ground.local_planner import LocalPlanner
-from simulator.cograph_experiment import CoGraphExperiment
 from simulator.mappo_experiment import Experiment, BRIDGE_CLEARANCE_M
 from simulator.large_world_scenarios import CircleGeometry, generate_large_scene
 from simulator.train_mappo import optimizer_config_changes, validate_config
@@ -34,7 +32,7 @@ def config(version):
 
 class GroundSafetyDistanceConfigTests(unittest.TestCase):
     def test_every_training_version_defaults_to_one_metre(self):
-        paths = sorted(CONFIGS.glob('mappo_training*.json')) + sorted(CONFIGS.glob('cograph_v*.json'))
+        paths = sorted(CONFIGS.glob('mappo_training*.json'))
         for path in paths:
             with self.subTest(config=path.name):
                 settings = json.loads(path.read_text())
@@ -85,24 +83,16 @@ class GroundSafetyDistanceComponentTests(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(1)
         cls.single_model = RelayActorCritic().eval()
-        cls.team_model = CoGraphV2ActorCritic().eval()
 
     def setUp(self):
         output = contextlib.redirect_stdout(io.StringIO())
         output.__enter__()
         self.addCleanup(output.__exit__, None, None, None)
 
-    def experiment(self, team=False, **options):
-        if team:
-            scene = dict(start=[100., 100.], goals=[[250., 100.], [100., 250.]],
-                         attempts=1, vehicle_starts=[[100., 100.], [100., 114.], [100., 86.]],
-                         circles=[], reference_polyline_lengths=[150., 150.])
-            env = CoGraphExperiment(23, self.team_model, scene, num_drones=3,
-                                    fusion_bridge_distance=15., **options)
-        else:
-            env = Experiment(23, self.single_model, communication_mode='backbone',
-                             safety_filter='cbf', moving_ground=True, start=(30., 60.),
-                             scene=([95., 60.], [], 1), fusion_bridge_distance=15., **options)
+    def experiment(self, **options):
+        env = Experiment(23, self.single_model, communication_mode='backbone',
+                         safety_filter='cbf', moving_ground=True, start=(30., 60.),
+                         scene=([95., 60.], [], 1), fusion_bridge_distance=15., **options)
         self.addCleanup(env.env.close)
         return env
 
@@ -143,11 +133,6 @@ class GroundSafetyDistanceComponentTests(unittest.TestCase):
         for options, expected in (({}, 1.), ({'ground_safety_distance': 1.5}, 1.5)):
             with self.subTest(options=options):
                 self.check_components_and_bridge(self.experiment(**options), expected)
-
-    def test_cograph_components_use_default_and_configured_clearance(self):
-        for options, expected in (({}, 1.), ({'ground_safety_distance': 1.5}, 1.5)):
-            with self.subTest(options=options):
-                self.check_components_and_bridge(self.experiment(team=True, **options), expected)
 
     def test_one_metre_clearance_opens_a_corridor_closed_by_one_point_five(self):
         # A 2.5 m observed corridor at 0.5 m resolution. Inflation by 1 m

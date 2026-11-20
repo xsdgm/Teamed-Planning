@@ -1,10 +1,10 @@
 # WildScenes 2D 局部感知适配
 
-本次修改针对 WildScenes 点云投影地图、VTemp rolling200 临时目标和 v9 best576 权重。无人机新增同位置、同 24×24m 视野的精细局部观测，默认 0.5m（48×48），仅用于语义转换和拓扑建图。它是感知分辨率设置的调整，并非从原 2m 观测中推断出未提供的细节。
+本次修改针对 WildScenes 点云投影地图、vtemp 滚动临时目标和 v9 best576 权重。无人机新增同位置、同 24×24m 视野的精细局部观测，默认 0.5m（48×48），仅用于语义转换和拓扑建图。它是感知分辨率设置的调整，并非从原 2m 观测中推断出未提供的细节。
 
 原 12×12、2m 占据图继续进入 Actor 和送达证据账本，网络结构和权重不变。地面感知保持 8×8m、0.5m。新增 `mapping_known_mask` 区分覆盖缺失与实测占据；未知、边界外以及任何与阻挡细格相交的区域仍禁止通行。建图保留 1.5m 净空及原米制节点/边参数，重新构造建图器以同步像素缓存。
 
-主要实现位于 `scripts/drone/local_mapping.py`、`drone_main.py` 和 `scripts/simulator/wildscenes_map.py`。当前控制器直接支持双分辨率；冻结 v9 通过显式子类适配，历史 `runtime_sources`、训练配置和权重未被编辑。临时目标选择规则仍为原 VTemp 200m / arrival25。
+主要实现位于 `scripts/drone/local_mapping.py`、`drone_main.py` 和 `scripts/simulator/wildscenes_map.py`。当前控制器直接支持双分辨率；冻结 v9 通过显式子类适配，历史 `runtime_sources`、训练配置和权重未被编辑。临时目标选择规则仍为vtemp 的 200 米候选半径和 25 米到达阈值。
 
 ## 使用
 
@@ -15,14 +15,14 @@
   src/teamed-planning/scripts/simulator/validate_wildscenes_vtemp.py \
   --cases artifacts/wildscenes-v9-20261106/maps/K-01-r025/cases_control_200m.json \
   --mapping-resolution 0.5 --samples 3 --workers 2 \
-  --output artifacts/wildscenes-v9-20261106/perception_r05_full_control
+  --output artifacts/wildscenes-v9-20261106/vtemp/perception_r05_full_control
 ```
 
 此命令是后续完整对照的入口；本次实际执行的是下面列出的单样本验证，不把它冒称为完整六次对照。
 
 ## 验证结果
 
-49项测试通过：局部感知7项、栅格适配9项、速度策略与图编码17项、冻结VTemp6项、冻结v9精细感知集成5项、报告隔离5项。检查包括4m安全直通道恢复节点和边、未知缺口保持阻挡、坐标与尺度、Actor传感器特征逐元素不变、实际收到的证据包仍是12×12@2m、冻结资产散列不变，以及异常后的运行时恢复。另验证相同设置resume可复用、改变分辨率时拒绝复用且不写坏原manifest。
+49项测试通过：局部感知7项、栅格适配9项、速度策略与图编码17项、冻结 vtemp 6 项、冻结v9精细感知集成5项、报告隔离5项。检查包括4m安全直通道恢复节点和边、未知缺口保持阻挡、坐标与尺度、Actor传感器特征逐元素不变、实际收到的证据包仍是12×12@2m、冻结资产散列不变，以及异常后的运行时恢复。另验证相同设置resume可复用、改变分辨率时拒绝复用且不写坏原manifest。
 
 实际 K-01 重放结果保存在 `artifacts/wildscenes-v9-20261106/perception_r05_20261106/`：
 

@@ -18,12 +18,13 @@ NODE_FEATURES = 8
 GRAPH_BLOCK = MAX_NODES*(NODE_FEATURES+NEIGHBORS+1)
 
 
-def prefix_width(input_version=1):
-    # State + 2*12*12 actual sensor pixels: 320 (v6, input 1) or 322 (v6.2, input 2).
+def prefix_width(input_version=2):
+    if input_version not in INPUT_VERSIONS:
+        raise ValueError('Only actor input version 2 is supported')
     return STATE_FEATURES[input_version]+2*SENSOR_SIZE**2
 
 
-PREFIX = prefix_width(1)
+PREFIX = prefix_width(2)
 GAT_FEATURES = PREFIX + GRAPH_BLOCK
 ENCODED_FEATURES = PREFIX + 64
 
@@ -136,11 +137,10 @@ class GraphAttentionActorCritic(nn.Module):
     policy_architecture='gat_map_v1'
     velocity=staticmethod(bounded_velocity)
 
-    def __init__(self,global_features=10,input_version=1):
+    def __init__(self,global_features=10,input_version=2):
         super().__init__();self.global_features=int(global_features)
         self.input_version=int(input_version);self.prefix=prefix_width(self.input_version)
-        # Checkpoint feature versions: 4 = v6 GAT inputs, 6 = v6.2 GAT inputs.
-        self.feature_version=4 if self.input_version==1 else 6
+        self.feature_version=6
         encoded=self.prefix+64
         self.gat_actor=nn.Sequential(GraphEncoder(self.prefix),nn.Linear(encoded,128),nn.Tanh(),
                                      nn.Linear(128,128),nn.Tanh(),nn.Linear(128,2))
@@ -151,15 +151,6 @@ class GraphAttentionActorCritic(nn.Module):
         nn.init.orthogonal_(self.gat_actor[-1].weight,gain=.01);nn.init.zeros_(self.gat_actor[-1].bias)
         self.register_buffer('value_mean',torch.zeros(()));self.register_buffer('value_std',torch.ones(()))
         self.register_buffer('value_moments',torch.zeros(3))
-
-    @classmethod
-    def from_state_dict(cls,state):
-        # The critic's first linear layer follows its private graph encoder.
-        prefix=state['gat_actor.1.weight'].shape[1]-64
-        versions=[v for v in INPUT_VERSIONS if prefix_width(v)==prefix]
-        if not versions:raise ValueError(f'Unknown GAT actor prefix width {prefix}')
-        model=cls(state['critic.1.weight'].shape[1]-prefix-64,versions[0])
-        model.load_state_dict(state);return model
 
     def encode_graph(self,base,position,observation):
         return encode_graph(base,position,observation,self.prefix)

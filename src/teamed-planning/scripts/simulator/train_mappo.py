@@ -32,6 +32,7 @@ import torch
 from drone.mappo import ActorCritic, GLOBAL_FEATURES
 from simulator.mappo_experiment import Experiment, SafetyTermination
 from common.navigation_config import DEFAULT_GROUND_CLEARANCE_M
+from ground.subgoal_manager import DEFAULT_REVIEW_INTERVAL_S
 from simulator.ppo_batch import update_batch
 from simulator.large_world_scenarios import generate_training_scene
 from simulator.env import BOUNDARY_ROUNDOFF_TOLERANCE_M
@@ -58,7 +59,8 @@ DEFAULTS = dict(episodes=800, steps=4000, seed=53, learning_rate=3e-4,
     discount=0.995,gae_lambda=0.97,initial_validation=False,
     # Relay subgoals (ground/subgoal_manager.py), episode end at vehicle arrival
     # instead of a stable task graph, its terminal reward, and initial weights.
-    subgoal_radius=None,subgoal_arrival=25.,termination='arrival',arrival_reward=100.0,init_checkpoint=None,
+    subgoal_radius=None,subgoal_arrival=25.,subgoal_review_interval=DEFAULT_REVIEW_INTERVAL_S,
+    termination='arrival',arrival_reward=100.0,init_checkpoint=None,
     # Compatibility fields present in existing policy checkpoints.
     chain_ground_range=None,chain_link_range=None,
     route_reward_weight=10.,time_penalty=0.01,map_success_reward=0.,ground_stationary=False,
@@ -69,7 +71,7 @@ DEFAULTS = dict(episodes=800, steps=4000, seed=53, learning_rate=3e-4,
     # velocity_mapping: the start->goal map term stops once route quality pays.
     mapping_reward_until_connected=True,
     # v9 evaluates both delivered maps at the same current vehicle position and
-    # rolling target. CoGraph retains the initial-origin schema.
+    # rolling target.
     mapping_route_origin='vehicle',
     cbf_margin_weight=0.1,cbf_margin_scale=8.,map_improvement_steps=0,map_target_quality=1.,
     frontier_progress_weight=45.0,
@@ -91,25 +93,6 @@ DEFAULTS = dict(episodes=800, steps=4000, seed=53, learning_rate=3e-4,
     # Vehicle-side fusion joins graph components within this distance (m) when the
     # delivered occupancy shows a free corridor (0: off; at most the drones' 15 m edge).
     fusion_bridge_distance=15.0,
-    # CoGraph (policy_architecture cograph_v1): vehicles in the one team and the
-    # inclusive range of task targets per episode (null for single-target runs).
-    vehicle_count=1,target_count_range=None,
-    # CoGraph v2: 'single_task' scenes put every target under the drone network
-    # at once (one task; 'any' is v1's sampling); 'decentralized' vehicles each
-    # claim, broadcast and drive to their own targets ('parked' is v1's stationary
-    # team): a vehicle departs once its own graph reaches vehicle_depart_progress
-    # of the way, and a target passes to a vehicle cheaper by vehicle_transfer_margin;
-    # 'tree' budgets by the drones' coverage tree instead of the sum of target routes.
-    scene_regime='any',vehicle_planner='parked',budget_reference='sum',
-    vehicle_depart_progress=.5,vehicle_transfer_margin=.15,
-    # 'link_keeping': each decentralized vehicle's onboard filter keeps its own
-    # backbone links within vehicle_keep_range (m, 3D, inside the drones' CBF
-    # edge) and yields to other vehicles (ground/vehicle_motion.py); 'free' is the
-    # first v2 run's unfiltered drive.
-    vehicle_motion='free',vehicle_keep_range=88.,
-    # CoGraph v2: compare delivered maps at the same current vehicle positions.
-    # Omitted fields preserve historical checkpoints and reward trajectories.
-    cograph_route_reward='legacy',
     # v10: local UAV confidence over an independent a-b survey corridor.
     survey_a=None,survey_b=None,survey_vehicle_start=None,survey_half_width=12.,
     survey_resolution=2.,survey_start_offset_range=[20.,80.],survey_anchor_probability=.25,
@@ -119,11 +102,18 @@ DEFAULTS = dict(episodes=800, steps=4000, seed=53, learning_rate=3e-4,
     # feasibility resampling. None retains the unrestricted legacy sampler.
     route_ab_distance_bands=None)
 
-# cograph_v2 is v1 plus the learned per-drone target choice (drone/cograph_v2_mappo.py).
-COGRAPH_ARCHITECTURES=('cograph_v1','cograph_v2')
-# The drones' CBF keeps a link below comm range minus its margin (95 - 0.25 m).
-COGRAPH_LINK_EDGE_M=94.75
-RELAY_ARCHITECTURES=('gat_relay_attention_v8','gat_survey_v10','gat_route_ab_v11')+COGRAPH_ARCHITECTURES
+RELAY_ARCHITECTURES=('gat_relay_attention_v8','gat_survey_v10','gat_route_ab_v11')
+
+# Retained policy checkpoints saved complete configuration dictionaries. Ignore
+# only the inert defaults of the removed multi-target experiment on recovery;
+# nondefault values must never silently select a different task.
+_RETIRED_TEAM_DEFAULTS = {
+    'vehicle_count': 1, 'target_count_range': None, 'scene_regime': 'any',
+    'vehicle_planner': 'parked', 'budget_reference': 'sum',
+    'vehicle_depart_progress': .5, 'vehicle_transfer_margin': .15,
+    'vehicle_motion': 'free', 'vehicle_keep_range': 88.,
+    'cograph_route_reward': 'legacy',
+}
 
 OPTIMIZER_CONFIG_FIELDS={'rollout_mode','ppo_target_kl','ppo_max_kl','ppo_max_backtracks',
                          'critic_epochs','critic_minibatch_size','value_normalization'}
@@ -153,17 +143,23 @@ def fixed_schedule(config, completed):
 
 
 def validate_config(config):
+    config = dict(config)
+    for name, default in _RETIRED_TEAM_DEFAULTS.items():
+        if name in config:
+            value = config.pop(name)
+            if value != default or (isinstance(value, bool) and not isinstance(default, bool)):
+                raise ValueError(f'Removed multi-target setting is unsupported: {name}')
     unknown=set(config)-set(DEFAULTS)
     if unknown:
         raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
-    # Historical CoGraph and survey checkpoints omit the fixed-start field.
+    # Historical survey checkpoints omit the fixed-start field.
     # Relay checkpoints with no origin describe the retired fixed-start task.
     if 'policy_architecture' in config and 'mapping_route_origin' not in config:
         config = dict(config, mapping_route_origin='initial')
     config = dict(DEFAULTS, **config)
     if (config['policy_architecture'] not in RELAY_ARCHITECTURES or
             (config['policy_architecture'] == 'gat_relay_attention_v8' and config['mapping_route_origin'] != 'vehicle')):
-        raise ValueError('Training requires a v9, v10, v11, v11.2 or CoGraph policy configuration')
+        raise ValueError('Training requires a v9, v10, v11 or v11.2 policy configuration')
     if config['policy_architecture']=='gat_route_ab_v11':
         from simulator.route_ab_experiment import validate_route_ab_config
         validate_route_ab_config(config)
@@ -178,11 +174,6 @@ def validate_config(config):
     if (isinstance(clearance,bool) or not isinstance(clearance,(int,float))
             or not np.isfinite(clearance) or clearance<=0):
         raise ValueError('ground_safety_distance must be positive and finite')
-    if config['cograph_route_reward'] not in ('legacy','paired_current'):
-        raise ValueError('cograph_route_reward must be legacy or paired_current')
-    if config['cograph_route_reward']=='paired_current' and (
-            config['policy_architecture']!='cograph_v2' or config['vehicle_planner']!='decentralized'):
-        raise ValueError('Paired current-route reward requires cograph_v2 with decentralized vehicles')
     if config['mapping_route_origin'] not in ('initial','vehicle'):
         raise ValueError('mapping_route_origin must be initial or vehicle')
     remaining_route=config['mapping_route_origin']=='vehicle'
@@ -259,53 +250,6 @@ def validate_config(config):
     if config['communication_mode'] != 'backbone' or config['safety_filter'] != 'cbf' or config['drop'] != 0.:
         raise ValueError('Training requires the communication backbone, CBF and synchronous neighbour geometry')
     relay={k:config[k] for k in ('relay_loss','relay_delay_jitter','relay_period','relay_capacity','relay_attention')}
-    if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
-        counts=config['target_count_range']
-        if (not isinstance(counts,(list,tuple)) or len(counts)!=2 or any(type(n) is not int for n in counts)
-                or not 1<=counts[0]<=counts[1]<=8):
-            raise ValueError('CoGraph target_count_range must be two integers within 1..8')
-        if type(config['vehicle_count']) is not int or not 1<=config['vehicle_count']<=3:
-            raise ValueError('CoGraph v1 has a start layout for 1..3 vehicles')
-        if (len(config['fleet_sizes'])!=1 or config['task_distance_range'] is None
-                or config['reward_mode']!='velocity_mapping'):
-            raise ValueError('CoGraph: one fleet size, a task_distance_range and velocity_mapping')
-        if (config['scene_regime'] not in ('any','single_task')
-                or config['vehicle_planner'] not in ('parked','decentralized')
-                or config['budget_reference'] not in ('sum','tree')):
-            raise ValueError("CoGraph scene_regime is any|single_task, vehicle_planner parked|decentralized, "
-                             "budget_reference sum|tree")
-        # v1 parks the team (the option space is built from the start); v2's
-        # decentralized vehicles drive themselves, so they are not stationary.
-        if config['ground_stationary']!=(config['vehicle_planner']=='parked'):
-            raise ValueError('CoGraph: ground_stationary must be true exactly for the parked team')
-        for name,low,high in (('vehicle_depart_progress',0.,1.),('vehicle_transfer_margin',0.,1.)):
-            value=config[name]
-            if isinstance(value,bool) or not isinstance(value,(int,float)) or not (low<value<=high if
-                    name=='vehicle_depart_progress' else low<=value<high):
-                raise ValueError(f'{name} out of range')
-        if (config['vehicle_motion'] not in ('free','link_keeping')
-                or (config['vehicle_motion']=='link_keeping' and config['vehicle_planner']!='decentralized')):
-            raise ValueError('vehicle_motion is free, or link_keeping with decentralized vehicles')
-        keep=config['vehicle_keep_range']
-        if isinstance(keep,bool) or not isinstance(keep,(int,float)) or not 20.<keep<COGRAPH_LINK_EDGE_M:
-            raise ValueError(f'vehicle_keep_range must lie in (20, {COGRAPH_LINK_EDGE_M}) m')
-        if config['vehicle_motion']=='free' and keep!=DEFAULTS['vehicle_keep_range']:
-            raise ValueError('vehicle_keep_range needs vehicle_motion link_keeping')
-        if (config['vehicle_planner']=='parked' and (config['vehicle_depart_progress'],
-                config['vehicle_transfer_margin'])!=(DEFAULTS['vehicle_depart_progress'],DEFAULTS['vehicle_transfer_margin'])):
-            raise ValueError('vehicle_depart_progress/vehicle_transfer_margin need decentralized vehicles')
-        if (config['surprise_weight'] or config['route_reward_weight'] or config['exploration_weight']
-                or config['map_quality_reward'] or config['init_optimizer']):
-            raise ValueError('CoGraph v1 has no surprise, route-cost, area or final-quality terms and '
-                             'cannot restore an optimizer of another architecture')
-    elif (config['target_count_range'] is not None or config['vehicle_count']!=1
-            or (config['scene_regime'],config['vehicle_planner'],config['budget_reference'])!=('any','parked','sum')
-            or (config['vehicle_depart_progress'],config['vehicle_transfer_margin'])
-               !=(DEFAULTS['vehicle_depart_progress'],DEFAULTS['vehicle_transfer_margin'])
-            or (config['vehicle_motion'],config['vehicle_keep_range'])
-               !=(DEFAULTS['vehicle_motion'],DEFAULTS['vehicle_keep_range'])):
-        raise ValueError('target_count_range/vehicle_count/scene_regime/vehicle_planner/budget_reference/'
-                         'vehicle_* require a CoGraph policy_architecture')
     if (isinstance(relay['relay_loss'],bool) or not isinstance(relay['relay_loss'],(int,float))
             or not 0<=relay['relay_loss']<1
             or any(type(relay[k]) is not int for k in ('relay_delay_jitter','relay_period','relay_capacity'))
@@ -358,6 +302,9 @@ def validate_config(config):
     if (isinstance(config['subgoal_arrival'],bool) or not isinstance(config['subgoal_arrival'],(int,float))
             or not 0<config['subgoal_arrival']<(config['subgoal_radius'] or np.inf)):
         raise ValueError('subgoal_arrival must be positive and below subgoal_radius')
+    interval = config['subgoal_review_interval']
+    if type(interval) not in (float, int) or not math.isfinite(interval) or interval <= 0:
+        raise ValueError('subgoal_review_interval must be a positive finite duration in seconds')
     if config['termination'] not in ('map','arrival','survey'):
         raise ValueError('termination must be map, arrival or survey')
     if config['termination']=='survey' and config['policy_architecture']!='gat_survey_v10':
@@ -391,8 +338,7 @@ def validate_config(config):
     if remaining_route:
         if (config['reward_mode']!='velocity_mapping' or config['action_mode']!='velocity'
                 or config['world_size']!=1000. or config['termination']!='arrival'
-                or config['ground_stationary']
-                or config['policy_architecture'] in COGRAPH_ARCHITECTURES):
+                or config['ground_stationary']):
             raise ValueError('v9 remaining-route mapping requires a moving vehicle, '
                              'velocity_mapping and arrival termination in the 1000m world')
         if (config['map_success_reward'] or config['map_quality_reward']
@@ -442,18 +388,13 @@ def validate_config(config):
 
 
 def critic_features(config):
-    """Width of the centralized critic state (CoGraph has its own multi-target state)."""
-    if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
-        from drone.cograph_mappo import GLOBAL_FEATURES as COGRAPH_FEATURES
-        return COGRAPH_FEATURES
+    """Width of the retained policies' centralized critic state."""
     return GLOBAL_FEATURES
 
 
 def feature_version(config):
     return {
         'gat_relay_attention_v8': 8,
-        'cograph_v1': 9,
-        'cograph_v2': 10,
         'gat_survey_v10': 11,
         'gat_route_ab_v11': 12,
     }[config['policy_architecture']]
@@ -466,12 +407,6 @@ def make_model(config):
     if config['policy_architecture']=='gat_survey_v10':
         from drone.survey_mappo import SurveyActorCritic
         return SurveyActorCritic(GLOBAL_FEATURES,config['actor_input_version'],config['relay_attention'])
-    if config['policy_architecture']=='cograph_v2':
-        from drone.cograph_v2_mappo import CoGraphV2ActorCritic
-        return CoGraphV2ActorCritic(critic_features(config),config['actor_input_version'],config['relay_attention'])
-    if config['policy_architecture']=='cograph_v1':
-        from drone.cograph_mappo import CoGraphActorCritic
-        return CoGraphActorCritic(critic_features(config),config['actor_input_version'],config['relay_attention'])
     if config['policy_architecture']=='gat_relay_attention_v8':
         from drone.relay_attention_mappo import RelayActorCritic
         return RelayActorCritic(GLOBAL_FEATURES,config['actor_input_version'],config['relay_attention'])
@@ -491,19 +426,6 @@ def reward_contract(config):
         return 'uav_local_ab_confidence_with_vehicle_backbone_v10'
     if config.get('mapping_route_origin','initial')=='vehicle':
         return 'uav_remaining_route_mapping_v9'
-    if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
-        # v8 terms per target, averaged over targets; success = every target connected.
-        bridged='_bridged' if config['fusion_bridge_distance'] else ''
-        if (config['scene_regime'],config['vehicle_planner'],config['budget_reference'])==('any','parked','sum'):
-            return 'cograph_v1_multi_target_option_space'+bridged
-        # CoGraph v2: same per-target terms; the episode distribution, budget and
-        # vehicle behaviour differ, so checkpoints are labelled apart from v1.
-        return ('cograph_v2_task_option_space'
-                +('_single_task' if config['scene_regime']=='single_task' else '')
-                +('_decentralized_vehicles' if config['vehicle_planner']=='decentralized' else '')
-                +('_tree_budget' if config['budget_reference']=='tree' else '')
-                +('_vehicle_link_keeping' if config['vehicle_motion']=='link_keeping' else '')+bridged
-                +('_paired_current_route' if config.get('cograph_route_reward','legacy')=='paired_current' else ''))
     raise ValueError('Unknown reward contract')
 
 
@@ -532,9 +454,6 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
     if config['policy_architecture']=='gat_survey_v10':
         from simulator.survey_experiment import run_survey_episode
         return run_survey_episode(model,config,scene_seed,schedule,stochastic,progress,stop)
-    if config['policy_architecture'] in COGRAPH_ARCHITECTURES:
-        from simulator.cograph_experiment import run_cograph_episode
-        return run_cograph_episode(model,config,scene_seed,schedule,stochastic,progress,stop)
     scene = generate_training_scene(scene_seed, config['task_distances'],
         distance_range=config['task_distance_range'], distance_sampling=config['distance_sampling'],
         ground_safety_distance=config['ground_safety_distance'])
@@ -550,6 +469,7 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],
             ground_safety_distance=config.get('ground_safety_distance',DEFAULT_GROUND_CLEARANCE_M),
             subgoal_radius=config['subgoal_radius'],subgoal_arrival=config['subgoal_arrival'],
+            subgoal_review_interval=config.get('subgoal_review_interval', DEFAULT_REVIEW_INTERVAL_S),
             route_reward_weight=config['route_reward_weight'],time_penalty=config['time_penalty'],
             ground_stationary=config['ground_stationary'],
             chain_soft_ratio=config['chain_soft_ratio'],chain_risk_weight=config['chain_risk_weight'],
@@ -768,10 +688,6 @@ def episode_line(completed, config, summary, loss, ppo):
         completion=f'arrived={summary.get("goal_reached",0.):.0f}'
         route_change=f'route_delta_m={summary.get("route_length_delta_m",0.):.1f}'
         frontier=summary.get('frontier_progress',0.)
-    elif config.get('cograph_route_reward','legacy')=='paired_current':
-        completion=f'map_done={summary.get("map_completed",0.):.0f}'
-        route_change=f'route_delta_m={summary.get("route_length_delta_m",0.):.1f}'
-        frontier=summary.get('frontier_progress',0.)
     else:
         completion=f'map_done={summary.get("map_completed",0.):.0f}'
         route_change=f'route_saved_m={summary.get("route_new_best_saving_m",0.):.1f}'
@@ -825,13 +741,6 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
                     or initial['config'].get('relay_attention')!=config['relay_attention']):
                 raise ValueError('Survey warm start requires a compatible v9 checkpoint')
             warm=model.warm_start_actor(initial['model'])
-        elif (config['policy_architecture'] in COGRAPH_ARCHITECTURES
-                and initial.get('policy_architecture')=='gat_relay_attention_v8'):
-            # Cross-architecture warm start: shared v8 modules, fresh target attention
-            # (and, for v2, the target selector at its nearest-unconnected prior).
-            if initial.get('relay_attention',initial['config'].get('relay_attention'))!=config['relay_attention']:
-                raise ValueError('v8 warm start must use the same relay_attention mode')
-            warm=model.warm_start(initial['model'])
         elif (initial.get('critic_global_features',0)!=critic_features(config) or
                 initial.get('feature_version')!=feature_version(config) or
                 initial.get('action_mode','candidate')!=config['action_mode']):
@@ -927,7 +836,6 @@ def train(config, output, resume=False, workers=1, mp_context='spawn', upgrade_o
             communication_mode=config['communication_mode'],safety_filter=config['safety_filter'],
             moving_ground=config['moving_ground'],reward_mode=config['reward_mode'],
             mapping_route_origin=config['mapping_route_origin'],
-            cograph_route_reward=config['cograph_route_reward'],
             environment_version=ENVIRONMENT_VERSION,
             reward_contract=reward_contract(config),
             ground_speed=config['ground_speed'],path_reward_scale=config['path_reward_scale'],

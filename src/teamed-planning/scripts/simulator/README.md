@@ -1,6 +1,13 @@
 # Simple 2D Heterogeneous Multi-Robot Simulator
 
-MAPPO training, controlled baselines and offline 2D replay: [implementation and experiment instructions](MAPPO.md).
+MAPPO training, controlled baselines and offline 2D replay: [implementation and experiment instructions](MAPPO.md). VTemp2 ground and survey training is documented in [VTemp2.md](VTemp2.md).
+
+VTemp4 supervisors are [run_vtemp4_formal.py](run_vtemp4_formal.py),
+[run_vtemp4_continuous_history.py](run_vtemp4_continuous_history.py) and
+[run_vtemp4_waypoint_comparison.py](run_vtemp4_waypoint_comparison.py).
+Its `build_vtemp4_*`, `generate_vtemp4_field.py`, `render_vtemp4_field.py`,
+`replay_vtemp4_field.py` and `check_vtemp4_guidance.py` tools prepare and inspect
+field scenarios. See the [experiment guide](../../../../experiments/world_model/vtemp4/README.md).
 
 A kilometer-scale multi-robot forest simulation environment designed for reinforcement learning.
 
@@ -31,7 +38,7 @@ scripts/
 │   ├── robots.py              # Ground robot and drone dynamics
 │   ├── obstacles.py           # Obstacle definitions and forest generation
 │   ├── renderer_pygame.py     # Interactive renderer
-│   ├── navigation_metrics.py  # Route metrics and CoGraph update credit
+│   ├── navigation_metrics.py  # Route metrics
 │   ├── scenarios.py           # Small deterministic scenes
 │   ├── large_world_scenarios.py # Large training/evaluation scenes
 │   ├── train_mappo.py         # Training entry point
@@ -50,7 +57,6 @@ test fixtures. Frozen evaluation jobs use the archived source trees recorded in 
 | `utils.py` | Collision helpers in [env.py](env.py); three unused angle/vector helpers removed |
 | `relay_channel.py` | [env.py](env.py), alongside simulator transport and physics |
 | `forest_generator.py` | [obstacles.py](obstacles.py), alongside obstacle definitions |
-| `cograph_route_reward.py` | [navigation_metrics.py](navigation_metrics.py), alongside route metrics |
 
 The package-level `create_forest_scenario` export is retained. Historical
 experiments that explicitly load frozen snapshots keep their original imports.

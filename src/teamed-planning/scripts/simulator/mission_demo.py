@@ -405,32 +405,6 @@ def generate_forest_scenario(world_size, obstacle_density):
     return obstacles
 
 
-def create_patrol_waypoints(start_pos, world_size, num_waypoints=8, patrol_range=400.0):
-    """
-    Create patrol waypoints for a drone starting from a position.
-    """
-    waypoints = []
-    center_x = start_pos[0]
-    center_y = start_pos[1]
-    altitude = start_pos[2]
-    
-    for i in range(num_waypoints):
-        angle = 2 * np.pi * i / num_waypoints
-        dx = patrol_range * np.cos(angle)
-        dy = patrol_range * np.sin(angle)
-        
-        x = center_x + dx
-        y = center_y + dy
-        
-        # Keep within world bounds
-        x = max(100, min(world_size - 100, x))
-        y = max(100, min(world_size - 100, y))
-        
-        waypoints.append((x, y, altitude))
-    
-    return waypoints
-
-
 def run_simulation(max_steps=2000):
     """Run cooperative aerial mapping and ground navigation."""
     
@@ -732,4 +706,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

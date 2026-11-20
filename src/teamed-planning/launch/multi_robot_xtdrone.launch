@@ -14,6 +14,8 @@
   <arg name="num_drones" default="3"/>
   <arg name="vehicle"    default="iris"/>
   <arg name="sitl_v9_checkpoint" default=""/>
+  <arg name="guidance_strategy" default="vtemp1"/>
+  <arg name="subgoal_review_interval" default="15.0"/>
   <arg name="sitl_v9" value="$(eval bool(arg('sitl_v9_checkpoint')))"/>
   <arg name="seg_model_path"
        default="$(find teamed_planning)/scripts/drone/models/segformer_b0_ade/model.onnx"/>
@@ -64,6 +66,8 @@
     <arg name="num_drones" value="$(arg num_drones)"/>
     <arg name="sitl_v9" value="$(arg sitl_v9)"/>
     <arg name="subgoal_radius" value="$(eval 200.0 if arg('sitl_v9') else 0.0)"/>
+    <arg name="subgoal_review_interval" value="$(arg subgoal_review_interval)"/>
+    <arg name="guidance_strategy" value="$(arg guidance_strategy)"/>
   </include>
 
   <include file="$(find teamed_planning)/launch/gcs.launch">

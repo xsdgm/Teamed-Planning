@@ -1,14 +1,13 @@
 # MAPPO 二维仿真
 
-训练和验证支持 v9、v10、v11、v11.2 及 CoGraph v1/v2。配置与任务的对应关系见[算法配置](../../config/algorithm/README.md)。
+训练和验证支持 v9、v10、v11、v11.2。配置与任务的对应关系见[算法配置](../../config/algorithm/README.md)。
 
 | 任务 | 入口 |
 | --- | --- |
 | 当前车辆位置到终点的导航建图 | `train_mappo.py`，使用 `mappo_training_v9.json` |
 | 局部 A–B 区域侦察、固定 A–B 路线 | `train_mappo.py`，使用 v10、v11 或 v11.2 配置 |
-| 多车、多目标协作 | `train_mappo.py`，使用 `cograph_v1.json` 或 `cograph_v2.json` |
 | 独立复评检查点 | `rescore_checkpoints.py --run <实验目录>`，默认使用该次训练的验证种子与采样次数 |
-| WildScenes 与 VTemp 滚动临时目标 | `validate_wildscenes_v9.py`、`validate_wildscenes_vtemp.py` |
+| WildScenes 与 vtemp 滚动临时目标 | `validate_wildscenes_v9.py`、`validate_wildscenes_vtemp.py` |
 
 ## 训练与恢复
 
@@ -24,6 +23,6 @@ Linux 和 PowerShell 的 `start_mappo_training` 脚本均默认使用 v9。后�
 
 训练器使用同一份冻结策略采集整批轨迹，再做同步 PPO 更新。它将权重、优化器、随机数状态和配置写入 `latest.pt`，按验证结果更新 `best.pt`。在实验目录中放置 `STOP` 可请求保存并停止。移除 `STOP` 后，使用原配置、原目录和 `--resume` 恢复。冻结实验的独立回放继续使用自身的源码快照。
 
-v9 使用的检查点架构名为 `gat_relay_attention_v8`，当前车辆位置路线奖励为 `uav_remaining_route_mapping_v9`。CoGraph 可以从兼容的中继注意力权重初始化。两者都使用 `drone/` 内的图注意力、协作、通信及安全模块。
+v9 使用的检查点架构名为 `gat_relay_attention_v8`，当前车辆位置路线奖励为 `uav_remaining_route_mapping_v9`。训练使用 `drone/` 内的图注意力、协作、通信及安全模块。
 
 回归测试及冻结回放的隔离运行命令见[模拟器测试说明](README.md#regression-tests)。

@@ -1,7 +1,6 @@
 """
 Graph Fusion Module for Ground Robots
 Merges topological graphs from multiple drones into a unified graph
-Includes uncertainty handling (placeholder for future probabilistic fusion)
 """
 
 import numpy as np
@@ -51,8 +50,6 @@ class GraphFusion:
         self.bridge_distance = 0.
         self.bridge_check = None
 
-        # Uncertainty handling (placeholder for future)
-        self.uncertainty_enabled = False
         
     def add_drone_graph(self, drone_id: str, graph: TopologicalGraph):
         """
@@ -230,93 +227,8 @@ class GraphFusion:
         """Clear all graphs."""
         self.unified_graph = TopologicalGraph(drone_id=f"{self.robot_id}_unified")
         self.source_graphs.clear()
-    
-    # ========== Uncertainty Handling Methods (Placeholder for Future) ==========
-    
-    def compute_merge_probability(self, pos1: Tuple[float, float],
-                                  pos2: Tuple[float, float],
-                                  cov1: Optional[np.ndarray] = None,
-                                  cov2: Optional[np.ndarray] = None) -> float:
-        """
-        Compute probability that two nodes should be merged.
-        
-        Version 1: Returns 1.0 if within threshold, 0.0 otherwise
-        Future: Use Mahalanobis distance with covariance matrices from broadcast
-        
-        Args:
-            pos1: Position of first node
-            pos2: Position of second node
-            cov1: Covariance matrix of first node (future use)
-            cov2: Covariance matrix of second node (future use)
-            
-        Returns:
-            Probability of merge (0.0 to 1.0)
-        """
-        if not self.uncertainty_enabled:
-            # Simple distance-based (already handled in _find_merge_candidate)
-            distance = np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
-            return 1.0 if distance <= self.merge_threshold else 0.0
-        
-        # Future: Mahalanobis distance with covariances
-        # if cov1 is not None and cov2 is not None:
-        #     combined_cov = cov1 + cov2
-        #     diff = np.array(pos2) - np.array(pos1)
-        #     inv_cov = np.linalg.inv(combined_cov)
-        #     mahal_dist = np.sqrt(diff.T @ inv_cov @ diff)
-        #     probability = scipy.stats.chi2.cdf(mahal_dist**2, df=2)
-        #     return probability
-        
-        return 1.0
-    
-    def validate_graph_consistency(self, graph1: TopologicalGraph, 
-                                   graph2: TopologicalGraph) -> bool:
-        """
-        Check consistency between two overlapping graphs.
-        
-        Version 1: Always returns True (no validation)
-        Future: Check for conflicting edges, incompatible node positions
-        
-        Args:
-            graph1: First TopologicalGraph
-            graph2: Second TopologicalGraph
-            
-        Returns:
-            True if graphs are consistent
-        """
-        if not self.uncertainty_enabled:
-            return True
-        
-        # Future: Implement consistency checks
-        # - Find overlapping nodes
-        # - Check if edge existence is consistent
-        # - Validate that node positions are within uncertainty bounds
-        # - Check for loop closure consistency
-        
-        return True
-    
-    def estimate_node_uncertainty(self, node_sources: List[Tuple[str, str]]) -> float:
-        """
-        Estimate position uncertainty for a merged node.
-        
-        Version 1: Returns fixed small uncertainty
-        Future: Compute based on source uncertainties and agreement
-        
-        Args:
-            node_sources: List of (drone_id, original_node_id) contributing to node
-            
-        Returns:
-            Estimated position uncertainty (meters)
-        """
-        if not self.uncertainty_enabled:
-            # Nominal small uncertainty
-            return 0.1
-        
-        # Future: If multiple drones observe same node with different positions,
-        # compute uncertainty from variance
-        # If node sources have covariances, propagate them
-        
-        return 0.1
-    
+
+
     def get_stats(self) -> Dict:
         """
         Get fusion statistics.
@@ -329,6 +241,5 @@ class GraphFusion:
             'unified_nodes': len(self.unified_graph),
             'unified_edges': self.unified_graph.graph.number_of_edges(),
             'source_graphs': len(self.source_graphs),
-            'merge_threshold': self.merge_threshold,
-            'uncertainty_enabled': self.uncertainty_enabled
+            'merge_threshold': self.merge_threshold
         }

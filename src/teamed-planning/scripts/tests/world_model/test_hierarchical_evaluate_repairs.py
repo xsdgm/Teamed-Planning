@@ -164,6 +164,57 @@ class RepairEvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'schemas differ'):
             validate_checkpoint(checkpoint, modules)
 
+    def test_all_external_evaluators_load_road_weights_and_synthetic_observation_protocol(self):
+        import torch
+        from world_model import (evaluate_fixed_target as fixed, evaluate_slow_policy as slow,
+                                 evaluate_safety_repairs as repairs, graph_dynamics, graph_fast_policy,
+                                 graph_rollouts, hierarchical_policy, hierarchical_runtime)
+        from world_model.partial_observation import PARTIAL_OBSERVATION_PROTOCOL
+        repo = Path(__file__).resolve().parents[5]
+        def old_episode(root, case, config, *, fast_seed, rollout_limit, random_init):
+            return hierarchical_runtime.HierarchicalEpisode(root, case, config, fast_seed=fast_seed,
+                rollout_limit=rollout_limit, random_init=random_init)
+
+        old_hierarchy = SimpleNamespace(HierarchyConfig=hierarchical_runtime.HierarchyConfig,
+                                        HierarchicalEpisode=old_episode)
+        old_world = SimpleNamespace(MODEL_SCHEMA=graph_dynamics.MODEL_SCHEMA,
+                                    GraphWorldModel=lambda hidden, horizon: graph_dynamics.GraphWorldModel(hidden, horizon))
+        # A goal inside the original 2m tolerance gives one real control frame to
+        # each worker, including the old frozen-signature and full-road cases.
+        case = dict(kind='v9_random', seed=791521, world_size=1000., direct_distance_m=1.,
+                    start=[500., 500.], goal=[501., 500.], circles=[])
+        for road in (False, True):
+            with self.subTest(road=road), tempfile.TemporaryDirectory() as directory:
+                modules = dict(hierarchy=hierarchical_runtime if road else old_hierarchy,
+                               graph_world=graph_dynamics if road else old_world, graph_data=graph_rollouts,
+                               fast=graph_fast_policy, graph_policy=hierarchical_policy)
+                output = Path(directory)
+                for subdir in ('episodes', 'logs', 'progress', 'runtime_sources/world_model'):
+                    (output / subdir).mkdir(parents=True)
+                config = dict(fresh_fast_world=True, fixed_mission_target=True, hidden=16, horizon=4,
+                              stride=4, jitter=0, loss=0., option_steps=8, ground_start_hold_seconds=30)
+                if road:
+                    config.update(road_topology=True, training_observation_protocol=PARTIAL_OBSERVATION_PROTOCOL)
+                model = graph_dynamics.GraphWorldModel(16, 4, road_topology=road)
+                fast = hierarchical_policy.make_graph_fast(repo, random_init=True)
+                checkpoint = dict(config=config, world_schema=model.schema, world=model.state_dict(),
+                                  fast=fast.state_dict(), slow=hierarchical_policy.GraphSlowActorCritic(hidden=16).state_dict(),
+                                  manifest=dict(fast_schema=hierarchical_policy.FAST_SCHEMA, slow_schema=hierarchical_policy.SLOW_SCHEMA))
+                path = output / 'input.pt'
+                torch.save(checkpoint, path)
+                hashes = repairs.checkpoint_hashes(checkpoint, graph_fast_policy.state_hash)
+                reference = SimpleNamespace(frozen_modules=lambda run: modules, write_json=write_json)
+                with patch.object(fixed, 'frozen_modules', return_value=modules), patch.object(
+                        slow, 'helper', return_value=reference), patch.object(repairs, 'load_modules', return_value=modules):
+                    fixed_row = fixed.evaluate_case((repo, output, path, output, case, True))
+                    slow_row = slow.evaluate_case((repo, output, output, path, output, case, 8, hashes))
+                    repair_row = repairs.evaluate_case((repo, output, 0, case, 1, hashes, digest(path)))
+                for row in (fixed_row, slow_row, repair_row):
+                    self.assertEqual(row['steps'], 1)
+                    self.assertTrue(row['goal_reached'])
+                    self.assertEqual(row['observation_protocol'], PARTIAL_OBSERVATION_PROTOCOL if road else 'native')
+                    self.assertEqual(row['frozen_hashes']['world'], hashes['world'])
+
     def test_nonfinite_margin_remains_explicit_and_serializable(self):
         controller = SimpleNamespace(drone_id='drone_0', safety_stats=dict(
             feasibility_margin=float('-inf'), infeasible=True, communication_guard_feasible=False))

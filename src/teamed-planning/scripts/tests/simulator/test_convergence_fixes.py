@@ -10,7 +10,6 @@ import torch
 from common.graph_structure import TopologicalGraph
 from drone.skeleton_graph_builder import SkeletonGraphBuilder
 from drone.semantic_segmentation import TerrainType
-from drone.mappo import ActorCritic
 from ground.graph_fusion import GraphFusion
 from simulator.scenarios import generate_scene,scene_feasible
 from simulator.mappo_experiment import navigation_cost,Experiment
@@ -118,7 +117,7 @@ class ConvergenceTests(unittest.TestCase):
 
     def test_packet_outage_is_distinct_from_geometric_connectivity(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            env=Experiment(20000,ActorCritic(),drop=1.,moving_ground=True,
+            env=Experiment(20000,None,drop=1.,moving_ground=True,
                 communication_mode='chain',safety_filter='cbf',reward_mode='cadmm_exploration')
             try:
                 for frame in range(8):

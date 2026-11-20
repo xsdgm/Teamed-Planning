@@ -1,10 +1,10 @@
-# WildScenes 实测森林二维地图：VTemp 临时目标方案 + v9 权重
+# WildScenes 实测森林二维地图：vtemp 临时目标方案 + v9 权重
 
 后续已增加[双分辨率局部感知适配](wildscenes_perception_20261106.md)。本文记录的是原2m无人机观测实验；当前工作区验证入口默认0.5m精细建图，运行原单栅格行为需显式指定 `--mapping-resolution 2` 并使用新输出目录。旧正式结果与冻结源码仍保留，不能将新配置结果混入本文实验。
 
-本实验把 WildScenes 的真实点云及语义标签转换成原比例二维占据地图，使用原 VTemp 5km 验证的 `rolling200` 临时目标方案，搭配冻结 v9 权重。用户要求公里级任务，不要求起终点直线相距 5km。数据集的采集总里程不作为导航任务距离。
+本实验把 WildScenes 的真实点云及语义标签转换成原比例二维占据地图，使用 vtemp 在原 5 公里验证中采用的滚动临时目标方案，搭配冻结 v9 权重。用户要求公里级任务，不要求起终点直线相距 5km。数据集的采集总里程不作为导航任务距离。
 
-正式结果统一放在 `artifacts/wildscenes-v9-20261106/vtemp_rolling200/`，不向 `pre/` 写入任何文件。此前无临时目标的测试仅为基线，结果保留于根实验目录的 `evaluation/` 与 `evaluation_control/`；四个基线回放/报告已从 `pre/` 移至 `baseline_no_subgoal/report/`，不能将其当作 VTemp 验证。
+本次正式结果保存在 `artifacts/wildscenes-v9-20261106/vtemp_rolling200/`，不向 `pre/` 写入任何文件。此前无临时目标的测试仅为基线，结果保留于根实验目录的 `evaluation/` 与 `evaluation_control/`；四个基线回放/报告已从 `pre/` 移至 `baseline_no_subgoal/report/`，不能将其当作 vtemp 验证。
 
 ## 固定模型与运行方式
 
@@ -14,9 +14,9 @@
 - 无人机保持 24×24m、2m 分辨率的局部观测；地面车保持 8×8m、0.5m 分辨率。保持三机、固定高度、原通信/中继与随机策略设置。
 - 沿用二维运动和理想局部二值地图传感器。高度仅用于离线区分低矮障碍和高处树冠；不模拟三维飞行、坡地动力学、相机成像或林区无线传播。
 
-## VTemp 临时目标点机制
+## vtemp 临时目标点机制
 
-复用 `artifacts/vtemp-5km-400best-20261102` 中 `rolling200` 的原实现。旧 VTemp 与冻结 v9 的 `ground/subgoal_manager.py` 字节相同，SHA256 为 `e36971e1a194210a972c38c9d393e7f4c1d6ee970fc077d885aa141fef4e2702`；`ground/ground_main.py` 也字节相同。无需补丁运行时。
+复用 `artifacts/vtemp-5km-400best-20261102` 中 `rolling200` 的原实现。vtemp 归档与冻结 v9 的 `ground/subgoal_manager.py` 字节相同，SHA256 为 `e36971e1a194210a972c38c9d393e7f4c1d6ee970fc077d885aa141fef4e2702`；`ground/ground_main.py` 也字节相同。无需补丁运行时。
 
 车辆以自身位置为中心，在半径 200、133.33、66.67 米的三圈、每圈 24 个方向上选择候选，按车辆到候选距离、候选到终点距离及失败惩罚之和评分。同分优先靠近终点。进入中间目标 25 米范围后重新选择；180 秒没有靠近或相关图增长、600 秒没有靠近，或相对最近距离后退超过 40 米时，也触发失败重选。接近临时目标 50 米内，可一次性吸附到 20 米内最近的已映射图节点。候选只依赖车的位置、收到的融合图、时间和已知世界边界，不读取实景地图真值或离线路线。
 
@@ -85,7 +85,7 @@ python src/teamed-planning/scripts/simulator/download_wildscenes.py \
 /home/bdi/miniconda3/envs/teamedplanning-2d/bin/python \
   src/teamed-planning/scripts/simulator/validate_wildscenes_vtemp.py \
   --cases artifacts/wildscenes-v9-20261106/maps/K-01-r025/cases_physical_multicomponent.json \
-  --output artifacts/wildscenes-v9-20261106/vtemp_rolling200/evaluation --samples 3 --workers 3
+  --output artifacts/wildscenes-v9-20261106/vtemp/evaluation --samples 3 --workers 3
 
 /home/bdi/miniconda3/envs/teamedplanning-2d/bin/python \
   src/teamed-planning/scripts/simulator/select_wildscenes_cases.py \
@@ -96,7 +96,7 @@ python src/teamed-planning/scripts/simulator/download_wildscenes.py \
 /home/bdi/miniconda3/envs/teamedplanning-2d/bin/python \
   src/teamed-planning/scripts/simulator/validate_wildscenes_vtemp.py \
   --cases artifacts/wildscenes-v9-20261106/maps/K-01-r025/cases_control_200m.json \
-  --output artifacts/wildscenes-v9-20261106/vtemp_rolling200/evaluation_control --samples 3 --workers 2
+  --output artifacts/wildscenes-v9-20261106/vtemp/evaluation_control --samples 3 --workers 2
 
 /home/bdi/miniconda3/envs/teamedplanning-2d/bin/python \
   src/teamed-planning/scripts/tests/simulator/test_wildscenes_vtemp.py

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from common.graph_structure import TopologicalGraph
-from drone.mappo import ActorCritic,GLOBAL_FEATURES
+from drone.mappo import GLOBAL_FEATURES
 from drone.graph_attention_mappo import (GraphAttentionActorCritic,GraphEncoder,encode_graph,
     PREFIX,MAX_NODES,NEIGHBORS,NODE_FEATURES,GAT_FEATURES)
 from simulator.ppo_batch import update_batch,update_value_statistics
@@ -84,8 +84,8 @@ class GATTests(unittest.TestCase):
         self.assertLessEqual(stats['exact_kl'],.02)
         self.assertGreater(stats['critic_updates'],0)
         self.assertTrue(any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('gat_actor.')))
-        rebuilt=ActorCritic.from_state_dict(model.state_dict())
-        self.assertIsInstance(rebuilt,GraphAttentionActorCritic)
+        rebuilt=GraphAttentionActorCritic()
+        rebuilt.load_state_dict(model.state_dict())
         with torch.no_grad():
             x=torch.tensor(rollouts[0][0][0]);s=torch.zeros(GLOBAL_FEATURES)
             value=model.value(x,state=s).clone();update_value_statistics(model,torch.tensor([100.,200.,300.]))

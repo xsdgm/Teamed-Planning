@@ -154,7 +154,7 @@ class RelayActorCritic(GraphAttentionActorCritic):
         p[:len(position)] = position
         data = observation.get('cooperation', {})
         sensed = set(data.get('peers', {}))
-        # CoGraph: several vehicles; each token is flagged by its own one-hop link.
+        # Each vehicle token is flagged by its own one-hop link.
         vehicles = data.get('grounds')
         # KeyError on purpose: v8 never silently acts without its relay cache.
         # The cache lists vehicle/task records first, then fresher and shorter

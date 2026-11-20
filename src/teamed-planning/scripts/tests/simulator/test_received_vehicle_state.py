@@ -135,14 +135,12 @@ class VehicleFeatureTests(unittest.TestCase):
             cooperation=dict(peers={}, velocities={}, ground=None, required=()), relay=[]))
         np.testing.assert_array_equal(expired[4:12], np.zeros(8))
 
-    def test_legacy_target_present_prefix_retains_values_for_both_input_versions(self):
-        for version in (1, 2):
-            nav = VelocityNavigator('drone_0', total_drones=3,
-                model=GraphAttentionActorCritic(input_version=version))
-            nav.cbf_margin_source = lambda: None
-            features, _ = nav.encode([50., 50., 15.], observation())
-            expected = [130./350., 0., -20./95., 0., 150./350., 0., 1., 25./95.]
-            np.testing.assert_allclose(features[4:12], expected, rtol=1e-6)
+    def test_target_present_prefix_retains_values(self):
+        nav = VelocityNavigator('drone_0', total_drones=3, model=GraphAttentionActorCritic(input_version=2))
+        nav.cbf_margin_source = lambda: None
+        features, _ = nav.encode([50., 50., 15.], observation())
+        expected = [130./350., 0., -20./95., 0., 150./350., 0., 1., 25./95.]
+        np.testing.assert_allclose(features[4:12], expected, rtol=1e-6)
 
 
 if __name__ == '__main__':

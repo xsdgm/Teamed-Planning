@@ -109,7 +109,9 @@ def checkpoint_hashes(saved, state_hash):
 
 
 def validate_checkpoint(saved, modules):
-    if (saved.get('world_schema') != modules['graph_world'].MODEL_SCHEMA
+    graph_world = modules['graph_world']
+    schema = getattr(graph_world, 'ROAD_MODEL_SCHEMA', None) if saved.get('config', {}).get('road_topology') else graph_world.MODEL_SCHEMA
+    if (schema is None or saved.get('world_schema') != schema
             or saved.get('manifest', {}).get('fast_schema') != modules['graph_policy'].FAST_SCHEMA
             or saved.get('manifest', {}).get('slow_schema') != modules['graph_policy'].SLOW_SCHEMA):
         raise ValueError('Checkpoint graph model schemas differ from evaluation source')
@@ -181,6 +183,9 @@ def evaluate_case(job):
     saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
     validate_checkpoint(saved, modules)
     config = saved['config']
+    road_arguments = {'road_topology': True} if config.get('road_topology') else {}
+    protocol = config.get('training_observation_protocol')
+    observation_arguments = {'training_observation_protocol': protocol} if protocol else {}
     fresh_arguments = {'random_init': True} if (config.get('fresh_all', False)
                                                or config.get('fresh_fast_world', False)) else {}
     label = f'validation-{index:04d}-seed{case["seed"]}'
@@ -191,14 +196,15 @@ def evaluate_case(job):
     with (output / 'logs' / (label + '.log')).open('w') as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
         try:
             write_json(progress_path, dict(state='initializing', label=label, pid=os.getpid()))
-            hierarchy = replace(modules['hierarchy'].HierarchyConfig(), option_steps=config['option_steps'])
+            hold = {'ground_start_hold_seconds': config['ground_start_hold_seconds']} if config.get('ground_start_hold_seconds') else {}
+            hierarchy = replace(modules['hierarchy'].HierarchyConfig(), option_steps=config['option_steps'], **hold)
             episode = modules['hierarchy'].HierarchicalEpisode(repo, case, hierarchy,
                 fast_seed=case['seed'] + 43, rollout_limit=max_steps if max_steps is not None else 1,
-                **fresh_arguments)
+                **fresh_arguments, **observation_arguments)
             if max_steps is None:
                 episode.rollout_limit = episode.mission_budget + 1
             models = dict(fast=modules['graph_policy'].make_graph_fast(repo, **fresh_arguments),
-                world=modules['graph_world'].GraphWorldModel(config['hidden'], config['horizon']),
+                world=modules['graph_world'].GraphWorldModel(config['hidden'], config['horizon'], **road_arguments),
                 slow=modules['graph_policy'].GraphSlowActorCritic(hidden=config['hidden']))
             for name, model in models.items():
                 model.load_state_dict(saved[name], strict=True)
@@ -246,6 +252,7 @@ def evaluate_case(job):
             if summary['goal_reached'] and summary['remaining_m'] > 2. + 1e-6:
                 raise AssertionError('Arrival exceeded the original two-metre tolerance')
             result = dict(case_index=index, label=label, seed=case['seed'], kind=case['kind'],
+                observation_protocol=getattr(episode, 'observation_protocol', 'native'),
                 map_group=case.get('map_group'), distance_m=case['direct_distance_m'],
                 reference_distance_m=case.get('reference_distance_m', case['direct_distance_m']),
                 goal_reached=summary['goal_reached'], termination=summary['termination'],

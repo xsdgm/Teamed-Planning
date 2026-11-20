@@ -1,4 +1,4 @@
-"""Vehicle-vehicle contact must keep 3D velocities (CoGraph v2 crash at ep18)."""
+"""Vehicle contact preserves 3D velocities and valid subsequent observations."""
 import contextlib
 import io
 from pathlib import Path
