@@ -1,0 +1,245 @@
+"""
+Graph Fusion Module for Ground Robots
+Merges topological graphs from multiple drones into a unified graph
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from shared.common.graph_structure import TopologicalGraph
+
+
+class GraphFusion:
+    """
+    Fuses topological graphs from multiple sources into a unified graph.
+    
+    Preserve received path geometry; coalesce only identical positions.
+
+    Nearby navigation samples are not necessarily the same physical landmark.
+    Moving or snapping their endpoints invalidates the source edge's clearance
+    check. Distinct positions therefore remain distinct nodes. Connections
+    between them require the received-evidence check in _bridge_components.
+    Future versions will add:
+    - Probabilistic merging with covariance tracking
+    - Mahalanobis distance for node association
+    - Graph consistency validation
+    - SLAM-based uncertainty propagation
+    """
+    
+    def __init__(self, robot_id: str, merge_threshold: float = 2.0):
+        """
+        Initialize graph fusion.
+        
+        Args:
+            robot_id: ID of the ground robot
+            merge_threshold: Retained for caller compatibility. Proximity alone
+                           no longer authorizes merging navigation samples.
+        """
+        self.robot_id = robot_id
+        self.merge_threshold = merge_threshold
+        self.unified_graph = TopologicalGraph(drone_id=f"{robot_id}_unified")
+        self.source_graphs = {}  # {drone_id: TopologicalGraph}
+        self._position_nodes = {}
+        # Optional component bridging (off unless both are set): nodes of
+        # different components within bridge_distance (m) are joined when
+        # bridge_check(a, b) confirms the segment from delivered observations.
+        self.bridge_distance = 0.
+        self.bridge_check = None
+
+        
+    def add_drone_graph(self, drone_id: str, graph: TopologicalGraph):
+        """
+        Add or update a graph from a drone.
+        
+        Args:
+            drone_id: ID of the drone that created the graph
+            graph: TopologicalGraph to add
+        """
+        self.source_graphs[drone_id] = graph
+        self._rebuild_unified_graph()
+        
+    def _rebuild_unified_graph(self):
+        """
+        Rebuild the unified graph from all source graphs.
+        
+        This is a simple version that rebuilds from scratch.
+        More efficient incremental updates can be added later.
+        """
+        # Create new unified graph
+        self.unified_graph = TopologicalGraph(drone_id=f"{self.robot_id}_unified")
+        self._position_nodes = {}
+        
+        # Track which nodes have been added
+        # Maps (drone_id, original_node_id) -> unified_node_id
+        node_mapping = {}
+        
+        # Source edges certify their original coordinates, not an average of
+        # nearby samples. Exact-coordinate deduplication is geometry preserving
+        # and also makes relayed copies idempotent.
+        for drone_id, graph in self.source_graphs.items():
+            for node_id, node_data in graph.graph.nodes(data=True):
+                position = node_data['position']
+                
+                # Only co-located samples can share a vertex without adding
+                # an unobserved connection or changing incident edge geometry.
+                merged_node_id = self._find_merge_candidate(position)
+                
+                if merged_node_id is None:
+                    # Create new node in unified graph
+                    unified_node_id = f"unified_{len(self.unified_graph)}"
+                    
+                    # Use attributes from this node
+                    attributes = {k: v for k, v in node_data.items() if k != 'position'}
+                    self.unified_graph.add_node(unified_node_id, position, attributes)
+                    self._position_nodes[tuple(position)] = unified_node_id
+                    
+                    # Track mapping
+                    node_mapping[(drone_id, node_id)] = unified_node_id
+                else:
+                    # Merge with existing node
+                    node_mapping[(drone_id, node_id)] = merged_node_id
+                    existing = self.unified_graph.graph.nodes[merged_node_id]
+                    existing.update(TopologicalGraph.merge_observation_attributes(existing, node_data))
+        
+        # Add edges from all source graphs
+        for drone_id, graph in self.source_graphs.items():
+            for edge in graph.graph.edges(data=True):
+                node1, node2, edge_data = edge
+                
+                # Get unified node IDs
+                unified_node1 = node_mapping.get((drone_id, node1))
+                unified_node2 = node_mapping.get((drone_id, node2))
+                
+                if unified_node1 and unified_node2 and unified_node1 != unified_node2:
+                    # Add edge if it doesn't exist, or update weight if it does
+                    if self.unified_graph.graph.has_edge(unified_node1, unified_node2):
+                        # Average weights if edge already exists
+                        existing_weight = self.unified_graph.graph[unified_node1][unified_node2].get('weight', 1.0)
+                        new_weight = edge_data.get('weight', 1.0)
+                        avg_weight = (existing_weight + new_weight) / 2.0
+                        self.unified_graph.graph[unified_node1][unified_node2]['weight'] = avg_weight
+                    else:
+                        # Add new edge
+                        weight = edge_data.get('weight')
+                        attributes = {k: v for k, v in edge_data.items() if k != 'weight'}
+                        self.unified_graph.add_edge(unified_node1, unified_node2, 
+                                                   weight=weight, attributes=attributes)
+        
+        if self.bridge_distance > 0 and self.bridge_check is not None:
+            self._bridge_components()
+
+        # Rebuild spatial index for efficient queries
+        self.unified_graph.build_spatial_index()
+
+        print(f"[GraphFusion] Unified graph: {len(self.unified_graph)} nodes, "
+              f"{self.unified_graph.graph.number_of_edges()} edges from "
+              f"{len(self.source_graphs)} drones")
+    
+    def _bridge_components(self):
+        """Join components that the drones' own graphs leave apart.
+
+        A drone links two nodes only when a single frame shows both, so a gap
+        of a few metres between components built in different frames stays
+        open. Cross-component pairs are tried shortest first; an edge is added
+        only when bridge_check confirms the segment, never from proximity alone.
+        """
+        import networkx as nx
+        from scipy.spatial import cKDTree
+        graph = self.unified_graph.graph
+        if graph.number_of_nodes() < 2:
+            return
+        ids = list(graph.nodes)
+        points = np.asarray([graph.nodes[n]['position'][:2] for n in ids], float)
+        components = nx.utils.UnionFind()
+        for component in nx.connected_components(graph):
+            components.union(*component)
+        candidates = sorted((float(np.linalg.norm(points[i] - points[j])), i, j)
+                            for i, j in cKDTree(points).query_pairs(self.bridge_distance)
+                            if components[ids[i]] != components[ids[j]])
+        for distance, i, j in candidates:
+            a, b = ids[i], ids[j]
+            if components[a] != components[b] and self.bridge_check(points[i], points[j]):
+                self.unified_graph.add_edge(a, b, weight=distance, attributes={'bridged': True})
+                components.union(a, b)
+
+    def _find_merge_candidate(self, position: Tuple[float, float]) -> Optional[str]:
+        """Return an exact geometric duplicate, never a proximity match."""
+        return self._position_nodes.get(tuple(position))
+    
+    def get_unified_graph(self) -> TopologicalGraph:
+        """
+        Get the unified graph.
+        
+        Returns:
+            Unified TopologicalGraph
+        """
+        return self.unified_graph
+    
+    def get_path(self, start_pos: Tuple[float, float], 
+                goal_pos: Tuple[float, float]) -> Optional[List[Tuple[float, float]]]:
+        """
+        Find path from start to goal using unified graph.
+        
+        Args:
+            start_pos: (x, y) starting position
+            goal_pos: (x, y) goal position
+            
+        Returns:
+            List of (x, y) waypoints, or None if no path found
+        """
+        if len(self.unified_graph) == 0:
+            print("[GraphFusion] No unified graph available")
+            return None
+        
+        # Find nearest nodes to start and goal
+        start_node = self.unified_graph.find_nearest_node(start_pos)
+        goal_node = self.unified_graph.find_nearest_node(goal_pos)
+        
+        if start_node is None or goal_node is None:
+            print("[GraphFusion] Cannot find nodes near start or goal")
+            return None
+        
+        start_node_id, start_dist = start_node
+        goal_node_id, goal_dist = goal_node
+        
+        print(f"[GraphFusion] Planning from {start_node_id} to {goal_node_id}")
+        
+        # Find path
+        node_path = self.unified_graph.get_path(start_node_id, goal_node_id)
+        
+        if node_path is None:
+            print("[GraphFusion] No path found in graph")
+            return None
+        
+        # Convert node IDs to positions
+        waypoints = []
+        for node_id in node_path:
+            pos = self.unified_graph.get_node_position(node_id)
+            waypoints.append(pos)
+        
+        return waypoints
+    
+    def clear(self):
+        """Clear all graphs."""
+        self.unified_graph = TopologicalGraph(drone_id=f"{self.robot_id}_unified")
+        self.source_graphs.clear()
+
+
+    def get_stats(self) -> Dict:
+        """
+        Get fusion statistics.
+        
+        Returns:
+            Dictionary with fusion statistics
+        """
+        return {
+            'robot_id': self.robot_id,
+            'unified_nodes': len(self.unified_graph),
+            'unified_edges': self.unified_graph.graph.number_of_edges(),
+            'source_graphs': len(self.source_graphs),
+            'merge_threshold': self.merge_threshold
+        }

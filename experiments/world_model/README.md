@@ -15,6 +15,7 @@ vtmp2 与 vtmp3 的世界模型实现统一放在 [world_model](../../src/teamed
 | vtmp2 历史二值模型 | [decoupled_model.py](../../src/teamed-planning/scripts/world_model/terrain/decoupled_model.py) | [tests/world_model/vtmp2](../../src/teamed-planning/scripts/tests/world_model/vtmp2/) | 独立车机决策与简化 WildScenes 二维原型 |
 | vtmp2 历史 RSSM | [model.py](../../src/teamed-planning/scripts/world_model/rssm/model.py) | [tests/world_model/vtmp2](../../src/teamed-planning/scripts/tests/world_model/vtmp2/) | 单目标驾驶／侦察互斥任务 |
 | vtmp3 | [ab_model.py](../../src/teamed-planning/scripts/world_model/survey/ab_model.py) | [tests/world_model/vtmp3](../../src/teamed-planning/scripts/tests/world_model/vtmp3/) | [A—B 区域选点与代理建图训练](vtmp3/README.md) |
+| vtemp5 | [局部障碍预测](../../src/teamed-planning/scripts/simulator/vtemp5_world_model.py) · [前视点训练](../../src/teamed-planning/scripts/simulator/run_vtemp5.py) | [车端模拟器验证](../../src/teamed-planning/scripts/tests/simulator/test_vtemp5.py) | [双侧大障碍、单桥课程和训练结果](vtemp5/README.md) |
 
 各阶段的职责由功能模块区分：`mission.py` / `planner.py` 处理单目标任务，`ab_environment.py` / `ab_planner.py` 处理两点任务。`survey/ab_model.py` 保存模型及训练逻辑，保留与单目标不同的数据契约和损失；两种任务不能混用数据或权重。
 

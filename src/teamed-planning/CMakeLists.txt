@@ -45,10 +45,10 @@ include_directories(
 )
 
 catkin_install_python(PROGRAMS
-  scripts/drone/ros_drone_node.py
-  scripts/drone/ros_seg_node.py
-  scripts/ground/ros_ground_node.py
-  scripts/ground/ros_gcs_node.py
+  scripts/shared/drone/ros_drone_node.py
+  scripts/shared/drone/ros_seg_node.py
+  scripts/shared/ground/ros_ground_node.py
+  scripts/shared/ground/ros_gcs_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

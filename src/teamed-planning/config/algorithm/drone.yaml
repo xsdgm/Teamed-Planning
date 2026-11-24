@@ -20,4 +20,4 @@ max_speed: 5.0
 comm_timeout: 10.0
 algorithm_rate: 10.0
 control_rate: 50.0
-navigation_algorithm: cadmm  # cadmm | cadmm_controlled | greedy
+navigation_algorithm: cadmm  # Original non-learning C-ADMM dispatcher
