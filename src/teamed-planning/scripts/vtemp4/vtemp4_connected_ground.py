@@ -5,7 +5,8 @@ from types import FunctionType, MethodType
 import networkx as nx
 import numpy as np
 
-from shared.ground.global_planner import GlobalPlanner
+# The extension subclasses the planner instance installed by frozen_navigation.runtime.
+from ground.global_planner import GlobalPlanner
 
 
 def _distance(a, b):

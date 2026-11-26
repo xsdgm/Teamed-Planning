@@ -99,12 +99,12 @@ def _received_filter(self, velocity, observation, dt):
     chain = getattr(self.navigator, 'chain', self._chain_state)
     grounds = None
     if self.communication_mode == 'backbone' and self.multi_vehicle:
-        from shared.drone.local_backbone import received_geometry_multi, relative_neighborhood
+        from drone.local_backbone import received_geometry_multi, relative_neighborhood
         peers, _, grounds = received_geometry_multi(self.position, observation)
         required = relative_neighborhood(self.position, {**peers, **grounds}, self.communication_range)
         ground = None
     elif self.communication_mode == 'backbone':
-        from shared.drone.local_backbone import received_geometry, relative_neighborhood
+        from drone.local_backbone import received_geometry, relative_neighborhood
         peers, _, ground = received_geometry(self.position, observation)
         visible = dict(peers)
         if ground is not None:

@@ -47,7 +47,10 @@ def load_map_backend(repo):
     if not path.is_file():
         if PACKAGE_DIR.parent.name == 'runtime_sources':
             raise ValueError('Archived WildScenes run is missing its frozen raster backend')
-        path = Path(repo).resolve() / 'src/teamed-planning/scripts/simulator/wildscenes_map.py'
+        scripts = Path(repo).resolve() / 'src/teamed-planning/scripts'
+        path = scripts / 'shared/simulator/wildscenes/wildscenes_map.py'
+        if not path.is_file():
+            path = scripts / 'simulator/wildscenes_map.py'
     key = str(path.resolve())
     if key not in _BACKENDS:
         spec = importlib.util.spec_from_file_location('_vtemp2_wildscenes_backend', path)

@@ -23,9 +23,9 @@ def frozen_tests():
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from vtemp2_3.frozen_navigation import runtime
     runtime(Path(__file__).resolve().parents[5])
-    from shared.common.graph_structure import TopologicalGraph
-    from shared.ground.global_planner import GlobalPlanner
-    from shared.ground.ground_main import GroundRobotController
+    from common.graph_structure import TopologicalGraph
+    from ground.global_planner import GlobalPlanner
+    from ground.ground_main import GroundRobotController
     from vtemp4.vtemp4_connected_ground import ConnectedGroundPlanner, install_connected_ground
     from vtemp4.vtemp4_anchored_ground import AnchoredGroundPlanner, install_anchored_ground
 

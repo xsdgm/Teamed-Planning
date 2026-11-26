@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>无人机与无人车仿真回放</title>
+<style>
+:root {
+  color-scheme:light;
+  font:15px/1.5 'Noto Sans CJK SC','Microsoft YaHei',sans-serif;
+  color:#142d39;
+  background:#eef2ed;
+  --teal:#165967;
+  --line:#d4ded6;
+}
+* {
+  box-sizing:border-box;
+}
+[hidden] {
+  display:none!important;
+}
+body {
+  margin:0;
+}
+main {
+  max-width:1330px;
+  margin:auto;
+  padding:32px clamp(12px,3vw,48px);
+}
+header {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap:16px;
+  margin-bottom:18px;
+}
+h1 {
+  font-size:clamp(24px,4vw,36px);
+  letter-spacing:-.04em;
+  margin:0;
+}
+h2 {
+  font-size:16px;
+  margin:0 0 9px;
+}
+p {
+  margin:0;
+}
+select,button,input {
+  font:inherit;
+}
+select,button {
+  border:1px solid #a8b8b3;
+  border-radius:6px;
+  color:inherit;
+  background:white;
+  padding:6px 12px;
+}
+select:focus,button:focus,input:focus {
+  outline:3px solid #ecac40;
+  outline-offset:2px;
+}
+button {
+  cursor:pointer;
+}
+select {
+  max-width:100%;
+}
+.layout {
+  display:grid;
+  grid-template-columns:minmax(0,3.3fr) minmax(212px,1fr);
+  gap:15px;
+}
+.map,.side,.controls {
+  background:#fff;
+  border:1px solid var(--line);
+  border-radius:10px;
+}
+.map {
+  position:relative;
+  overflow:hidden;
+  background:#f4f4ed;
+}
+canvas {
+  display:block;
+  width:100%;
+  height:clamp(370px,58vh,620px);
+}
+.scale {
+  font-size:12px;
+  background:#ffffffdf;
+  position:absolute;
+  bottom:10px;
+  left:12px;
+  border-radius:4px;
+  padding:2px 7px;
+}
+.side {
+  padding:19px;
+}
+.side section+section {
+  border-top:1px solid var(--line);
+  margin-top:15px;
+  padding-top:14px;
+}
+.opts {
+  display:grid;
+  gap:8px;
+}
+.opts label {
+  display:flex;
+  align-items:center;
+  gap:7px;
+  cursor:pointer;
+}
+.opts input {
+  accent-color:var(--teal);
+}
+.note {
+  font-size:13px;
+  color:#53666a;
+}
+.metric {
+  font-size:21px;
+  font-variant-numeric:tabular-nums;
+  display:block;
+  font-weight:660;
+}
+#sample {
+  margin-top:8px;
+}
+.controls {
+  display:flex;
+  gap:12px;
+  align-items:center;
+  padding:12px 14px;
+  margin-top:12px;
+  flex-wrap:wrap;
+}
+#seek {
+  flex:1;
+  min-width:120px;
+  accent-color:var(--teal);
+}
+#play {
+  background:var(--teal);
+  color:white;
+  border-color:var(--teal);
+  min-width:79px;
+  font-weight:650;
+}
+output {
+  min-width:60px;
+  font-variant-numeric:tabular-nums;
+}
+.legend {
+  display:flex;
+  flex-wrap:wrap;
+  gap:7px 16px;
+  margin-top:12px;
+  color:#40555f;
+  font-size:13px;
+}
+.legend span {
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+}
+.sw {
+  display:inline-block;
+  width:12px;
+  height:12px;
+  border:1px solid #64746e36;
+  border-radius:2px;
+}
+.switcher {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-weight:600;
+}
+.headline {
+  margin-top:3px;
+  color:#526466;
+}
+@media(max-width:790px) {
+  main {
+    padding:16px 10px;
+  }
+  .layout {
+    grid-template-columns:1fr;
+  }
+  .side {
+    display:flex;
+    flex-wrap:wrap;
+    gap:16px;
+    padding:14px;
+  }
+  .side section+section {
+    border:0;
+    margin:0;
+    padding:0;
+  }
+  .side section {
+    flex:1;
+    min-width:160px;
+  }
+  .opts {
+    gap:4px;
+  }
+  .controls {
+    gap:7px;
+  }
+  .map canvas {
+    height:52vh;
+  }
+}
+@media(prefers-reduced-motion:reduce) {
+  * {
+    scroll-behavior:auto;
+  }
+}
+</style></head><body><main>
+<header><div><h1>无人机与无人车仿真回放</h1><p class="headline">V9.1 固定无人机策略 · 车端观测与轨迹</p></div><label class="switcher">选择场景 <select id="scene"></select></label></header>
+<div class="layout"><div class="map"><canvas id="map" aria-label="无人车路径、无人机位置、接收地图与当前传感器视野"></canvas><div class="scale" id="scale"></div></div><aside class="side">
+<section><h2>当前状态</h2><div class="note">车端累计收到的不同无人机观测包</div><strong class="metric" id="received"></strong><div id="prediction"></div></section>
+<section class="opts"><h2>显示图层</h2><label><input id="air" type="checkbox" checked> 车端已收无人机地图</label><label><input id="ground" type="checkbox" checked> 无人车自有地图</label><label><input id="sensors" type="checkbox" checked> 当前各机传感器视野</label><label><input id="paths" type="checkbox" checked> 行驶与飞行轨迹</label><label id="predictionOpt"><input id="wm" type="checkbox"> 世界模型预测区域</label><label><input id="truth" type="checkbox"> 模拟器真实障碍轮廓</label><label><input id="follow" type="checkbox"> 近看无人车</label></section>
+<section><p class="note">绿色、紫色与琥珀色视野框标出三架无人机此刻的探测范围。车端接收地图按观测包实际送达时间累积。</p></section></aside></div>
+<div class="controls"><button id="play" type="button">播放</button><button id="prev" type="button" aria-label="上一个采样时刻">上一步</button><input id="seek" type="range" min="0" value="0" aria-label="仿真采样时刻"><output id="clock"></output><button id="next" type="button" aria-label="下一个采样时刻">下一步</button></div>
+<div class="legend"><span><i class="sw" style="background:#c1e7dd"></i>已回传空地</span><span><i class="sw" style="background:#33594f"></i>已回传障碍</span><span><i class="sw" style="background:#bdcfeb"></i>车端自测空地</span><span><i class="sw" style="background:#344a75"></i>车端自测障碍</span><span><i class="sw" style="background:#f4f4ed"></i>无有效观测</span><span id="wmKey"><i class="sw" style="background:#d54c7c"></i>预测的大障碍范围</span></div>
+</main><script id="data" type="application/json">__REPLAY_DATA__</script><script>
+'use strict';
+const { scenes, mask_threshold: maskThreshold } = JSON.parse(document.getElementById('data').textContent);
+const el = id => document.getElementById(id), canvas = el('map'), ctx = canvas.getContext('2d'), sel = el('scene'), seek = el('seek');
+const colors = ['#148760', '#7d51a0', '#ad7416'];
+let current = 0, timer = null;
+const palettes = { air: [[0, 0, 0, 0], [193, 231, 221, 235], [51, 89, 79, 255]], ground: [[0, 0, 0, 0], [189, 207, 235, 230], [52, 74, 117, 255]] };
+function raster(grid, kind) {
+    if (grid.surface)
+        return grid.surface;
+    const [h, w, encoded] = grid, surf = document.createElement('canvas');
+    surf.width = w;
+    surf.height = h;
+    const cx = surf.getContext('2d'), img = cx.createImageData(w, h), raw = atob(encoded);
+    let pos = 0;
+    for (let j = 0; j < raw.length; j += 3) {
+        const n = raw.charCodeAt(j) + 256 * raw.charCodeAt(j + 1), v = raw.charCodeAt(j + 2);
+        let rgba;
+        if (kind === 'mask')
+            rgba = [206, 45, 107, v ? 120 : 0];
+        else if (kind === 'sensor')
+            rgba = [[0, 0, 0, 0], [255, 255, 255, 10], [32, 42, 48, 200]][v];
+        else
+            rgba = palettes[kind][v];
+        if (rgba[3])
+            for (let i = 0; i < n; i++)
+                img.data.set(rgba, (pos + i) * 4);
+        pos += n;
+    }
+    if (pos !== w * h)
+        throw Error('Grid decoding failed');
+    cx.putImageData(img, 0, 0);
+    grid.surface = surf;
+    return surf;
+}
+function line(points, color, px, S, dash = []) { if (!points.length)
+    return; ctx.save(); ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = px / S; ctx.setLineDash(dash.map(v => v / S)); points.forEach(([x, y], i) => { if (i === 0)
+    ctx.moveTo(x, y);
+else
+    ctx.lineTo(x, y); }); ctx.stroke(); ctx.restore(); }
+function tile(grid, p, r, color, S) { const [h, w] = grid; const x = p[0] - w * r / 2, y = p[1] - h * r / 2; ctx.drawImage(raster(grid, 'sensor'), x, y, w * r, h * r); ctx.strokeStyle = color; ctx.lineWidth = 1.7 / S; ctx.strokeRect(x, y, w * r, h * r); }
+function redraw() {
+    const s = scenes[Number(sel.value) || 0], i = current, f = s.frames[i], step = s.steps[i];
+    const W = canvas.clientWidth, H = canvas.clientHeight, D = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * D);
+    canvas.height = Math.round(H * D);
+    ctx.setTransform(D, 0, 0, D, 0, 0);
+    ctx.fillStyle = '#f4f4ed';
+    ctx.fillRect(0, 0, W, H);
+    let xmin = s.bounds[0], xmax = s.bounds[1], ymin = s.bounds[2], ymax = s.bounds[3];
+    if (el('follow').checked) {
+        xmin = f.car[0] - 60;
+        xmax = f.car[0] + 60;
+        ymin = f.car[1] - 48;
+        ymax = f.car[1] + 48;
+    }
+    const S = Math.min((W - 36) / (xmax - xmin), (H - 36) / (ymax - ymin)), cx = (xmin + xmax) / 2, cy = (ymin + ymax) / 2, screen = ([x, y]) => [W / 2 + (x - cx) * S, H / 2 - (y - cy) * S];
+    ctx.setTransform(D * S, 0, 0, -D * S, D * (W / 2 - cx * S), D * (H / 2 + cy * S));
+    ctx.imageSmoothingEnabled = false;
+    const wx = W / (2 * S), wy = H / (2 * S);
+    ctx.beginPath();
+    for (let x = Math.ceil((cx - wx) / 20) * 20; x <= cx + wx; x += 20) {
+        ctx.moveTo(x, cy - wy);
+        ctx.lineTo(x, cy + wy);
+    }
+    for (let y = Math.ceil((cy - wy) / 20) * 20; y <= cy + wy; y += 20) {
+        ctx.moveTo(cx - wx, y);
+        ctx.lineTo(cx + wx, y);
+    }
+    ctx.strokeStyle = '#dfe3d9';
+    ctx.lineWidth = .75 / S;
+    ctx.stroke();
+    for (const type of ['air', 'ground'])
+        if (el(type).checked) {
+            const grid = f[type];
+            ctx.drawImage(raster(grid, type), ...s.crop_origin, grid[1] * s.resolution, grid[0] * s.resolution);
+        }
+    if (el('wm').checked && f.mask) {
+        const [h, w] = f.mask, dx = s.goal[0] - f.car[0], dy = s.goal[1] - f.car[1], len = Math.hypot(dx, dy);
+        if (len > 0) {
+            const fx = dx / len, fy = dy / len, rx = fy, ry = -fx;
+            ctx.save();
+            ctx.transform(rx, ry, -fx, -fy, f.car[0], f.car[1]);
+            ctx.drawImage(raster(f.mask, 'mask'), -48, 24 - h * 2, w * 2, h * 2);
+            ctx.restore();
+        }
+    }
+    if (el('truth').checked) {
+        ctx.save();
+        ctx.setLineDash([5 / S, 4 / S]);
+        ctx.strokeStyle = '#ad4930';
+        ctx.lineWidth = 1.7 / S;
+        for (const [x, y, r] of s.circles) {
+            ctx.beginPath();
+            ctx.arc(x, y, r, 0, 2 * Math.PI);
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+    if (el('sensors').checked) {
+        tile(f.car_tile, f.car, s.car_res, '#254c70', S);
+        f.drone_tiles.forEach((g, j) => tile(g, f.drones[j], s.drone_res, colors[j], S));
+    }
+    if (el('paths').checked) {
+        line(s.car_path.slice(0, step + 1), '#184267', 3.2, S);
+        for (let j = 0; j < f.drones.length; j++)
+            line(s.drone_paths.slice(0, step + 1).map(v => v[j]), colors[j], 1.1, S, [3, 2]);
+    }
+    ctx.setTransform(D, 0, 0, D, 0, 0);
+    ctx.font = 'bold 12px sans-serif';
+    function label(text, x, y) { ctx.lineWidth = 3; ctx.strokeStyle = '#fffffff0'; ctx.strokeText(text, x, y); ctx.fillStyle = '#25353b'; ctx.fillText(text, x, y); }
+    function marker(p, fill, type, tag) { const [x, y] = screen(p); ctx.fillStyle = fill; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.7; ctx.beginPath(); if (type === 'diamond') {
+        ctx.moveTo(x, y - 8);
+        ctx.lineTo(x + 7, y);
+        ctx.lineTo(x, y + 8);
+        ctx.lineTo(x - 7, y);
+        ctx.closePath();
+    }
+    else if (type === 'car') {
+        ctx.rect(x - 5, y - 5, 10, 10);
+    }
+    else {
+        ctx.arc(x, y, 4.5, 0, 2 * Math.PI);
+    } ctx.fill(); ctx.stroke(); label(tag, type === 'car' ? x - 21 : x + 7, y - 7); }
+    marker(s.goal, '#a44631', 'diamond', '终点');
+    marker(f.car, '#173c61', 'car', '车');
+    f.drones.forEach((p, j) => marker(p, colors[j], 'circle', '机 ' + (j + 1)));
+    ctx.fillStyle = '#44565c';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('↑ 北', 13, 21);
+    el('scale').textContent = '网格间距 20 米';
+    el('received').textContent = f.received + ' 个';
+    el('clock').textContent = step + ' 秒';
+    seek.value = i;
+    el('prev').disabled = i === 0;
+    el('next').disabled = i === s.steps.length - 1;
+    const pred = el('prediction');
+    if (f.presence !== undefined) {
+        pred.textContent = '模型判断有大障碍的概率 ' + (100 * f.presence).toFixed(1) + '%';
+        pred.className = 'note';
+    }
+    else
+        pred.textContent = '';
+}
+function choose() { stop(); current = 0; const s = scenes[Number(sel.value)]; seek.max = s.steps.length - 1; el('predictionOpt').hidden = !s.frames[0].mask; el('wmKey').hidden = !s.frames[0].mask; redraw(); }
+function stop() { if (timer !== null)
+    clearInterval(timer); timer = null; el('play').textContent = '播放'; }
+for (const [j, s] of scenes.entries()) {
+    const op = document.createElement('option');
+    op.value = j;
+    op.textContent = '地图 ' + s.seed;
+    sel.append(op);
+    const pts = [s.start, s.goal, ...s.car_path, ...s.drone_paths.flat()], xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+    s.bounds = [Math.min(...xs) - 16, Math.max(...xs) + 16, Math.min(...ys) - 16, Math.max(...ys) + 16];
+}
+sel.addEventListener('change', choose);
+seek.addEventListener('input', () => { stop(); current = Number(seek.value); redraw(); });
+for (const id of ['air', 'ground', 'paths', 'truth', 'wm', 'sensors', 'follow'])
+    el(id).addEventListener('change', redraw);
+el('prev').onclick = () => { stop(); if (current > 0)
+    current--; redraw(); };
+el('next').onclick = () => { stop(); if (current < Number(seek.max))
+    current++; redraw(); };
+el('play').onclick = () => { if (timer !== null) {
+    stop();
+    return;
+} if (current >= Number(seek.max))
+    current = 0; redraw(); el('play').textContent = '暂停'; timer = setInterval(() => { if (current < Number(seek.max)) {
+    current++;
+    redraw();
+} if (current >= Number(seek.max))
+    stop(); }, 850); };
+window.addEventListener('resize', redraw);
+el('wmKey').title = `按验证集选定的占用概率阈值 ${maskThreshold} 显示`;
+choose();
+
+</script></body></html>

@@ -53,7 +53,7 @@ DEFAULTS = dict(episodes=800, steps=4000, seed=53, learning_rate=3e-4,
     # One obstacle clearance (m) for UAV graphs, UGV local planning and fusion bridges.
     # All versions default to 1 m; enclosed-state escape retains its 0.5 m margin.
     ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M,
-    reward_schedule='fixed',exploration_weight=0.0,entropy_coefficient=0.003,
+    reward_schedule='fixed',exploration_weight=0.0,side_exploration_weight=0.0,entropy_coefficient=0.003,
     world_size=1000.0,task_distances=[],task_distance_range=[100.0, 400.0],budget_multiplier=3.,budget_extra=240,
     min_episode_steps=600,map_stability_steps=30,safety_failure_penalty=100.0,
     discount=0.995,gae_lambda=0.97,initial_validation=False,
@@ -221,9 +221,11 @@ def validate_config(config):
         raise ValueError('Environment version differs; start a separate corrected training run')
     if config['reward_schedule'] != 'fixed':
         raise ValueError('Invalid reward schedule')
-    for name in ('exploration_weight','entropy_coefficient'):
+    for name in ('exploration_weight','side_exploration_weight','entropy_coefficient'):
         if not np.isfinite(config[name]) or config[name]<0:
             raise ValueError(f'{name} must be finite and nonnegative')
+    if config['side_exploration_weight'] and config['policy_architecture'] != 'gat_relay_attention_v8':
+        raise ValueError('Side exploration requires the vehicle-origin V9 training environment')
     final=config['entropy_coefficient_final']
     if final is not None and (isinstance(final,bool) or not isinstance(final,(int,float))
                               or not np.isfinite(final) or final<0):
@@ -424,6 +426,8 @@ def reward_contract(config):
         return 'uav_fixed_ab_route_with_vehicle_backbone_v11_r2'
     if config['policy_architecture']=='gat_survey_v10':
         return 'uav_local_ab_confidence_with_vehicle_backbone_v10'
+    if config.get('side_exploration_weight', 0.):
+        return 'uav_remaining_route_side_exploration_v9_1'
     if config.get('mapping_route_origin','initial')=='vehicle':
         return 'uav_remaining_route_mapping_v9'
     raise ValueError('Unknown reward contract')
@@ -479,6 +483,7 @@ def run_episode(model, config, scene_seed, schedule, stochastic, progress=None, 
             mapping_route_origin=config.get('mapping_route_origin','initial'),
             cbf_margin_weight=config['cbf_margin_weight'],cbf_margin_scale=config['cbf_margin_scale'],
             frontier_progress_weight=config['frontier_progress_weight'],
+            side_exploration_weight=config.get('side_exploration_weight', 0.),
             chain_ground_range=config['chain_ground_range'],
             chain_link_range=config['chain_link_range'],
             relay_loss=config['relay_loss'],relay_delay_jitter=config['relay_delay_jitter'],
@@ -692,7 +697,11 @@ def episode_line(completed, config, summary, loss, ppo):
         completion=f'map_done={summary.get("map_completed",0.):.0f}'
         route_change=f'route_saved_m={summary.get("route_new_best_saving_m",0.):.1f}'
         frontier=summary.get('frontier_best_progress',0.)
+    side = (f'side_area_m2={summary["side_exploration_area_m2"]:.1f} '
+            f'side_reward={summary["side_exploration_reward"]:.3f} '
+            if config.get('side_exploration_weight', 0.) else '')
     return (f'episode {completed}/{config["episodes"]} '
+        f'{side}'
         f'beta={summary["reward_beta"]:.3f} eta={summary["reward_eta"]:.3f} '
         f'confidence={summary["confidence_area"]:.1f} '
         f'task_share={summary["task_share"]:.3f} '

@@ -122,8 +122,9 @@ def runtime(repo, *, random_init=False):
     sys.meta_path[:]=[finder for finder in sys.meta_path if not isinstance(finder,_NavigationExtensionFinder)]
     sys.meta_path.insert(0,_NavigationExtensionFinder(extension_root,sources))
     import torch
-    from mappo import mappo_experiment as me
-    from mappo import train_mappo as tm
+    # This runtime uses the module layout shipped in the pinned V9 archive.
+    from simulator import mappo_experiment as me
+    from simulator import train_mappo as tm
     torch.set_num_threads(1)
     config=v9_archive_config(repo)
     if random_init:
@@ -133,7 +134,7 @@ def runtime(repo, *, random_init=False):
         if (config['policy_architecture'] != 'gat_relay_attention_v8'
                 or config.get('actor_input_version', 2) != 2):
             raise ValueError('Fresh graph fast policy requires the pinned relay architecture')
-        from mappo.relay_attention_mappo import RelayActorCritic
+        from drone.relay_attention_mappo import RelayActorCritic
         model=RelayActorCritic(global_features=tm.GLOBAL_FEATURES, input_version=2,
                               relay_attention=config['relay_attention'])
     else:

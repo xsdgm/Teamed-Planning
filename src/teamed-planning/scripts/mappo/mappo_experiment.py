@@ -168,6 +168,43 @@ class DeliveredEvidence:
         return ((np.linalg.norm(self.xy-start, axis=-1) <= car_radius) |
                 (np.linalg.norm(self.xy-goal, axis=-1) <= goal_radius) | (corridor <= band))
 
+    def first_route_blockage(self, start, goal, clearance=1.):
+        """Locate the first reported obstruction along the vehicle-to-target strip."""
+        start = np.asarray(start, dtype=float)
+        delta = np.asarray(goal, dtype=float) - start
+        length = np.linalg.norm(delta)
+        if length < self.resolution:
+            return None
+        forward = delta / length
+        lateral = np.array([-forward[1], forward[0]])
+        half_cell = self.resolution / 2
+        stations = np.linspace(0., length, int(np.ceil(length / half_cell)) + 1)
+        offsets = np.linspace(-clearance, clearance, 2 * int(np.ceil(clearance / half_cell)) + 1)
+        axis = start + stations[:, None] * forward
+        samples = axis[:, None, :] + offsets[None, :, None] * lateral
+        cells = np.floor(samples / self.resolution).astype(int)
+        inside = ((cells >= 0) & (cells < self.n)).all(axis=-1)
+        x, y = np.clip(cells, 0, self.n - 1).transpose(2, 0, 1)
+        hits = inside & self.seen[y, x] & (self.log_odds[y, x] > 0.)
+        blocked = np.flatnonzero(hits.any(axis=1))
+        if len(blocked):
+            return axis[blocked[0]], forward
+        return None
+
+    def new_side_area(self, old_seen, blockage):
+        """Area first delivered beside the previously observed obstructed route, in m²."""
+        if blockage is None:
+            return 0.
+        anchor, forward = blockage
+        new_xy = self.xy[self.seen & ~old_seen] - anchor
+        lateral = np.array([-forward[1], forward[0]])
+        along = np.abs(new_xy @ forward)
+        across = np.abs(new_xy @ lateral)
+        # One 24 m sensor footprint upstream/downstream and a 60 m lateral
+        # search on either side, excluding the original 12 m route band.
+        flanks = (along <= 24.) & (across > 12.) & (across <= 60.)
+        return float(np.count_nonzero(flanks) * self.resolution**2)
+
     def connector_clear(self, start, end):
         """Endpoint access must be supported by received free pixels."""
         points=np.linspace(start,end,max(2,int(np.linalg.norm(np.asarray(end)-start)/
@@ -229,7 +266,8 @@ class Experiment:
                  relay_loss=0.,relay_delay_jitter=0,relay_period=1,relay_capacity=16,
                  fusion_bridge_distance=0., mapping_route_origin='initial',
                  ground_safety_distance=DEFAULT_GROUND_CLEARANCE_M, coordinated_safety=False,
-                 subgoal_review_interval=DEFAULT_REVIEW_INTERVAL_S, guidance_strategy='vtemp1'):
+                 subgoal_review_interval=DEFAULT_REVIEW_INTERVAL_S, guidance_strategy='vtemp1',
+                 side_exploration_weight=0.):
         if type(num_drones) is not int or num_drones < 2:
             raise ValueError('At least two drones are required for the chain experiment')
         if reward_mode not in ('cadmm_exploration','velocity_mapping'):
@@ -238,6 +276,11 @@ class Experiment:
             raise ValueError('mapping_route_origin must be initial or vehicle')
         self.mapping_route_origin = mapping_route_origin
         self.vehicle_route_mapping = mapping_route_origin == 'vehicle'
+        self.side_exploration_weight = float(side_exploration_weight)
+        if not 0. <= self.side_exploration_weight < float('inf'):
+            raise ValueError('side_exploration_weight must be finite and nonnegative')
+        if self.side_exploration_weight and not self.vehicle_route_mapping:
+            raise ValueError('Side exploration requires vehicle-origin mapping')
         if self.vehicle_route_mapping and (reward_mode != 'velocity_mapping' or not moving_ground
                                           or ground_stationary):
             raise ValueError('Vehicle-origin mapping requires a moving vehicle')
@@ -560,6 +603,12 @@ class Experiment:
             # successive timesteps would pay for driving or changing the subgoal.
             vehicle_before=task_graph_metrics(self.ground_controller.unified_graph,
                 ground_position[:2],target,self.ledger.connector_clear)
+            # Freeze the search region before this frame's receipts so new
+            # observations cannot create their own reward opportunity.
+            blockage = None
+            if self.side_exploration_weight and not vehicle_before['graph_task_connected']:
+                blockage = self.ledger.first_route_blockage(
+                    ground_position[:2], target, self.ground_safety_distance)
         if self.moving_ground:
             self.ground_action=self._ground_action(ground_received)
         cost_after=navigation_cost(self.ground_controller.unified_graph,ground_position[:2],target)
@@ -641,6 +690,11 @@ class Experiment:
             metrics['first_path_quality_reward']=self.path_quality_weight*metrics.get('route_first_quality_gain',0.)
             metrics['path_shortening_reward']=self.path_quality_weight*metrics.get('route_shortening_quality_gain',0.)
             reward+=metrics['path_quality_reward']
+            if self.side_exploration_weight:
+                area = self.ledger.new_side_area(old_seen, blockage)
+                metrics['side_exploration_area_m2'] = area
+                metrics['side_exploration_reward'] = self.side_exploration_weight * area / 400.
+                reward += metrics['side_exploration_reward']
             if self.vehicle_route_mapping:
                 gain=vehicle_terms['frontier_progress_gain']
                 metrics.update(mapping_route_origin_vehicle=1.,
@@ -832,6 +886,9 @@ class Experiment:
         if self.reward_mode=='velocity_mapping':
             for k in ('task_exploration_area', 'task_exploration_reward', 'time_cost'):
                 total[k] = float(sum(t[k] for t in self.trace))
+            if self.side_exploration_weight:
+                for key in ('side_exploration_area_m2', 'side_exploration_reward'):
+                    total[key] = float(sum(t[key] for t in self.trace))
             total['mapping_reward']=float(sum(t['mapping_reward'] for t in self.trace))
             for key in ('path_quality_reward','first_path_quality_reward','path_shortening_reward',
                         'route_new_best_saving_m','frontier_progress_reward'):
